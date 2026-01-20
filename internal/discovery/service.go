@@ -90,10 +90,13 @@ func (s *Service) buildServiceInfo() *ServiceInfo {
 	hostname, _ := os.Hostname()
 	ip := getLocalIP()
 
+	apiBase := fmt.Sprintf("http://%s:%d", ip, s.config.APIPort)
+	metaCoreBase := fmt.Sprintf("http://%s:%d", ip, s.config.HTTPPort)
+
 	return &ServiceInfo{
 		Name:          s.config.ServiceName,
 		Version:       s.config.ServiceVersion,
-		API:           fmt.Sprintf("http://%s:%d", ip, s.config.APIPort),
+		API:           apiBase,
 		Status:        "running",
 		PID:           os.Getpid(),
 		Hostname:      hostname,
@@ -101,8 +104,15 @@ func (s *Service) buildServiceInfo() *ServiceInfo {
 		LastHeartbeat: time.Now().UTC().Format(time.RFC3339),
 		Capabilities:  []string{"meta-core"},
 		Endpoints: map[string]string{
-			"health": fmt.Sprintf("http://%s:%d/health", ip, s.config.HTTPPort),
-			"meta":   fmt.Sprintf("http://%s:%d/meta", ip, s.config.HTTPPort),
+			// meta-core sidecar endpoints (port 9000)
+			"health":   metaCoreBase + "/health",
+			"meta":     metaCoreBase + "/meta",
+			"leader":   metaCoreBase + "/leader",
+			"services": metaCoreBase + "/services",
+			// main service endpoints (port 80)
+			"api":      apiBase + "/api",
+			"webdav":   apiBase + "/webdav",
+			"callback": apiBase + "/api/plugins/callback",
 		},
 	}
 }

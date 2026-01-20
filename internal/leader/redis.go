@@ -50,6 +50,7 @@ func (rm *RedisManager) Start() error {
 	args := []string{
 		"--port", fmt.Sprintf("%d", rm.config.RedisPort),
 		"--bind", "0.0.0.0",
+		"--protected-mode", "no",
 		"--dir", dataDir,
 		"--appendonly", "yes",
 		"--appendfilename", "appendonly.aof",
