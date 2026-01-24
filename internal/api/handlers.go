@@ -507,8 +507,14 @@ func (s *Server) handleGetProperty(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(value))
 }
 
+// PropertyBody is the request body for PUT /meta/{hash}/{key}
+type PropertyBody struct {
+	Value string `json:"value"`
+}
+
 // handlePutProperty handles PUT /meta/{hash}/{key}
 // Sets a single property value
+// Accepts JSON body with {"value": "..."} or plain text
 func (s *Server) handlePutProperty(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	hashID := vars["hash"]
@@ -529,14 +535,25 @@ func (s *Server) handlePutProperty(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read body as plain text
+	// Read body
 	buf := make([]byte, 1024*1024) // 1MB max
 	n, err := r.Body.Read(buf)
 	if err != nil && err.Error() != "EOF" {
 		writeError(w, http.StatusBadRequest, "failed to read body")
 		return
 	}
-	value := string(buf[:n])
+	body := buf[:n]
+
+	// Try to parse as JSON {"value": "..."} first
+	var propBody PropertyBody
+	var value string
+	if err := json.Unmarshal(body, &propBody); err == nil && propBody.Value != "" {
+		// JSON body with value field
+		value = propBody.Value
+	} else {
+		// Plain text body
+		value = string(body)
+	}
 
 	if err := s.storage.SetProperty(hashID, key, value); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -586,6 +603,7 @@ func (s *Server) handleDeleteProperty(w http.ResponseWriter, r *http.Request) {
 
 // handleAddToSet handles POST /meta/{hash}/_add/{key}
 // Adds a value to a set-type field
+// Accepts JSON body with {"value": "..."} or plain text
 func (s *Server) handleAddToSet(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	hashID := vars["hash"]
@@ -606,14 +624,25 @@ func (s *Server) handleAddToSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read body as plain text
+	// Read body
 	buf := make([]byte, 1024*1024) // 1MB max
 	n, err := r.Body.Read(buf)
 	if err != nil && err.Error() != "EOF" {
 		writeError(w, http.StatusBadRequest, "failed to read body")
 		return
 	}
-	value := string(buf[:n])
+	body := buf[:n]
+
+	// Try to parse as JSON {"value": "..."} first
+	var propBody PropertyBody
+	var value string
+	if err := json.Unmarshal(body, &propBody); err == nil && propBody.Value != "" {
+		// JSON body with value field
+		value = propBody.Value
+	} else {
+		// Plain text body
+		value = string(body)
+	}
 
 	if value == "" {
 		writeError(w, http.StatusBadRequest, "value is required")
