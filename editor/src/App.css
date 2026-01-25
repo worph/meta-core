@@ -1,0 +1,185 @@
+.app {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-header {
+  padding: 2rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  background-color: rgba(0, 0, 0, 0.2);
+}
+
+.app-header h1 {
+  margin: 0 0 0.5rem 0;
+  color: #646cff;
+}
+
+.app-description {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.app-main {
+  flex: 1;
+  padding: 2rem;
+  max-width: 1400px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.app-error {
+  padding: 1rem;
+  background-color: rgba(255, 0, 0, 0.1);
+  border: 1px solid rgba(255, 0, 0, 0.3);
+  border-radius: 8px;
+  color: #ff6b6b;
+  margin-bottom: 1rem;
+}
+
+.app-loading {
+  text-align: center;
+  padding: 3rem 2rem;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 1.1rem;
+}
+
+.app-welcome {
+  text-align: center;
+  padding: 4rem 2rem;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.app-welcome h2 {
+  margin: 0 0 1rem 0;
+  color: rgba(255, 255, 255, 0.8);
+}
+
+.app-welcome-features {
+  margin-top: 1rem;
+  margin-bottom: 1.5rem;
+  font-size: 0.85rem;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.app-kv-browser {
+  margin-top: 1.5rem;
+  text-align: left;
+  max-width: 900px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.app-content {
+  display: grid;
+  grid-template-columns: 350px 1fr;
+  gap: 1.5rem;
+  margin-top: 1rem;
+}
+
+.app-sidebar {
+  min-height: 400px;
+}
+
+.app-editor {
+  min-height: 400px;
+}
+
+.app-no-selection {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  min-height: 400px;
+  background-color: rgba(255, 255, 255, 0.05);
+  border-radius: 8px;
+  color: rgba(255, 255, 255, 0.5);
+  text-align: center;
+  padding: 2rem;
+}
+
+.app-footer {
+  padding: 1.5rem 2rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  text-align: center;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 0.9rem;
+}
+
+.app-footer a {
+  color: #646cff;
+  text-decoration: none;
+}
+
+.app-footer a:hover {
+  text-decoration: underline;
+}
+
+@media (max-width: 1024px) {
+  .app-content {
+    grid-template-columns: 1fr;
+  }
+
+  .app-sidebar {
+    order: 2;
+  }
+
+  .app-editor {
+    order: 1;
+  }
+}
+
+@media (max-width: 768px) {
+  .app-header,
+  .app-main,
+  .app-footer {
+    padding: 1rem;
+  }
+
+  .app-content {
+    gap: 1rem;
+  }
+}
+
+@media (prefers-color-scheme: light) {
+  .app-header {
+    border-bottom-color: rgba(0, 0, 0, 0.1);
+    background-color: rgba(0, 0, 0, 0.02);
+  }
+
+  .app-description {
+    color: rgba(0, 0, 0, 0.6);
+  }
+
+  .app-error {
+    background-color: rgba(255, 0, 0, 0.1);
+    border-color: rgba(255, 0, 0, 0.3);
+    color: #cc0000;
+  }
+
+  .app-loading {
+    color: rgba(0, 0, 0, 0.7);
+  }
+
+  .app-welcome {
+    color: rgba(0, 0, 0, 0.6);
+  }
+
+  .app-welcome h2 {
+    color: rgba(0, 0, 0, 0.8);
+  }
+
+  .app-welcome-features {
+    color: rgba(0, 0, 0, 0.5);
+  }
+
+  .app-no-selection {
+    background-color: rgba(0, 0, 0, 0.02);
+    color: rgba(0, 0, 0, 0.5);
+  }
+
+  .app-footer {
+    border-top-color: rgba(0, 0, 0, 0.1);
+    color: rgba(0, 0, 0, 0.5);
+  }
+}

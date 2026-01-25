@@ -90,7 +90,16 @@ func (s *Service) buildServiceInfo() *ServiceInfo {
 	hostname, _ := os.Hostname()
 	ip := getLocalIP()
 
-	apiBase := fmt.Sprintf("http://%s:%d", ip, s.config.APIPort)
+	// Use BASE_URL for external access (dashboard navigation), fall back to internal IP
+	var apiBase string
+	if s.config.BaseURL != "" {
+		apiBase = s.config.BaseURL
+	} else {
+		apiBase = fmt.Sprintf("http://%s:%d", ip, s.config.APIPort)
+	}
+
+	// Internal URLs always use container IP for container-to-container communication
+	internalBase := fmt.Sprintf("http://%s:%d", ip, s.config.APIPort)
 	metaCoreBase := fmt.Sprintf("http://%s:%d", ip, s.config.HTTPPort)
 
 	return &ServiceInfo{
@@ -104,15 +113,16 @@ func (s *Service) buildServiceInfo() *ServiceInfo {
 		LastHeartbeat: time.Now().UTC().Format(time.RFC3339),
 		Capabilities:  []string{"meta-core"},
 		Endpoints: map[string]string{
-			// meta-core sidecar endpoints (port 9000)
+			// meta-core sidecar endpoints (port 9000) - always internal
 			"health":   metaCoreBase + "/health",
 			"meta":     metaCoreBase + "/meta",
 			"leader":   metaCoreBase + "/leader",
 			"services": metaCoreBase + "/services",
-			// main service endpoints (port 80)
-			"api":      apiBase + "/api",
-			"webdav":   apiBase + "/webdav",
-			"callback": apiBase + "/api/plugins/callback",
+			// main service endpoints - external for dashboard
+			"api":    apiBase + "/api",
+			"webdav": apiBase + "/webdav",
+			// callback uses internal IP for container-to-container plugin communication
+			"callback": internalBase + "/api/plugins/callback",
 		},
 	}
 }

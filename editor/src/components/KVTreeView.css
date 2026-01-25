@@ -1,0 +1,247 @@
+.kv-tree {
+  background-color: rgba(255, 255, 255, 0.05);
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+}
+
+.kv-tree-header {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  background-color: rgba(0, 0, 0, 0.2);
+}
+
+.kv-tree-header h3 {
+  margin: 0;
+  font-size: 0.9rem;
+  color: rgba(255, 255, 255, 0.8);
+}
+
+.kv-tree-info {
+  display: flex;
+  gap: 1rem;
+  font-size: 0.75rem;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.kv-tree-refresh {
+  margin-left: auto;
+  padding: 0.25rem 0.75rem;
+  font-size: 0.75rem;
+  background-color: rgba(100, 108, 255, 0.2);
+  color: #646cff;
+  border: 1px solid rgba(100, 108, 255, 0.3);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.kv-tree-refresh:hover:not(:disabled) {
+  background-color: rgba(100, 108, 255, 0.3);
+}
+
+.kv-tree-refresh:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.kv-tree-error {
+  padding: 0.5rem 1rem;
+  background-color: rgba(255, 0, 0, 0.1);
+  color: #ff6b6b;
+  font-size: 0.8rem;
+}
+
+.kv-tree-content {
+  max-height: 400px;
+  overflow-y: auto;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  font-size: 0.8rem;
+}
+
+.kv-tree-node {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.kv-tree-node:last-child {
+  border-bottom: none;
+}
+
+.kv-tree-key {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+  transition: background-color 0.15s;
+}
+
+.kv-tree-key:hover {
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
+.kv-tree-key.expanded {
+  background-color: rgba(100, 108, 255, 0.1);
+}
+
+.kv-tree-toggle {
+  width: 1rem;
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 0.65rem;
+}
+
+.kv-tree-key-name {
+  flex: 1;
+  color: #88c0d0;
+  word-break: break-all;
+}
+
+.kv-tree-type {
+  padding: 0.1rem 0.4rem;
+  font-size: 0.65rem;
+  background-color: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.kv-tree-value {
+  padding: 0.5rem 1rem 0.5rem 2.5rem;
+  background-color: rgba(0, 0, 0, 0.2);
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.kv-tree-fields {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.kv-tree-fields tr:hover {
+  background-color: rgba(255, 255, 255, 0.03);
+}
+
+.kv-field-name {
+  padding: 0.25rem 0.5rem 0.25rem 0;
+  color: #a3be8c;
+  white-space: nowrap;
+  vertical-align: top;
+  width: 1%;
+}
+
+.kv-field-value {
+  padding: 0.25rem 0;
+  color: rgba(255, 255, 255, 0.7);
+  word-break: break-all;
+}
+
+.kv-field-value pre {
+  margin: 0;
+  font-family: inherit;
+  white-space: pre-wrap;
+  font-size: 0.75rem;
+}
+
+.kv-tree-load-more {
+  display: block;
+  width: 100%;
+  padding: 0.75rem;
+  font-size: 0.8rem;
+  background-color: transparent;
+  color: #646cff;
+  border: none;
+  cursor: pointer;
+  transition: background-color 0.15s;
+}
+
+.kv-tree-load-more:hover:not(:disabled) {
+  background-color: rgba(100, 108, 255, 0.1);
+}
+
+.kv-tree-load-more:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.kv-tree-empty {
+  padding: 2rem;
+  text-align: center;
+  color: rgba(255, 255, 255, 0.4);
+}
+
+/* Light mode */
+@media (prefers-color-scheme: light) {
+  .kv-tree {
+    background-color: rgba(0, 0, 0, 0.02);
+    border-color: rgba(0, 0, 0, 0.1);
+  }
+
+  .kv-tree-header {
+    border-bottom-color: rgba(0, 0, 0, 0.1);
+    background-color: rgba(0, 0, 0, 0.03);
+  }
+
+  .kv-tree-header h3 {
+    color: rgba(0, 0, 0, 0.8);
+  }
+
+  .kv-tree-info {
+    color: rgba(0, 0, 0, 0.5);
+  }
+
+  .kv-tree-error {
+    background-color: rgba(255, 0, 0, 0.08);
+    color: #cc0000;
+  }
+
+  .kv-tree-node {
+    border-bottom-color: rgba(0, 0, 0, 0.05);
+  }
+
+  .kv-tree-key:hover {
+    background-color: rgba(0, 0, 0, 0.03);
+  }
+
+  .kv-tree-key.expanded {
+    background-color: rgba(100, 108, 255, 0.08);
+  }
+
+  .kv-tree-toggle {
+    color: rgba(0, 0, 0, 0.4);
+  }
+
+  .kv-tree-key-name {
+    color: #0077aa;
+  }
+
+  .kv-tree-type {
+    background-color: rgba(0, 0, 0, 0.08);
+    color: rgba(0, 0, 0, 0.5);
+  }
+
+  .kv-tree-value {
+    background-color: rgba(0, 0, 0, 0.02);
+    border-top-color: rgba(0, 0, 0, 0.05);
+  }
+
+  .kv-tree-fields tr:hover {
+    background-color: rgba(0, 0, 0, 0.02);
+  }
+
+  .kv-field-name {
+    color: #228822;
+  }
+
+  .kv-field-value {
+    color: rgba(0, 0, 0, 0.7);
+  }
+
+  .kv-tree-load-more:hover:not(:disabled) {
+    background-color: rgba(100, 108, 255, 0.08);
+  }
+
+  .kv-tree-empty {
+    color: rgba(0, 0, 0, 0.4);
+  }
+}

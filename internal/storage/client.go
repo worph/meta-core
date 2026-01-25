@@ -490,3 +490,83 @@ func (c *Client) RemoveFromSet(hashID, property, value string) (bool, error) {
 	newValue := strings.Join(newValues, "|")
 	return true, c.client.HSet(ctx, hashKey, property, newValue).Err()
 }
+
+// GetMemoryInfo returns Redis memory usage information
+func (c *Client) GetMemoryInfo() (string, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.client == nil {
+		return "", fmt.Errorf("not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	info, err := c.client.Info(ctx, "memory").Result()
+	if err != nil {
+		return "", fmt.Errorf("info memory failed: %w", err)
+	}
+
+	// Extract used_memory_human from info string
+	for _, line := range strings.Split(info, "\r\n") {
+		if strings.HasPrefix(line, "used_memory_human:") {
+			return strings.TrimPrefix(line, "used_memory_human:"), nil
+		}
+	}
+
+	return "N/A", nil
+}
+
+// ClearAllMetadata deletes all file metadata and index
+// Returns the number of files deleted
+func (c *Client) ClearAllMetadata() (int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.client == nil {
+		return 0, fmt.Errorf("not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	// Get all hash IDs from index
+	indexKey := c.buildIndexKey()
+	hashIDs, err := c.client.SMembers(ctx, indexKey).Result()
+	if err != nil {
+		return 0, fmt.Errorf("smembers failed: %w", err)
+	}
+
+	var deletedCount int64
+
+	// Delete each file's hash
+	for _, hashID := range hashIDs {
+		hashKey := c.buildHashKey(hashID)
+		if err := c.client.Del(ctx, hashKey).Err(); err != nil {
+			log.Printf("[Storage] Warning: failed to delete %s: %v", hashKey, err)
+			continue
+		}
+		deletedCount++
+	}
+
+	// Delete the index set
+	if err := c.client.Del(ctx, indexKey).Err(); err != nil {
+		log.Printf("[Storage] Warning: failed to delete index: %v", err)
+	}
+
+	log.Printf("[Storage] Cleared %d file metadata entries", deletedCount)
+	return deletedCount, nil
+}
+
+// GetRedisClient returns the underlying redis client for advanced operations
+func (c *Client) GetRedisClient() *redis.Client {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.client
+}
+
+// GetPrefix returns the key prefix used by this client
+func (c *Client) GetPrefix() string {
+	return c.prefix
+}

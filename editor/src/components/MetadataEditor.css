@@ -1,0 +1,438 @@
+.metadata-editor {
+  background-color: rgba(255, 255, 255, 0.05);
+  border-radius: 8px;
+  padding: 1.5rem;
+}
+
+.metadata-editor-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.metadata-editor-header h2 {
+  margin: 0;
+  font-size: 1.5rem;
+}
+
+.metadata-editor-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.metadata-editor-actions button.primary {
+  background-color: #646cff;
+  color: white;
+}
+
+.metadata-editor-actions button.primary:hover:not(:disabled) {
+  background-color: #535bf2;
+}
+
+.metadata-editor-actions .download-button {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.5rem 1rem;
+  background-color: #28a745;
+  color: white;
+  border-radius: 4px;
+  text-decoration: none;
+  font-size: 0.9rem;
+  font-weight: 500;
+  transition: background-color 0.2s;
+}
+
+.metadata-editor-actions .download-button:hover {
+  background-color: #218838;
+}
+
+.metadata-editor-message {
+  padding: 1rem;
+  border-radius: 4px;
+  margin-bottom: 1rem;
+}
+
+.metadata-editor-message.success {
+  background-color: rgba(0, 200, 0, 0.1);
+  border: 1px solid rgba(0, 200, 0, 0.3);
+  color: #00ff00;
+}
+
+.metadata-editor-message.error {
+  background-color: rgba(255, 0, 0, 0.1);
+  border: 1px solid rgba(255, 0, 0, 0.3);
+  color: #ff6b6b;
+}
+
+.metadata-editor-hashes {
+  margin-bottom: 1.5rem;
+  padding: 1rem;
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 8px;
+  border-left: 4px solid #888;
+}
+
+.hashes-header {
+  margin-bottom: 0.75rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.hashes-header h3 {
+  margin: 0;
+  font-size: 0.9rem;
+  color: rgba(255, 255, 255, 0.7);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.hashes-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.hash-value {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.hash-value-primary {
+  margin-bottom: 0.5rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.hash-value-primary .hash-label {
+  color: #4ecdc4;
+}
+
+.hash-value-primary .hash-code {
+  color: #4ecdc4;
+  font-size: 1rem;
+}
+
+.hash-label {
+  font-size: 0.75rem;
+  color: rgba(255, 255, 255, 0.4);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.hash-code {
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Courier New', monospace;
+  font-size: 0.85rem;
+  color: rgba(255, 255, 255, 0.6);
+  word-break: break-all;
+  cursor: pointer;
+  transition: color 0.2s;
+}
+
+.hash-code:hover {
+  color: #fff;
+}
+
+/* Plugin Chips */
+.metadata-editor-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 1.5rem;
+}
+
+.plugin-chip {
+  padding: 0.4rem 0.8rem;
+  border-radius: 16px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  border: 2px solid var(--chip-color);
+  color: var(--chip-color);
+  background: transparent;
+}
+
+.plugin-chip:hover {
+  background-color: var(--chip-color);
+  color: white;
+}
+
+.plugin-chip.active {
+  color: white;
+}
+
+/* Plugin Accordion */
+.plugin-accordion {
+  margin-bottom: 0.5rem;
+  border-radius: 8px;
+  overflow: hidden;
+  background-color: rgba(0, 0, 0, 0.2);
+}
+
+.plugin-accordion-header {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 1rem 1.25rem;
+  border: none;
+  border-left: 4px solid #646cff;
+  background-color: rgba(255, 255, 255, 0.05);
+  color: inherit;
+  font-size: 1rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.2s ease;
+}
+
+.plugin-accordion-header:hover {
+  background-color: rgba(255, 255, 255, 0.1);
+}
+
+.plugin-accordion.expanded .plugin-accordion-header {
+  background-color: rgba(255, 255, 255, 0.08);
+}
+
+.plugin-accordion-title {
+  color: inherit;
+}
+
+.plugin-accordion-icon {
+  font-size: 0.75rem;
+  opacity: 0.6;
+  transition: transform 0.2s ease;
+}
+
+.plugin-accordion-content {
+  padding: 1rem 1.25rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.metadata-editor-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.metadata-section {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-left: 4px solid #646cff;
+  border-radius: 8px;
+  padding: 1.5rem;
+  background-color: rgba(0, 0, 0, 0.2);
+}
+
+.metadata-section-header {
+  margin-bottom: 1rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.metadata-section-header h3 {
+  margin: 0 0 0.25rem 0;
+  font-size: 1.1rem;
+  color: #646cff;
+}
+
+.plugin-description {
+  margin: 0;
+  font-size: 0.85rem;
+  color: rgba(255, 255, 255, 0.5);
+  font-style: italic;
+}
+
+.metadata-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.metadata-field:last-child {
+  margin-bottom: 0;
+}
+
+.metadata-field label {
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.metadata-field input,
+.metadata-field textarea,
+.metadata-field select {
+  width: 100%;
+}
+
+.metadata-field-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.metadata-field-row:last-child {
+  margin-bottom: 0;
+}
+
+.hash-field {
+  font-family: 'Courier New', monospace;
+  font-size: 0.9em;
+}
+
+.no-hash-info {
+  margin: 0;
+  padding: 1rem;
+  text-align: center;
+  color: rgba(255, 255, 255, 0.5);
+  font-style: italic;
+}
+
+.metadata-editor-loading,
+.metadata-editor-error,
+.metadata-editor-empty {
+  padding: 3rem;
+  text-align: center;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.metadata-editor-error button {
+  margin-top: 1rem;
+}
+
+@media (max-width: 768px) {
+  .metadata-editor-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 1rem;
+  }
+
+  .metadata-editor-actions {
+    width: 100%;
+  }
+
+  .metadata-editor-actions button {
+    flex: 1;
+  }
+
+  .metadata-field-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-color-scheme: light) {
+  .metadata-editor {
+    background-color: rgba(0, 0, 0, 0.02);
+  }
+
+  .metadata-editor-header {
+    border-bottom-color: rgba(0, 0, 0, 0.1);
+  }
+
+  .metadata-section {
+    border-color: rgba(0, 0, 0, 0.1);
+    background-color: rgba(0, 0, 0, 0.02);
+  }
+
+  .metadata-section-header {
+    border-bottom-color: rgba(0, 0, 0, 0.1);
+  }
+
+  .plugin-description {
+    color: rgba(0, 0, 0, 0.5);
+  }
+
+  .metadata-field label {
+    color: rgba(0, 0, 0, 0.7);
+  }
+
+  .metadata-editor-message.success {
+    background-color: rgba(0, 200, 0, 0.1);
+    border-color: rgba(0, 200, 0, 0.3);
+    color: #008800;
+  }
+
+  .metadata-editor-message.error {
+    background-color: rgba(255, 0, 0, 0.1);
+    border-color: rgba(255, 0, 0, 0.3);
+    color: #cc0000;
+  }
+
+  .metadata-editor-loading,
+  .metadata-editor-error,
+  .metadata-editor-empty {
+    color: rgba(0, 0, 0, 0.5);
+  }
+
+  .no-hash-info {
+    color: rgba(0, 0, 0, 0.5);
+  }
+
+  .metadata-editor-hashes {
+    background: rgba(0, 0, 0, 0.05);
+  }
+
+  .hashes-header {
+    border-bottom-color: rgba(0, 0, 0, 0.1);
+  }
+
+  .hashes-header h3 {
+    color: rgba(0, 0, 0, 0.7);
+  }
+
+  .hash-value-primary {
+    border-bottom-color: rgba(0, 0, 0, 0.1);
+  }
+
+  .hash-value-primary .hash-label,
+  .hash-value-primary .hash-code {
+    color: #0a9e94;
+  }
+
+  .hash-label {
+    color: rgba(0, 0, 0, 0.4);
+  }
+
+  .hash-code {
+    color: rgba(0, 0, 0, 0.6);
+  }
+
+  .hash-code:hover {
+    color: #000;
+  }
+
+  /* Plugin Chips - Light theme */
+  .plugin-chip {
+    background: transparent;
+  }
+
+  .plugin-chip:hover,
+  .plugin-chip.active {
+    color: white;
+  }
+
+  /* Plugin Accordion - Light theme */
+  .plugin-accordion {
+    background-color: rgba(0, 0, 0, 0.02);
+  }
+
+  .plugin-accordion-header {
+    background-color: rgba(0, 0, 0, 0.03);
+  }
+
+  .plugin-accordion-header:hover {
+    background-color: rgba(0, 0, 0, 0.06);
+  }
+
+  .plugin-accordion.expanded .plugin-accordion-header {
+    background-color: rgba(0, 0, 0, 0.05);
+  }
+
+  .plugin-accordion-content {
+    border-top-color: rgba(0, 0, 0, 0.1);
+  }
+}

@@ -1,0 +1,63 @@
+.plugin-section {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-left: 4px solid #646cff;
+  border-radius: 8px;
+  padding: 1.5rem;
+  background-color: rgba(0, 0, 0, 0.2);
+}
+
+.plugin-section-header {
+  margin-bottom: 1rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.plugin-section-header h3 {
+  margin: 0 0 0.25rem 0;
+  font-size: 1.1rem;
+  color: #646cff;
+}
+
+.plugin-section-header .plugin-description {
+  margin: 0;
+  font-size: 0.85rem;
+  color: rgba(255, 255, 255, 0.5);
+  font-style: italic;
+}
+
+.plugin-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+/* Responsive grid for fields */
+@media (min-width: 768px) {
+  .plugin-fields {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 1rem;
+  }
+
+  /* Make text and json fields span full width */
+  .plugin-fields .dynamic-field:has(textarea),
+  .plugin-fields .json-field {
+    grid-column: 1 / -1;
+  }
+}
+
+/* Light theme */
+@media (prefers-color-scheme: light) {
+  .plugin-section {
+    border-color: rgba(0, 0, 0, 0.1);
+    background-color: rgba(0, 0, 0, 0.02);
+  }
+
+  .plugin-section-header {
+    border-bottom-color: rgba(0, 0, 0, 0.1);
+  }
+
+  .plugin-section-header .plugin-description {
+    color: rgba(0, 0, 0, 0.5);
+  }
+}
