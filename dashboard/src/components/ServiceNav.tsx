@@ -2,7 +2,6 @@ import { useState, useEffect } from 'react';
 
 interface ServiceInfo {
   name: string;
-  url: string;
   api: string;
   status: string;
   capabilities: string[];
@@ -70,12 +69,12 @@ function ServiceNav() {
           return (
             <a
               key={service.name}
-              href={isActive ? '#' : service.url}
+              href={isActive ? '#' : service.api}
               className={`service-link${isActive ? ' active' : ''}`}
               onClick={(e) => {
                 e.preventDefault();
                 if (!isActive) {
-                  window.location.href = service.url;
+                  window.location.href = service.api;
                 }
               }}
             >

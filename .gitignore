@@ -21,3 +21,5 @@ go.work
 *.swp
 *.swo
 dashboard/node_modules/*
+dist/*
+dashboard/dist/*
