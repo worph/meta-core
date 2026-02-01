@@ -11,6 +11,12 @@ const (
 	MountTypeRclone MountType = "rclone"
 )
 
+// Polling constants
+const (
+	DefaultPollingIntervalMs = 30000 // 30 seconds
+	MinPollingIntervalMs     = 5000  // 5 seconds
+)
+
 // MountConfig represents a mount configuration
 type MountConfig struct {
 	// Common fields
@@ -36,14 +42,20 @@ type MountConfig struct {
 	// rclone-specific fields
 	RcloneRemote string `json:"rcloneRemote,omitempty"`
 	RclonePath   string `json:"rclonePath,omitempty"`
+
+	// Polling configuration
+	PollingEnabled    bool `json:"pollingEnabled"`
+	PollingIntervalMs int  `json:"pollingIntervalMs,omitempty"` // Default: 30000
 }
 
 // MountStatus represents the runtime status of a mount
 type MountStatus struct {
 	MountConfig
-	Mounted     bool   `json:"mounted"`
-	Error       string `json:"error,omitempty"`
-	LastChecked int64  `json:"lastChecked"`
+	Mounted        bool   `json:"mounted"`
+	Error          string `json:"error,omitempty"`
+	LastChecked    int64  `json:"lastChecked"`
+	PollingActive  bool   `json:"pollingActive,omitempty"`
+	LastPolledScan int64  `json:"lastPolledScan,omitempty"`
 }
 
 // MountsFile represents the mounts.json file structure
@@ -79,6 +91,19 @@ type CreateMountRequest struct {
 	// rclone
 	RcloneRemote string `json:"rcloneRemote,omitempty"`
 	RclonePath   string `json:"rclonePath,omitempty"`
+
+	// Polling
+	PollingEnabled    *bool `json:"pollingEnabled,omitempty"`
+	PollingIntervalMs *int  `json:"pollingIntervalMs,omitempty"`
+}
+
+// MountScanResponse is the response for mount scan operations
+type MountScanResponse struct {
+	Status    string `json:"status"`
+	Message   string `json:"message,omitempty"`
+	MountID   string `json:"mountId"`
+	MountPath string `json:"mountPath"`
+	FileCount int    `json:"fileCount,omitempty"`
 }
 
 // MountResponse is the response for mount operations

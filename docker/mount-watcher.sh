@@ -51,10 +51,13 @@ init_dirs() {
     fi
 }
 
-# Check if path is mounted
+# Check if path is mounted (uses /proc/mounts for Alpine compatibility)
 is_mounted() {
     local mount_path="$1"
-    findmnt -n "$mount_path" > /dev/null 2>&1
+    # Remove trailing slash for consistent matching
+    local clean_path="${mount_path%/}"
+    # Check if the path appears as a mount point in /proc/mounts (field 2)
+    grep -q " ${clean_path} " /proc/mounts 2>/dev/null
 }
 
 # Clear error file for mount

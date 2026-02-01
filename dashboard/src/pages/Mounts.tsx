@@ -10,6 +10,10 @@ interface Mount {
   mounted: boolean;
   error?: string;
   lastChecked: number;
+  pollingEnabled?: boolean;
+  pollingIntervalMs?: number;
+  pollingActive?: boolean;
+  lastPolledScan?: number;
 }
 
 interface RcloneRemote {
@@ -55,7 +59,10 @@ export default function Mounts() {
     smbPassword: '',
     rcloneRemote: '',
     rclonePath: '',
+    pollingEnabled: false,
+    pollingIntervalMs: 30000,
   });
+  const [scanning, setScanning] = useState<string | null>(null);
 
   const fetchMounts = async () => {
     try {
@@ -106,6 +113,29 @@ export default function Mounts() {
     fetchMounts();
   };
 
+  const handleScan = async (id: string) => {
+    setScanning(id);
+    try {
+      await fetch(`/api/mounts/${id}/scan`, { method: 'POST' });
+      fetchMounts();
+    } finally {
+      setScanning(null);
+    }
+  };
+
+  const handleUpdatePolling = async (id: string, pollingEnabled: boolean, pollingIntervalMs?: number) => {
+    const body: Record<string, unknown> = { pollingEnabled };
+    if (pollingIntervalMs !== undefined) {
+      body.pollingIntervalMs = pollingIntervalMs;
+    }
+    await fetch(`/api/mounts/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    fetchMounts();
+  };
+
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
     const body: Record<string, unknown> = {
@@ -126,6 +156,12 @@ export default function Mounts() {
       body.rclonePath = formData.rclonePath;
     }
 
+    // Add polling configuration
+    body.pollingEnabled = formData.pollingEnabled;
+    if (formData.pollingEnabled && formData.pollingIntervalMs >= 5000) {
+      body.pollingIntervalMs = formData.pollingIntervalMs;
+    }
+
     await fetch('/api/mounts', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -144,6 +180,8 @@ export default function Mounts() {
       smbPassword: '',
       rcloneRemote: '',
       rclonePath: '',
+      pollingEnabled: false,
+      pollingIntervalMs: 30000,
     });
     fetchMounts();
   };
@@ -275,6 +313,28 @@ export default function Mounts() {
               </>
             )}
 
+            <div style={{ marginTop: '1rem', borderTop: '1px solid #0f3460', paddingTop: '1rem' }}>
+              <label style={{ display: 'flex', alignItems: 'center', marginBottom: '0.5rem', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={formData.pollingEnabled}
+                  onChange={(e) => setFormData({ ...formData, pollingEnabled: e.target.checked })}
+                  style={{ marginRight: '0.5rem' }}
+                />
+                Enable Polling (auto-scan on interval)
+              </label>
+              {formData.pollingEnabled && (
+                <input
+                  style={inputStyle}
+                  type="number"
+                  min="5000"
+                  placeholder="Polling Interval (ms)"
+                  value={formData.pollingIntervalMs}
+                  onChange={(e) => setFormData({ ...formData, pollingIntervalMs: parseInt(e.target.value) || 30000 })}
+                />
+              )}
+            </div>
+
             <button type="submit" style={buttonStyle}>
               Create Mount
             </button>
@@ -301,23 +361,57 @@ export default function Mounts() {
                     {mount.mounted ? 'Mounted' : 'Not mounted'}
                   </span>
                 </p>
+                {mount.pollingEnabled && (
+                  <p style={{ color: '#888', fontSize: '0.9rem' }}>
+                    Polling:{' '}
+                    <span style={{ color: mount.pollingActive ? '#4ade80' : '#f59e0b' }}>
+                      {mount.pollingActive ? 'Active' : 'Inactive'}
+                    </span>
+                    {' | Interval: '}{(mount.pollingIntervalMs || 30000) / 1000}s
+                    {mount.lastPolledScan && (
+                      <> | Last scan: {new Date(mount.lastPolledScan).toLocaleTimeString()}</>
+                    )}
+                  </p>
+                )}
                 {mount.error && (
                   <p style={{ color: '#f87171', marginTop: '0.5rem' }}>Error: {mount.error}</p>
                 )}
               </div>
-              <div>
-                {mount.mounted ? (
-                  <button style={buttonStyle} onClick={() => handleUnmount(mount.id)}>
-                    Unmount
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                <div>
+                  {mount.mounted ? (
+                    <button style={buttonStyle} onClick={() => handleUnmount(mount.id)}>
+                      Unmount
+                    </button>
+                  ) : (
+                    <button style={buttonStyle} onClick={() => handleMount(mount.id)}>
+                      Mount
+                    </button>
+                  )}
+                  <button style={dangerButtonStyle} onClick={() => handleDelete(mount.id)}>
+                    Delete
                   </button>
-                ) : (
-                  <button style={buttonStyle} onClick={() => handleMount(mount.id)}>
-                    Mount
-                  </button>
+                </div>
+                {mount.mounted && (
+                  <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                    <button
+                      style={{ ...buttonStyle, marginRight: 0 }}
+                      onClick={() => handleScan(mount.id)}
+                      disabled={scanning === mount.id}
+                    >
+                      {scanning === mount.id ? 'Scanning...' : 'Scan Now'}
+                    </button>
+                    <label style={{ display: 'flex', alignItems: 'center', fontSize: '0.85rem', cursor: 'pointer' }}>
+                      <input
+                        type="checkbox"
+                        checked={mount.pollingEnabled || false}
+                        onChange={(e) => handleUpdatePolling(mount.id, e.target.checked, mount.pollingIntervalMs)}
+                        style={{ marginRight: '0.25rem' }}
+                      />
+                      Poll
+                    </label>
+                  </div>
                 )}
-                <button style={dangerButtonStyle} onClick={() => handleDelete(mount.id)}>
-                  Delete
-                </button>
               </div>
             </div>
           </div>

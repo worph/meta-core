@@ -18,17 +18,18 @@ import (
 
 // Server is the HTTP API server for meta-core
 type Server struct {
-	config          *config.Config
-	election        *leader.Election
-	discovery       *discovery.Service
-	storage         *storage.Client
-	mountsManager   *mounts.Manager
-	mountsHandlers  *mounts.Handlers
+	config            *config.Config
+	election          *leader.Election
+	discovery         *discovery.Service
+	storage           *storage.Client
+	mountsManager     *mounts.Manager
+	mountsHandlers    *mounts.Handlers
+	mountPoller       *mounts.Poller
 	watcherDispatcher *watcher.Dispatcher
-	fileWatcher     *watcher.Watcher
-	watcherHandlers *watcher.Handlers
-	router          *mux.Router
-	server          *http.Server
+	fileWatcher       *watcher.Watcher
+	watcherHandlers   *watcher.Handlers
+	router            *mux.Router
+	server            *http.Server
 }
 
 // NewServer creates a new API server
@@ -46,16 +47,8 @@ func NewServer(
 		router:    mux.NewRouter(),
 	}
 
-	// Initialize mounts manager
-	mountsManager, err := mounts.NewManager(cfg)
-	if err != nil {
-		log.Printf("[API] Warning: failed to initialize mounts manager: %v", err)
-	} else {
-		s.mountsManager = mountsManager
-		s.mountsHandlers = mounts.NewHandlers(mountsManager)
-	}
-
-	// Initialize file watcher (if enabled)
+	// Initialize file watcher (if enabled) - before mounts so we can pass scanFunc
+	var scanFunc mounts.ScanFunc
 	if cfg.EnableFileWatcher && len(cfg.WatchFolderList) > 0 {
 		s.watcherDispatcher = watcher.NewDispatcher()
 		fileWatcher, err := watcher.NewWatcher(cfg, s.watcherDispatcher)
@@ -64,7 +57,22 @@ func NewServer(
 		} else {
 			s.fileWatcher = fileWatcher
 			s.watcherHandlers = watcher.NewHandlers(fileWatcher, s.watcherDispatcher)
+			// Create scan function from watcher
+			scanFunc = fileWatcher.ScanMountPath
 		}
+	}
+
+	// Initialize mounts manager
+	mountsManager, err := mounts.NewManager(cfg)
+	if err != nil {
+		log.Printf("[API] Warning: failed to initialize mounts manager: %v", err)
+	} else {
+		s.mountsManager = mountsManager
+		s.mountsHandlers = mounts.NewHandlers(mountsManager, scanFunc)
+
+		// Create and configure mount poller
+		s.mountPoller = mounts.NewPoller(mountsManager, scanFunc)
+		mountsManager.SetPoller(s.mountPoller)
 	}
 
 	s.setupRoutes()
@@ -78,6 +86,7 @@ func (s *Server) setupRoutes() {
 	s.router.HandleFunc("/status", s.handleStatus).Methods("GET")
 	s.router.HandleFunc("/leader", s.handleLeader).Methods("GET")
 	s.router.HandleFunc("/role", s.handleRole).Methods("GET")
+	s.router.HandleFunc("/urls", s.handleURLs).Methods("GET")
 
 	// Metadata Editor API routes (must be before /meta/{hash} routes)
 	s.router.HandleFunc("/api/metadata/hash-ids", s.handleGetHashIds).Methods("GET")
@@ -170,11 +179,25 @@ func (s *Server) Start() error {
 		}
 	}
 
+	// Start mount poller (if initialized)
+	if s.mountPoller != nil {
+		if err := s.mountPoller.Start(); err != nil {
+			log.Printf("[API] Warning: failed to start mount poller: %v", err)
+		}
+	}
+
 	return nil
 }
 
 // Stop gracefully stops the HTTP server
 func (s *Server) Stop() error {
+	// Stop mount poller
+	if s.mountPoller != nil {
+		if err := s.mountPoller.Stop(); err != nil {
+			log.Printf("[API] Warning: failed to stop mount poller: %v", err)
+		}
+	}
+
 	// Stop file watcher
 	if s.fileWatcher != nil {
 		if err := s.fileWatcher.Stop(); err != nil {

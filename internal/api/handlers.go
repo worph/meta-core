@@ -134,6 +134,37 @@ func (s *Server) handleRole(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// URLsResponse is the response for /urls
+type URLsResponse struct {
+	Hostname  string `json:"hostname"`
+	BaseUrl   string `json:"baseUrl"`
+	ApiUrl    string `json:"apiUrl"`
+	RedisUrl  string `json:"redisUrl"`
+	WebdavUrl string `json:"webdavUrl"`
+	IsLeader  bool   `json:"isLeader"`
+}
+
+// handleURLs handles GET /urls
+// Returns URLs for the current leader (or this instance if leader)
+func (s *Server) handleURLs(w http.ResponseWriter, r *http.Request) {
+	info := s.election.LeaderInfo()
+	if info == nil {
+		writeError(w, http.StatusServiceUnavailable, "no leader available")
+		return
+	}
+
+	response := URLsResponse{
+		Hostname:  info.Hostname,
+		BaseUrl:   info.BaseUrl,
+		ApiUrl:    info.ApiUrl,
+		RedisUrl:  info.RedisUrl,
+		WebdavUrl: info.WebdavUrl,
+		IsLeader:  s.election.IsLeader(),
+	}
+
+	writeJSON(w, http.StatusOK, response)
+}
+
 // handleGetMeta handles GET /meta/{hash}
 func (s *Server) handleGetMeta(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)

@@ -14,12 +14,13 @@ import (
 	"github.com/metazla/meta-core/internal/config"
 )
 
-// LeaderLockInfo matches the TypeScript LeaderLockInfo interface
+// LeaderLockInfo contains all URLs and metadata for the leader
 type LeaderLockInfo struct {
-	Host      string `json:"host"`
-	API       string `json:"api"`
-	HTTP      string `json:"http"`
-	BaseURL   string `json:"baseUrl,omitempty"`
+	Hostname  string `json:"hostname"`
+	BaseUrl   string `json:"baseUrl"`
+	ApiUrl    string `json:"apiUrl"`   // meta-core API (port 9000)
+	RedisUrl  string `json:"redisUrl"`
+	WebdavUrl string `json:"webdavUrl"`
 	Timestamp int64  `json:"timestamp"`
 	PID       int    `json:"pid"`
 }
@@ -236,7 +237,7 @@ func (e *Election) transitionToLeader() error {
 
 	// Connect storage to local Redis
 	if e.storage != nil {
-		if err := e.storage.Connect(info.API); err != nil {
+		if err := e.storage.Connect(info.RedisUrl); err != nil {
 			log.Printf("[Election] Warning: failed to connect storage: %v", err)
 		}
 	}
@@ -269,11 +270,11 @@ func (e *Election) transitionToFollower() error {
 	e.mu.Unlock()
 
 	if info != nil {
-		log.Printf("[Election] Leader is at %s", info.API)
+		log.Printf("[Election] Leader is at %s (Redis: %s)", info.ApiUrl, info.RedisUrl)
 
 		// Connect storage to leader's Redis
 		if e.storage != nil {
-			if err := e.storage.Connect(info.API); err != nil {
+			if err := e.storage.Connect(info.RedisUrl); err != nil {
 				log.Printf("[Election] Warning: failed to connect to leader: %v", err)
 			}
 		}
@@ -293,11 +294,18 @@ func (e *Election) buildLeaderInfo() *LeaderLockInfo {
 	ip := getLocalIP()
 	hostname, _ := os.Hostname()
 
+	// Use BaseURL if configured, otherwise construct from IP
+	baseUrl := e.config.BaseURL
+	if baseUrl == "" {
+		baseUrl = fmt.Sprintf("http://%s:%d", ip, e.config.APIPort)
+	}
+
 	return &LeaderLockInfo{
-		Host:      hostname,
-		API:       fmt.Sprintf("redis://%s:%d", ip, e.config.RedisPort),
-		HTTP:      fmt.Sprintf("http://%s:%d", ip, e.config.APIPort),
-		BaseURL:   e.config.BaseURL,
+		Hostname:  hostname,
+		BaseUrl:   baseUrl,
+		ApiUrl:    fmt.Sprintf("http://%s:%d", ip, e.config.HTTPPort),
+		RedisUrl:  fmt.Sprintf("redis://%s:%d", ip, e.config.RedisPort),
+		WebdavUrl: baseUrl + "/webdav",
 		Timestamp: time.Now().UnixMilli(),
 		PID:       os.Getpid(),
 	}

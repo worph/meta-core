@@ -23,6 +23,7 @@ type Manager struct {
 	mu        sync.RWMutex
 	filesPath string
 	mountsDir string
+	poller    *Poller
 }
 
 // NewManager creates a new mount manager
@@ -39,6 +40,11 @@ func NewManager(cfg *config.Config) (*Manager, error) {
 	}
 
 	return m, nil
+}
+
+// SetPoller sets the poller for the manager
+func (m *Manager) SetPoller(poller *Poller) {
+	m.poller = poller
 }
 
 // ensureDirs creates required directories
@@ -95,14 +101,30 @@ func (m *Manager) writeConfig(mountsFile *MountsFile) error {
 	return os.WriteFile(m.config.MountsFilePath(), data, 0644)
 }
 
-// IsMounted checks if a path is currently mounted
+// IsMounted checks if a path is currently mounted by parsing /proc/mounts
+// Note: Uses /proc/mounts instead of findmnt for Alpine compatibility
 func (m *Manager) IsMounted(mountPath string) bool {
-	cmd := exec.Command("findmnt", "-n", mountPath)
-	output, err := cmd.CombinedOutput()
+	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {
 		return false
 	}
-	return strings.TrimSpace(string(output)) != ""
+
+	// Clean the mount path (remove trailing slash)
+	cleanPath := strings.TrimSuffix(mountPath, "/")
+
+	// Parse each line of /proc/mounts
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			// Field 1 is the mount point
+			mountPoint := strings.TrimSuffix(fields[1], "/")
+			if mountPoint == cleanPath {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ReadError reads the error file for a mount
@@ -164,6 +186,26 @@ func ObscurePassword(password string) (string, error) {
 
 // ListMounts returns all mounts with their current status
 func (m *Manager) ListMounts() ([]MountStatus, error) {
+	statuses, err := m.listMountsWithoutPollingStatus()
+	if err != nil {
+		return nil, err
+	}
+
+	// Add polling status from poller (done separately to avoid deadlock)
+	if m.poller != nil {
+		for i := range statuses {
+			pollingStatus := m.poller.GetPollingStatus(statuses[i].ID)
+			statuses[i].PollingActive = pollingStatus.Active
+			statuses[i].LastPolledScan = pollingStatus.LastScan
+		}
+	}
+
+	return statuses, nil
+}
+
+// listMountsWithoutPollingStatus returns mounts without querying the poller
+// This is used internally by the poller to avoid deadlocks
+func (m *Manager) listMountsWithoutPollingStatus() ([]MountStatus, error) {
 	mountsFile, err := m.readConfig()
 	if err != nil {
 		return nil, err
@@ -197,12 +239,21 @@ func (m *Manager) GetMount(id string) (*MountStatus, error) {
 			mounted := m.IsMounted(mount.MountPath)
 			errMsg, _ := m.ReadError(mount.ID)
 
-			return &MountStatus{
+			status := &MountStatus{
 				MountConfig: mount,
 				Mounted:     mounted,
 				Error:       errMsg,
 				LastChecked: NowMS(),
-			}, nil
+			}
+
+			// Add polling status from poller (safe since GetMount isn't called from poller with lock held)
+			if m.poller != nil {
+				pollingStatus := m.poller.GetPollingStatus(mount.ID)
+				status.PollingActive = pollingStatus.Active
+				status.LastPolledScan = pollingStatus.LastScan
+			}
+
+			return status, nil
 		}
 	}
 
@@ -258,14 +309,26 @@ func (m *Manager) CreateMount(req *CreateMountRequest) (*MountStatus, error) {
 		enabled = *req.Enabled
 	}
 
+	// Default polling settings
+	pollingEnabled := false
+	if req.PollingEnabled != nil {
+		pollingEnabled = *req.PollingEnabled
+	}
+	pollingIntervalMs := DefaultPollingIntervalMs
+	if req.PollingIntervalMs != nil && *req.PollingIntervalMs >= MinPollingIntervalMs {
+		pollingIntervalMs = *req.PollingIntervalMs
+	}
+
 	mount := MountConfig{
-		ID:             id,
-		Name:           req.Name,
-		Type:           req.Type,
-		Enabled:        enabled,
-		DesiredMounted: enabled, // Auto-mount if enabled
-		MountPath:      mountPath,
-		Options:        req.Options,
+		ID:                id,
+		Name:              req.Name,
+		Type:              req.Type,
+		Enabled:           enabled,
+		DesiredMounted:    enabled, // Auto-mount if enabled
+		MountPath:         mountPath,
+		Options:           req.Options,
+		PollingEnabled:    pollingEnabled,
+		PollingIntervalMs: pollingIntervalMs,
 	}
 
 	// Type-specific fields
@@ -297,11 +360,73 @@ func (m *Manager) CreateMount(req *CreateMountRequest) (*MountStatus, error) {
 
 	log.Printf("[Mounts] Created mount config: %s (%s) -> %s", mount.Name, mount.Type, mount.MountPath)
 
+	// Notify poller about new mount
+	if m.poller != nil {
+		m.poller.NotifyMountChanged()
+	}
+
 	return &MountStatus{
 		MountConfig: mount,
 		Mounted:     false,
 		LastChecked: NowMS(),
 	}, nil
+}
+
+// UpdateMount updates mount configuration (for polling settings)
+func (m *Manager) UpdateMount(id string, updates map[string]interface{}) (*MountStatus, error) {
+	mountsFile, err := m.readConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	index := -1
+	for i, mount := range mountsFile.Mounts {
+		if mount.ID == id {
+			index = i
+			break
+		}
+	}
+
+	if index == -1 {
+		return nil, fmt.Errorf("mount not found")
+	}
+
+	// Apply updates
+	mount := &mountsFile.Mounts[index]
+
+	if val, ok := updates["pollingEnabled"]; ok {
+		if enabled, ok := val.(bool); ok {
+			mount.PollingEnabled = enabled
+		}
+	}
+
+	if val, ok := updates["pollingIntervalMs"]; ok {
+		// Handle both int and float64 (JSON numbers are float64)
+		switch v := val.(type) {
+		case int:
+			if v >= MinPollingIntervalMs {
+				mount.PollingIntervalMs = v
+			}
+		case float64:
+			if int(v) >= MinPollingIntervalMs {
+				mount.PollingIntervalMs = int(v)
+			}
+		}
+	}
+
+	if err := m.writeConfig(mountsFile); err != nil {
+		return nil, err
+	}
+
+	log.Printf("[Mounts] Updated mount config: %s", mount.Name)
+
+	// Notify poller about config change
+	if m.poller != nil {
+		m.poller.NotifyMountChanged()
+	}
+
+	// Return updated status
+	return m.GetMount(id)
 }
 
 // RequestMount sets desiredMounted to true
@@ -318,6 +443,12 @@ func (m *Manager) RequestMount(id string) error {
 				return err
 			}
 			log.Printf("[Mounts] Mount requested: %s", mount.Name)
+
+			// Notify poller about state change
+			if m.poller != nil {
+				m.poller.NotifyMountChanged()
+			}
+
 			return nil
 		}
 	}
@@ -339,6 +470,12 @@ func (m *Manager) RequestUnmount(id string) error {
 				return err
 			}
 			log.Printf("[Mounts] Unmount requested: %s", mount.Name)
+
+			// Notify poller about state change
+			if m.poller != nil {
+				m.poller.NotifyMountChanged()
+			}
+
 			return nil
 		}
 	}

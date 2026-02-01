@@ -39,7 +39,7 @@ func main() {
 	})
 
 	election.OnBecomeFollower(func(info *leader.LeaderLockInfo) {
-		log.Printf("[meta-core] Became FOLLOWER - Leader at %s", info.API)
+		log.Printf("[meta-core] Became FOLLOWER - Leader at %s (Redis: %s)", info.BaseUrl, info.RedisUrl)
 	})
 
 	election.OnLeaderLost(func() {

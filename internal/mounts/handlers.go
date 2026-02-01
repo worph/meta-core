@@ -9,12 +9,16 @@ import (
 
 // Handlers provides HTTP handlers for mount operations
 type Handlers struct {
-	manager *Manager
+	manager  *Manager
+	scanFunc ScanFunc
 }
 
 // NewHandlers creates new mount handlers
-func NewHandlers(manager *Manager) *Handlers {
-	return &Handlers{manager: manager}
+func NewHandlers(manager *Manager, scanFunc ScanFunc) *Handlers {
+	return &Handlers{
+		manager:  manager,
+		scanFunc: scanFunc,
+	}
 }
 
 // RegisterRoutes registers all mount-related routes
@@ -24,10 +28,12 @@ func (h *Handlers) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/mounts", h.handleCreateMount).Methods("POST")
 	r.HandleFunc("/api/mounts/rclone/remotes", h.handleListRcloneRemotes).Methods("GET")
 	r.HandleFunc("/api/mounts/{id}", h.handleGetMount).Methods("GET")
+	r.HandleFunc("/api/mounts/{id}", h.handleUpdateMount).Methods("PUT", "PATCH")
 	r.HandleFunc("/api/mounts/{id}", h.handleDeleteMount).Methods("DELETE")
 	r.HandleFunc("/api/mounts/{id}/mount", h.handleRequestMount).Methods("POST")
 	r.HandleFunc("/api/mounts/{id}/unmount", h.handleRequestUnmount).Methods("POST")
 	r.HandleFunc("/api/mounts/{id}/safe-unmount", h.handleSafeUnmount).Methods("POST")
+	r.HandleFunc("/api/mounts/{id}/scan", h.handleTriggerMountScan).Methods("POST")
 }
 
 // handleListMounts handles GET /api/mounts
@@ -192,6 +198,90 @@ func (h *Handlers) handleListRcloneRemotes(w http.ResponseWriter, r *http.Reques
 	}
 
 	writeJSON(w, http.StatusOK, RcloneRemotesResponse{Remotes: remotes})
+}
+
+// handleUpdateMount handles PUT/PATCH /api/mounts/{id}
+func (h *Handlers) handleUpdateMount(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	var updates map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	mount, err := h.manager.UpdateMount(id, updates)
+	if err != nil {
+		if err.Error() == "mount not found" {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, MountResponse{Mount: mount})
+}
+
+// handleTriggerMountScan handles POST /api/mounts/{id}/scan
+func (h *Handlers) handleTriggerMountScan(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	// Get mount info
+	mount, err := h.manager.GetMount(id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if mount == nil {
+		writeError(w, http.StatusNotFound, "mount not found")
+		return
+	}
+
+	// Check if mount is mounted
+	if !mount.Mounted {
+		writeJSON(w, http.StatusBadRequest, MountScanResponse{
+			Status:    "error",
+			Message:   "mount is not currently mounted",
+			MountID:   mount.ID,
+			MountPath: mount.MountPath,
+		})
+		return
+	}
+
+	// Check if scan function is available
+	if h.scanFunc == nil {
+		writeJSON(w, http.StatusServiceUnavailable, MountScanResponse{
+			Status:    "error",
+			Message:   "file watcher not available",
+			MountID:   mount.ID,
+			MountPath: mount.MountPath,
+		})
+		return
+	}
+
+	// Trigger scan
+	fileCount, err := h.scanFunc(mount.MountPath)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, MountScanResponse{
+			Status:    "error",
+			Message:   err.Error(),
+			MountID:   mount.ID,
+			MountPath: mount.MountPath,
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, MountScanResponse{
+		Status:    "ok",
+		Message:   "scan triggered successfully",
+		MountID:   mount.ID,
+		MountPath: mount.MountPath,
+		FileCount: fileCount,
+	})
 }
 
 // Helper functions

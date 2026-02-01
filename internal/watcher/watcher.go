@@ -3,6 +3,7 @@ package watcher
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -306,6 +307,35 @@ func (w *Watcher) scanDirectory(root string) int {
 	})
 
 	return count
+}
+
+// ScanMountPath scans a specific mount path and returns file count
+// This is used by the mount poller to scan individual mounts
+func (w *Watcher) ScanMountPath(mountPath string) (int, error) {
+	// Validate path is under filesPath
+	if !strings.HasPrefix(mountPath, w.filesPath) {
+		return 0, fmt.Errorf("mount path %s is not under files path %s", mountPath, w.filesPath)
+	}
+
+	// Check directory exists
+	info, err := os.Stat(mountPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, fmt.Errorf("mount path %s does not exist", mountPath)
+		}
+		return 0, fmt.Errorf("failed to stat mount path %s: %w", mountPath, err)
+	}
+
+	if !info.IsDir() {
+		return 0, fmt.Errorf("mount path %s is not a directory", mountPath)
+	}
+
+	// Scan the directory
+	log.Printf("[Watcher] Scanning mount path: %s", mountPath)
+	count := w.scanDirectory(mountPath)
+	log.Printf("[Watcher] Mount scan complete: %s (%d files)", mountPath, count)
+
+	return count, nil
 }
 
 // GetRecentEvents returns events since a given timestamp

@@ -13,18 +13,14 @@ import (
 	"github.com/metazla/meta-core/internal/config"
 )
 
-// ServiceInfo matches the TypeScript ServiceInfo interface
+// ServiceInfo contains simplified service registration data
+// URLs are obtained via the /urls API endpoint
 type ServiceInfo struct {
-	Name          string            `json:"name"`
-	Version       string            `json:"version"`
-	API           string            `json:"api"`
-	Status        string            `json:"status"`
-	PID           int               `json:"pid"`
-	Hostname      string            `json:"hostname"`
-	StartedAt     string            `json:"startedAt"`
-	LastHeartbeat string            `json:"lastHeartbeat"`
-	Capabilities  []string          `json:"capabilities"`
-	Endpoints     map[string]string `json:"endpoints"`
+	Name          string `json:"name"`
+	Hostname      string `json:"hostname"`
+	BaseUrl       string `json:"baseUrl"`
+	Status        string `json:"status"`
+	LastHeartbeat string `json:"lastHeartbeat"`
 }
 
 // Service handles service registration and discovery
@@ -41,10 +37,11 @@ type Service struct {
 
 // NewService creates a new service discovery instance
 func NewService(cfg *config.Config) *Service {
+	hostname, _ := os.Hostname()
 	return &Service{
 		config:      cfg,
 		servicesDir: cfg.ServicesDir(),
-		serviceFile: filepath.Join(cfg.ServicesDir(), cfg.ServiceName+".json"),
+		serviceFile: filepath.Join(cfg.ServicesDir(), cfg.ServiceName+"-"+hostname+".json"),
 		stopChan:    make(chan struct{}),
 	}
 }
@@ -90,40 +87,20 @@ func (s *Service) buildServiceInfo() *ServiceInfo {
 	hostname, _ := os.Hostname()
 	ip := getLocalIP()
 
-	// Use BASE_URL for external access (dashboard navigation), fall back to internal IP
-	var apiBase string
+	// Use BASE_URL for external access, fall back to internal IP
+	var baseUrl string
 	if s.config.BaseURL != "" {
-		apiBase = s.config.BaseURL
+		baseUrl = s.config.BaseURL
 	} else {
-		apiBase = fmt.Sprintf("http://%s:%d", ip, s.config.APIPort)
+		baseUrl = fmt.Sprintf("http://%s:%d", ip, s.config.APIPort)
 	}
-
-	// Internal URLs always use container IP for container-to-container communication
-	internalBase := fmt.Sprintf("http://%s:%d", ip, s.config.APIPort)
-	metaCoreBase := fmt.Sprintf("http://%s:%d", ip, s.config.HTTPPort)
 
 	return &ServiceInfo{
 		Name:          s.config.ServiceName,
-		Version:       s.config.ServiceVersion,
-		API:           apiBase,
-		Status:        "running",
-		PID:           os.Getpid(),
 		Hostname:      hostname,
-		StartedAt:     time.Now().UTC().Format(time.RFC3339),
+		BaseUrl:       baseUrl,
+		Status:        "running",
 		LastHeartbeat: time.Now().UTC().Format(time.RFC3339),
-		Capabilities:  []string{"meta-core"},
-		Endpoints: map[string]string{
-			// meta-core sidecar endpoints (port 9000) - always internal
-			"health":   metaCoreBase + "/health",
-			"meta":     metaCoreBase + "/meta",
-			"leader":   metaCoreBase + "/leader",
-			"services": metaCoreBase + "/services",
-			// main service endpoints - external for dashboard
-			"api":    apiBase + "/api",
-			"webdav": apiBase + "/webdav",
-			// callback uses internal IP for container-to-container plugin communication
-			"callback": internalBase + "/api/plugins/callback",
-		},
 	}
 }
 
@@ -198,23 +175,44 @@ func (s *Service) UpdateStatus(status string) error {
 }
 
 // Discover finds a service by name
+// Looks for files matching pattern: name-*.json (hostname-based naming)
 func (s *Service) Discover(name string) (*ServiceInfo, error) {
-	filePath := filepath.Join(s.servicesDir, name+".json")
-
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
+	// First try exact match for backward compatibility
+	exactPath := filepath.Join(s.servicesDir, name+".json")
+	if data, err := os.ReadFile(exactPath); err == nil {
+		var info ServiceInfo
+		if err := json.Unmarshal(data, &info); err == nil {
+			return s.checkStale(&info), nil
 		}
+	}
+
+	// Search for hostname-based files: name-*.json
+	pattern := filepath.Join(s.servicesDir, name+"-*.json")
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
 		return nil, err
 	}
 
-	var info ServiceInfo
-	if err := json.Unmarshal(data, &info); err != nil {
-		return nil, err
+	// Return the first valid service found
+	for _, match := range matches {
+		data, err := os.ReadFile(match)
+		if err != nil {
+			continue
+		}
+
+		var info ServiceInfo
+		if err := json.Unmarshal(data, &info); err != nil {
+			continue
+		}
+
+		return s.checkStale(&info), nil
 	}
 
-	// Check if service is stale
+	return nil, nil
+}
+
+// checkStale marks a service as stale if heartbeat is too old
+func (s *Service) checkStale(info *ServiceInfo) *ServiceInfo {
 	lastHeartbeat, err := time.Parse(time.RFC3339, info.LastHeartbeat)
 	if err == nil {
 		staleThreshold := time.Duration(s.config.StaleThresholdMS) * time.Millisecond
@@ -222,8 +220,7 @@ func (s *Service) Discover(name string) (*ServiceInfo, error) {
 			info.Status = "stale"
 		}
 	}
-
-	return &info, nil
+	return info
 }
 
 // DiscoverAll finds all registered services
@@ -242,16 +239,20 @@ func (s *Service) DiscoverAll() ([]*ServiceInfo, error) {
 			continue
 		}
 
-		name := entry.Name()[:len(entry.Name())-5] // Remove .json extension
-		info, err := s.Discover(name)
+		filePath := filepath.Join(s.servicesDir, entry.Name())
+		data, err := os.ReadFile(filePath)
 		if err != nil {
-			log.Printf("[Discovery] Failed to read service %s: %v", name, err)
+			log.Printf("[Discovery] Failed to read service file %s: %v", entry.Name(), err)
 			continue
 		}
 
-		if info != nil {
-			services = append(services, info)
+		var info ServiceInfo
+		if err := json.Unmarshal(data, &info); err != nil {
+			log.Printf("[Discovery] Failed to parse service file %s: %v", entry.Name(), err)
+			continue
 		}
+
+		services = append(services, s.checkStale(&info))
 	}
 
 	return services, nil
