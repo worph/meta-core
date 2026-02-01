@@ -26,9 +26,11 @@ type Config struct {
 	HTTPHost string // HTTP API host (default: "127.0.0.1")
 
 	// Timing configuration
-	HealthCheckIntervalMS int // Health check interval in ms (default: 5000)
-	HeartbeatIntervalMS   int // Service heartbeat interval in ms (default: 30000)
-	StaleThresholdMS      int // Stale service threshold in ms (default: 60000)
+	HealthCheckIntervalMS    int // Health check interval in ms (default: 5000)
+	HeartbeatIntervalMS      int // Service heartbeat interval in ms (default: 30000)
+	StaleThresholdMS         int // Stale service threshold in ms (default: 60000)
+	CleanupIntervalMS        int // Dead service cleanup interval in ms (default: 600000)
+	DeadServiceThresholdMS   int // Dead service threshold in ms (default: 600000)
 
 	// File watcher configuration
 	WatchFolderList   []string // List of folders to watch for file changes
@@ -52,9 +54,11 @@ func Load() *Config {
 		RedisPort:             getEnvInt("REDIS_PORT", 6379),
 		HTTPPort:              getEnvInt("META_CORE_HTTP_PORT", 9000),
 		HTTPHost:              getEnv("META_CORE_HTTP_HOST", "127.0.0.1"),
-		HealthCheckIntervalMS: getEnvInt("HEALTH_CHECK_INTERVAL_MS", 5000),
+		HealthCheckIntervalMS:  getEnvInt("HEALTH_CHECK_INTERVAL_MS", 5000),
 		HeartbeatIntervalMS:   getEnvInt("HEARTBEAT_INTERVAL_MS", 30000),
 		StaleThresholdMS:      getEnvInt("STALE_THRESHOLD_MS", 60000),
+		CleanupIntervalMS:     getEnvInt("CLEANUP_INTERVAL_MS", 600000),
+		DeadServiceThresholdMS: getEnvInt("DEAD_SERVICE_THRESHOLD_MS", 600000),
 		WatchIntervalMS:       getEnvInt("WATCH_INTERVAL_MS", 1000),
 		DebounceMS:            getEnvInt("DEBOUNCE_MS", 30000),
 		EnableFileWatcher:     getEnvBool("ENABLE_FILE_WATCHER", true),

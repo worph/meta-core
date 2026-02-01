@@ -1,12 +1,16 @@
 package leader
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -311,17 +315,24 @@ func (e *Election) buildLeaderInfo() *LeaderLockInfo {
 	}
 }
 
-// writeLeaderInfo atomically writes leader info to file
+// writeLeaderInfo atomically writes leader API URL to file (plain text)
+// Only writes if the content has changed to avoid triggering file watchers unnecessarily
 func (e *Election) writeLeaderInfo(info *LeaderLockInfo) error {
 	infoPath := e.config.InfoFilePath()
-	tempPath := infoPath + ".tmp"
 
-	data, err := json.MarshalIndent(info, "", "  ")
-	if err != nil {
-		return err
+	// Write just the API URL as plain text
+	newData := []byte(info.ApiUrl)
+
+	// Check if file already has the same content
+	existingData, err := os.ReadFile(infoPath)
+	if err == nil && string(existingData) == string(newData) {
+		// Content unchanged, skip write to avoid triggering file watchers
+		return nil
 	}
 
-	if err := os.WriteFile(tempPath, data, 0644); err != nil {
+	// Content changed or file doesn't exist, write atomically
+	tempPath := infoPath + ".tmp"
+	if err := os.WriteFile(tempPath, newData, 0644); err != nil {
 		return err
 	}
 
@@ -329,11 +340,11 @@ func (e *Election) writeLeaderInfo(info *LeaderLockInfo) error {
 		return err
 	}
 
-	log.Printf("[Election] Wrote leader info to %s", infoPath)
+	log.Printf("[Election] Wrote leader API URL to %s: %s", infoPath, info.ApiUrl)
 	return nil
 }
 
-// readLeaderInfo reads leader info from file
+// readLeaderInfo reads leader API URL from file and fetches full info via /urls API
 func (e *Election) readLeaderInfo() (*LeaderLockInfo, error) {
 	infoPath := e.config.InfoFilePath()
 
@@ -345,12 +356,65 @@ func (e *Election) readLeaderInfo() (*LeaderLockInfo, error) {
 		return nil, err
 	}
 
-	var info LeaderLockInfo
-	if err := json.Unmarshal(data, &info); err != nil {
-		return nil, err
+	// File contains plain text API URL
+	apiUrl := strings.TrimSpace(string(data))
+	if apiUrl == "" {
+		return nil, nil
 	}
 
-	return &info, nil
+	// Fetch full info from /urls API
+	return e.fetchLeaderInfoFromAPI(apiUrl)
+}
+
+// fetchLeaderInfoFromAPI calls the /urls API to get full leader info
+func (e *Election) fetchLeaderInfoFromAPI(apiUrl string) (*LeaderLockInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", apiUrl+"/urls", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call /urls API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("/urls API returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	// Parse URLsResponse format
+	var urlsResp struct {
+		Hostname  string `json:"hostname"`
+		BaseUrl   string `json:"baseUrl"`
+		ApiUrl    string `json:"apiUrl"`
+		RedisUrl  string `json:"redisUrl"`
+		WebdavUrl string `json:"webdavUrl"`
+		IsLeader  bool   `json:"isLeader"`
+	}
+	if err := json.Unmarshal(body, &urlsResp); err != nil {
+		return nil, fmt.Errorf("failed to parse /urls response: %w", err)
+	}
+
+	// Convert to LeaderLockInfo
+	return &LeaderLockInfo{
+		Hostname:  urlsResp.Hostname,
+		BaseUrl:   urlsResp.BaseUrl,
+		ApiUrl:    urlsResp.ApiUrl,
+		RedisUrl:  urlsResp.RedisUrl,
+		WebdavUrl: urlsResp.WebdavUrl,
+		Timestamp: time.Now().UnixMilli(),
+		PID:       0, // Unknown for remote leader
+	}, nil
 }
 
 // healthCheckLoop periodically checks health and updates timestamps

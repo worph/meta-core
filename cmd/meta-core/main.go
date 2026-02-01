@@ -53,12 +53,19 @@ func main() {
 
 	// Create and start service discovery
 	disc := discovery.NewService(cfg)
+	disc.SetRoleProvider(&roleProviderAdapter{election: election})
 	if err := disc.Start(); err != nil {
 		log.Fatalf("[meta-core] Failed to start service discovery: %v", err)
 	}
 
+	// Create and start dead service cleaner
+	cleaner := discovery.NewCleaner(cfg)
+	if err := cleaner.Start(); err != nil {
+		log.Printf("[meta-core] Warning: failed to start service cleaner: %v", err)
+	}
+
 	// Create and start API server
-	apiServer := api.NewServer(cfg, election, disc, storageClient)
+	apiServer := api.NewServer(cfg, election, disc, cleaner, storageClient)
 	if err := apiServer.Start(); err != nil {
 		log.Fatalf("[meta-core] Failed to start API server: %v", err)
 	}
@@ -73,6 +80,10 @@ func main() {
 	// Graceful shutdown in reverse order
 	if err := apiServer.Stop(); err != nil {
 		log.Printf("[meta-core] Error stopping API server: %v", err)
+	}
+
+	if err := cleaner.Stop(); err != nil {
+		log.Printf("[meta-core] Error stopping service cleaner: %v", err)
 	}
 
 	if err := disc.Stop(); err != nil {
@@ -108,4 +119,13 @@ func (a *storageConnectorAdapter) Connect(url string) error {
 
 func (a *storageConnectorAdapter) Close() error {
 	return a.client.Close()
+}
+
+// roleProviderAdapter adapts leader.Election to discovery.RoleProvider
+type roleProviderAdapter struct {
+	election *leader.Election
+}
+
+func (a *roleProviderAdapter) Role() string {
+	return string(a.election.Role())
 }

@@ -449,6 +449,17 @@ func (s *Server) handleGetService(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, service)
 }
 
+// handleCleanupStats handles GET /services/cleanup/stats
+func (s *Server) handleCleanupStats(w http.ResponseWriter, r *http.Request) {
+	if s.cleaner == nil {
+		writeError(w, http.StatusServiceUnavailable, "cleaner not initialized")
+		return
+	}
+
+	stats := s.cleaner.Stats()
+	writeJSON(w, http.StatusOK, stats)
+}
+
 // writeJSON writes a JSON response
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")

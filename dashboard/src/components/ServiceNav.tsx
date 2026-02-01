@@ -2,10 +2,11 @@ import { useState, useEffect } from 'react';
 
 interface ServiceInfo {
   name: string;
-  api: string;
+  hostname: string;
+  baseUrl: string;
   status: string;
-  capabilities: string[];
-  version: string;
+  lastHeartbeat: string;
+  role?: string; // "leader", "follower", or undefined (for non-meta-core services)
 }
 
 interface ServicesResponse {
@@ -55,7 +56,11 @@ function ServiceNav() {
 
   if (loading) return null;
 
-  const sortedServices = [...services].sort((a, b) => a.name.localeCompare(b.name));
+  // Filter out follower meta-core instances (only show leader)
+  const filteredServices = services.filter(
+    s => s.name !== 'meta-core' || s.role === 'leader'
+  );
+  const sortedServices = [...filteredServices].sort((a, b) => a.name.localeCompare(b.name));
 
   if (sortedServices.length === 0) return null;
 
@@ -69,12 +74,12 @@ function ServiceNav() {
           return (
             <a
               key={service.name}
-              href={isActive ? '#' : service.api}
+              href={isActive ? '#' : service.baseUrl}
               className={`service-link${isActive ? ' active' : ''}`}
               onClick={(e) => {
                 e.preventDefault();
                 if (!isActive) {
-                  window.location.href = service.api;
+                  window.location.href = service.baseUrl;
                 }
               }}
             >

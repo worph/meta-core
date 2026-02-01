@@ -21,6 +21,7 @@ type Server struct {
 	config            *config.Config
 	election          *leader.Election
 	discovery         *discovery.Service
+	cleaner           *discovery.Cleaner
 	storage           *storage.Client
 	mountsManager     *mounts.Manager
 	mountsHandlers    *mounts.Handlers
@@ -37,12 +38,14 @@ func NewServer(
 	cfg *config.Config,
 	election *leader.Election,
 	disc *discovery.Service,
+	cleaner *discovery.Cleaner,
 	stor *storage.Client,
 ) *Server {
 	s := &Server{
 		config:    cfg,
 		election:  election,
 		discovery: disc,
+		cleaner:   cleaner,
 		storage:   stor,
 		router:    mux.NewRouter(),
 	}
@@ -130,6 +133,7 @@ func (s *Server) setupRoutes() {
 
 	// Service discovery
 	s.router.HandleFunc("/services", s.handleListServices).Methods("GET")
+	s.router.HandleFunc("/services/cleanup/stats", s.handleCleanupStats).Methods("GET")
 	s.router.HandleFunc("/services/{name}", s.handleGetService).Methods("GET")
 
 	// Mount management routes (if manager initialized)
