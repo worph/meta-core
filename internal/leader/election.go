@@ -309,7 +309,7 @@ func (e *Election) buildLeaderInfo() *LeaderLockInfo {
 		BaseUrl:   baseUrl,
 		ApiUrl:    fmt.Sprintf("http://%s:%d", ip, e.config.HTTPPort),
 		RedisUrl:  fmt.Sprintf("redis://%s:%d", ip, e.config.RedisPort),
-		WebdavUrl: baseUrl + "/webdav",
+		WebdavUrl: fmt.Sprintf("http://%s:%d/webdav", ip, e.config.APIPort),
 		Timestamp: time.Now().UnixMilli(),
 		PID:       os.Getpid(),
 	}
