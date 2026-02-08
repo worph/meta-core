@@ -60,8 +60,8 @@ func (d *Dispatcher) dispatchToStream(event FileEvent) {
 	if event.Size > 0 {
 		fields["size"] = fmt.Sprintf("%d", event.Size)
 	}
-	if event.PartialHash != "" {
-		fields["partialHash"] = event.PartialHash
+	if event.MidHash256 != "" {
+		fields["midhash256"] = event.MidHash256
 	}
 	if event.OldPath != "" {
 		fields["oldPath"] = event.OldPath

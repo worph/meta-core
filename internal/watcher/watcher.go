@@ -1,9 +1,6 @@
 package watcher
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -13,10 +10,6 @@ import (
 	"github.com/metazla/meta-core/internal/config"
 )
 
-const (
-	// PartialHashSize is the number of bytes to hash for file identification
-	PartialHashSize = 64 * 1024 // 64KB
-)
 
 // Watcher provides file scanning and event dispatching
 type Watcher struct {
@@ -46,11 +39,11 @@ func NewWatcher(cfg *config.Config, dispatcher *Dispatcher) (*Watcher, error) {
 
 // handleDebouncedEvent processes a debounced event
 func (w *Watcher) handleDebouncedEvent(event FileEvent) {
-	// Compute partial hash for add/change events
+	// Compute midhash256 for add/change events
 	if event.Type == EventTypeAdd || event.Type == EventTypeChange {
 		fullPath := filepath.Join(w.filesPath, event.Path)
-		if hash, err := computePartialHash(fullPath); err == nil {
-			event.PartialHash = hash
+		if hash, err := ComputeMidHash256(fullPath); err == nil {
+			event.MidHash256 = hash
 		}
 	}
 
@@ -102,9 +95,9 @@ func (w *Watcher) ScanDirectory(root string) int {
 			Timestamp: NowMS(),
 		}
 
-		// Compute partial hash
-		if hash, err := computePartialHash(path); err == nil {
-			event.PartialHash = hash
+		// Compute midhash256
+		if hash, err := ComputeMidHash256(path); err == nil {
+			event.MidHash256 = hash
 		}
 
 		// Dispatch directly
@@ -178,21 +171,3 @@ func (w *Watcher) GetFilesPath() string {
 	return w.filesPath
 }
 
-// computePartialHash computes SHA-256 hash of first 64KB of a file
-func computePartialHash(path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-
-	hasher := sha256.New()
-	buffer := make([]byte, PartialHashSize)
-	n, err := file.Read(buffer)
-	if err != nil && err != io.EOF {
-		return "", err
-	}
-
-	hasher.Write(buffer[:n])
-	return hex.EncodeToString(hasher.Sum(nil)), nil
-}

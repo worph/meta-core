@@ -14,12 +14,12 @@ const (
 
 // FileEvent represents a file system event
 type FileEvent struct {
-	Type        FileEventType `json:"type"`
-	Path        string        `json:"path"`        // Relative to FILES_PATH
-	Size        int64         `json:"size,omitempty"`
-	Timestamp   int64         `json:"timestamp"`
-	PartialHash string        `json:"partialHash,omitempty"` // Hash of first 64KB
-	OldPath     string        `json:"oldPath,omitempty"`     // For rename events
+	Type       FileEventType `json:"type"`
+	Path       string        `json:"path"`                 // Relative to FILES_PATH
+	Size       int64         `json:"size,omitempty"`
+	Timestamp  int64         `json:"timestamp"`
+	MidHash256 string        `json:"midhash256,omitempty"` // midhash256 CID (SHA-256 of middle 1MB + file size)
+	OldPath    string        `json:"oldPath,omitempty"`    // For rename events
 }
 
 // PendingEvent tracks a file event that's being debounced

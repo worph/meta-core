@@ -30,7 +30,6 @@ echo "[entrypoint] meta-core starting..."
 echo "[entrypoint] META_CORE_PATH=${META_CORE_PATH:-/meta-core}"
 echo "[entrypoint] FILES_PATH=${FILES_PATH:-/files}"
 echo "[entrypoint] SERVICE_NAME=${SERVICE_NAME:-meta-core}"
-echo "[entrypoint] WATCH_FOLDER_LIST=${WATCH_FOLDER_LIST:-/files/}"
 
 # Execute the main command (supervisord)
 exec "$@"

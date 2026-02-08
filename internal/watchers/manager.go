@@ -40,8 +40,8 @@ func NewManager(cfg *config.Config) (*Manager, error) {
 		return nil, fmt.Errorf("failed to create watchers directory: %w", err)
 	}
 
-	// Load or migrate
-	if err := m.loadOrMigrate(); err != nil {
+	// Load existing or create default
+	if err := m.loadOrCreateDefault(); err != nil {
 		return nil, err
 	}
 
@@ -55,43 +55,46 @@ func (m *Manager) SetOnChanged(cb func()) {
 	m.onChanged = cb
 }
 
-// loadOrMigrate loads existing config or migrates from ENV
-func (m *Manager) loadOrMigrate() error {
+// loadOrCreateDefault loads existing config or creates default watcher
+func (m *Manager) loadOrCreateDefault() error {
 	// Try to load existing file
 	if _, err := os.Stat(m.watchersFile); err == nil {
 		return m.load()
 	}
 
-	// File doesn't exist, check for ENV migration
-	if len(m.config.WatchFolderList) > 0 {
-		log.Printf("[Watchers] Migrating from WATCH_FOLDER_LIST env var")
-		return m.migrateFromEnv()
-	}
-
-	// No config, start empty
-	log.Printf("[Watchers] No existing config, starting with empty watchers list")
-	return nil
+	// File doesn't exist, create default watcher for /files/watch
+	log.Printf("[Watchers] No existing config, creating default watcher for %s", m.config.DefaultWatchPath())
+	return m.createDefaultWatcher()
 }
 
-// migrateFromEnv creates watchers from WATCH_FOLDER_LIST env var
-func (m *Manager) migrateFromEnv() error {
+// createDefaultWatcher creates the default /files/watch watcher and folder
+func (m *Manager) createDefaultWatcher() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	for _, path := range m.config.WatchFolderList {
-		id := uuid.New().String()[:8]
-		watcher := &WatcherConfig{
-			ID:         id,
-			Path:       path,
-			IntervalMs: DefaultIntervalMs,
-			Enabled:    true,
-			CreatedAt:  NowMS(),
-		}
-		m.watchers[id] = watcher
-		log.Printf("[Watchers] Migrated watcher: %s -> %s", id, path)
+	defaultPath := m.config.DefaultWatchPath()
+
+	// Create the watch folder if it doesn't exist
+	if err := os.MkdirAll(defaultPath, 0755); err != nil {
+		log.Printf("[Watchers] Warning: failed to create default watch folder %s: %v", defaultPath, err)
+		// Continue anyway - folder might be created later or mounted
+	} else {
+		log.Printf("[Watchers] Created default watch folder: %s", defaultPath)
 	}
 
-	// Save migrated config
+	// Create default watcher
+	id := uuid.New().String()[:8]
+	watcher := &WatcherConfig{
+		ID:         id,
+		Path:       defaultPath,
+		IntervalMs: DefaultIntervalMs,
+		Enabled:    true,
+		CreatedAt:  NowMS(),
+	}
+	m.watchers[id] = watcher
+	log.Printf("[Watchers] Created default watcher: %s -> %s", id, defaultPath)
+
+	// Save config
 	return m.saveUnsafe()
 }
 

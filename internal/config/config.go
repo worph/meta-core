@@ -33,7 +33,6 @@ type Config struct {
 	DeadServiceThresholdMS   int // Dead service threshold in ms (default: 600000)
 
 	// File watcher configuration
-	WatchFolderList   []string // List of folders to watch for file changes
 	WatchIntervalMS   int      // Polling interval for network mounts (default: 1000)
 	DebounceMS        int      // File change debounce time (default: 30000)
 	EnableFileWatcher bool     // Enable file watcher (default: true)
@@ -63,10 +62,6 @@ func Load() *Config {
 		DebounceMS:            getEnvInt("DEBOUNCE_MS", 30000),
 		EnableFileWatcher:     getEnvBool("ENABLE_FILE_WATCHER", true),
 	}
-
-	// Parse watch folder list (comma-separated)
-	watchFolders := getEnv("WATCH_FOLDER_LIST", "/files/")
-	cfg.WatchFolderList = parseCommaSeparated(watchFolders)
 
 	// Set mounts directory
 	cfg.MountsDir = cfg.MetaCorePath + "/mounts"
@@ -133,17 +128,7 @@ func getEnvBool(key string, defaultValue bool) bool {
 	return defaultValue
 }
 
-func parseCommaSeparated(s string) []string {
-	if s == "" {
-		return []string{}
-	}
-	parts := strings.Split(s, ",")
-	result := make([]string, 0, len(parts))
-	for _, part := range parts {
-		trimmed := strings.TrimSpace(part)
-		if trimmed != "" {
-			result = append(result, trimmed)
-		}
-	}
-	return result
+// DefaultWatchPath returns the default watch folder path
+func (c *Config) DefaultWatchPath() string {
+	return c.FilesPath + "/watch"
 }
