@@ -39,6 +39,12 @@ type Config struct {
 
 	// Mount configuration
 	MountsDir string // Path to mounts configuration (default: /meta-core/mounts)
+
+	// Cache configuration
+	CacheEnabled    bool   // Enable WebDAV caching (default: true)
+	CachePath       string // Path to cache directory (default: /meta-core/cache)
+	CacheMaxSizeGB  int    // Maximum cache size in GB (default: 100)
+	CacheTTLSeconds int    // Cache entry TTL in seconds (default: 3600)
 }
 
 // Load creates a Config from environment variables
@@ -65,6 +71,12 @@ func Load() *Config {
 
 	// Set mounts directory
 	cfg.MountsDir = cfg.MetaCorePath + "/mounts"
+
+	// Set cache configuration
+	cfg.CacheEnabled = getEnvBool("CACHE_ENABLED", true)
+	cfg.CachePath = getEnv("CACHE_PATH", cfg.MetaCorePath+"/cache")
+	cfg.CacheMaxSizeGB = getEnvInt("CACHE_MAX_SIZE_GB", 100)
+	cfg.CacheTTLSeconds = getEnvInt("CACHE_TTL_SECONDS", 3600)
 
 	return cfg
 }
@@ -97,6 +109,16 @@ func (c *Config) MountsFilePath() string {
 // MountsErrorDir returns the path to mount error files
 func (c *Config) MountsErrorDir() string {
 	return c.MountsDir + "/errors"
+}
+
+// CacheDir returns the path to the cache directory
+func (c *Config) CacheDir() string {
+	return c.CachePath
+}
+
+// CacheIndexPath returns the path to the cache index file
+func (c *Config) CacheIndexPath() string {
+	return c.CachePath + "/cache-index.json"
 }
 
 // WatchersFilePath returns the path to the watchers configuration file

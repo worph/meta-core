@@ -203,7 +203,7 @@ func (p *Poller) stopPoller(poller *watcherPoller) {
 	}
 }
 
-// runPollScan executes a scan for a watcher
+// runPollScan executes a differential scan for a watcher
 func (p *Poller) runPollScan(watcherID, path string) {
 	if p.scanner == nil {
 		return
@@ -216,22 +216,26 @@ func (p *Poller) runPollScan(watcherID, path string) {
 	}
 	p.mu.Unlock()
 
-	// Perform scan
-	fileCount := p.scanner.ScanDirectory(path)
+	// Perform differential scan
+	result := p.scanner.ScanDirectoryDiff(path, watcherID)
 
 	// Update status
 	p.mu.Lock()
 	if status, exists := p.status[watcherID]; exists {
 		status.LastScan = NowMS()
-		status.FileCount = fileCount
+		status.FileCount = result.Total
 		status.IsScanning = false
 	}
 	p.mu.Unlock()
 
-	log.Printf("[WatcherPoller] Poll scan complete for watcher %s: %d files", watcherID, fileCount)
+	// Only log if there were changes
+	if result.Added > 0 || result.Changed > 0 || result.Deleted > 0 {
+		log.Printf("[WatcherPoller] Diff scan for %s: +%d ~%d -%d (total: %d)",
+			watcherID, result.Added, result.Changed, result.Deleted, result.Total)
+	}
 }
 
-// TriggerScan triggers an immediate scan for a watcher
+// TriggerScan triggers an immediate differential scan for a watcher
 func (p *Poller) TriggerScan(watcherID string) (int, error) {
 	w, err := p.manager.Get(watcherID)
 	if err != nil {
@@ -251,19 +255,22 @@ func (p *Poller) TriggerScan(watcherID string) (int, error) {
 	}
 	p.mu.Unlock()
 
-	// Perform scan
-	fileCount := p.scanner.ScanDirectory(w.Path)
+	// Perform differential scan
+	result := p.scanner.ScanDirectoryDiff(w.Path, watcherID)
 
 	// Update status
 	p.mu.Lock()
 	if status, exists := p.status[watcherID]; exists {
 		status.LastScan = NowMS()
-		status.FileCount = fileCount
+		status.FileCount = result.Total
 		status.IsScanning = false
 	}
 	p.mu.Unlock()
 
-	return fileCount, nil
+	log.Printf("[WatcherPoller] Triggered scan for %s: +%d ~%d -%d (total: %d)",
+		watcherID, result.Added, result.Changed, result.Deleted, result.Total)
+
+	return result.Total, nil
 }
 
 // TriggerScanAll triggers scans for all enabled watchers
@@ -279,6 +286,90 @@ func (p *Poller) TriggerScanAll() (int, error) {
 				continue
 			}
 			totalCount += count
+		}
+	}
+
+	return totalCount, nil
+}
+
+// TriggerReset performs a full reset for a watcher:
+// 1. Clears the Redis stream and emits a reset event
+// 2. Clears the watcher's state
+// 3. Performs a full scan (all files are "new")
+func (p *Poller) TriggerReset(watcherID string) (int, error) {
+	w, err := p.manager.Get(watcherID)
+	if err != nil {
+		return 0, err
+	}
+
+	if p.scanner == nil || p.dispatcher == nil {
+		return 0, nil
+	}
+
+	log.Printf("[WatcherPoller] Triggering reset for watcher %s", watcherID)
+
+	// Mark as scanning
+	p.mu.Lock()
+	if status, exists := p.status[watcherID]; exists {
+		status.IsScanning = true
+	} else {
+		p.status[watcherID] = &RuntimeStatus{IsScanning: true}
+	}
+	p.mu.Unlock()
+
+	// Step 1: Emit reset event (this clears the stream first)
+	if err := p.dispatcher.EmitReset(watcherID); err != nil {
+		log.Printf("[WatcherPoller] Warning: failed to emit reset for %s: %v", watcherID, err)
+	}
+
+	// Step 2: Clear the watcher's state
+	p.scanner.ClearState(watcherID)
+
+	// Step 3: Clear event buffer
+	p.scanner.ClearEventBuffer()
+
+	// Step 4: Perform full scan (all files are now "new" since state is cleared)
+	result := p.scanner.ScanDirectoryDiff(w.Path, watcherID)
+
+	// Update status
+	p.mu.Lock()
+	if status, exists := p.status[watcherID]; exists {
+		status.LastScan = NowMS()
+		status.FileCount = result.Total
+		status.IsScanning = false
+	}
+	p.mu.Unlock()
+
+	log.Printf("[WatcherPoller] Reset complete for %s: %d files", watcherID, result.Total)
+
+	return result.Total, nil
+}
+
+// TriggerResetAll performs a full reset for all enabled watchers
+func (p *Poller) TriggerResetAll() (int, error) {
+	watchers := p.manager.List()
+	totalCount := 0
+	isFirst := true
+
+	for _, w := range watchers {
+		if w.Enabled {
+			// Only emit reset event once (for the first watcher)
+			// Subsequent watchers just clear state and rescan
+			if isFirst {
+				count, err := p.TriggerReset(w.ID)
+				if err != nil {
+					log.Printf("[WatcherPoller] Failed to reset watcher %s: %v", w.ID, err)
+					continue
+				}
+				totalCount += count
+				isFirst = false
+			} else {
+				// Clear state and rescan without clearing stream again
+				p.scanner.ClearState(w.ID)
+				result := p.scanner.ScanDirectoryDiff(w.Path, w.ID)
+				totalCount += result.Total
+				log.Printf("[WatcherPoller] Reset scan for %s: %d files", w.ID, result.Total)
+			}
 		}
 	}
 

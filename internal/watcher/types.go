@@ -10,6 +10,7 @@ const (
 	EventTypeChange FileEventType = "change"
 	EventTypeDelete FileEventType = "delete"
 	EventTypeRename FileEventType = "rename"
+	EventTypeReset  FileEventType = "reset"
 )
 
 // FileEvent represents a file system event
@@ -20,6 +21,7 @@ type FileEvent struct {
 	Timestamp  int64         `json:"timestamp"`
 	MidHash256 string        `json:"midhash256,omitempty"` // midhash256 CID (SHA-256 of middle 1MB + file size)
 	OldPath    string        `json:"oldPath,omitempty"`    // For rename events
+	WatcherID  string        `json:"watcherId,omitempty"`  // For reset events
 }
 
 // PendingEvent tracks a file event that's being debounced
@@ -42,6 +44,14 @@ type ScanStatusResponse struct {
 	Scanning  bool   `json:"scanning"`
 	LastScan  int64  `json:"lastScan,omitempty"`
 	FileCount int    `json:"fileCount,omitempty"`
+}
+
+// DiffScanResult holds the results of a differential scan
+type DiffScanResult struct {
+	Added   int // Number of new files added
+	Changed int // Number of files with changed size/mtime
+	Deleted int // Number of files that no longer exist
+	Total   int // Total number of files currently tracked
 }
 
 // NowMS returns current time in milliseconds

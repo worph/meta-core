@@ -26,10 +26,12 @@ func (h *Handlers) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/watchers", h.handleList).Methods("GET")
 	r.HandleFunc("/api/watchers", h.handleCreate).Methods("POST")
 	r.HandleFunc("/api/watchers/scan-all", h.handleScanAll).Methods("POST")
+	r.HandleFunc("/api/watchers/reset-all", h.handleResetAll).Methods("POST")
 	r.HandleFunc("/api/watchers/{id}", h.handleGet).Methods("GET")
 	r.HandleFunc("/api/watchers/{id}", h.handleUpdate).Methods("PUT")
 	r.HandleFunc("/api/watchers/{id}", h.handleDelete).Methods("DELETE")
 	r.HandleFunc("/api/watchers/{id}/scan", h.handleScan).Methods("POST")
+	r.HandleFunc("/api/watchers/{id}/reset", h.handleReset).Methods("POST")
 }
 
 // handleList handles GET /api/watchers
@@ -172,6 +174,44 @@ func (h *Handlers) handleScanAll(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":     "ok",
 		"message":    "All watchers scanned",
+		"totalFiles": totalCount,
+	})
+}
+
+// handleReset handles POST /api/watchers/{id}/reset
+func (h *Handlers) handleReset(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	fileCount, err := h.poller.TriggerReset(id)
+	if err != nil {
+		if err.Error() == "watcher not found: "+id {
+			writeError(w, http.StatusNotFound, err.Error())
+		} else {
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":    "ok",
+		"message":   "Reset complete",
+		"watcherId": id,
+		"fileCount": fileCount,
+	})
+}
+
+// handleResetAll handles POST /api/watchers/reset-all
+func (h *Handlers) handleResetAll(w http.ResponseWriter, r *http.Request) {
+	totalCount, err := h.poller.TriggerResetAll()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":     "ok",
+		"message":    "All watchers reset",
 		"totalFiles": totalCount,
 	})
 }

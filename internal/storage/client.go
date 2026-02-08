@@ -97,9 +97,9 @@ func (c *Client) buildKey(key string) string {
 	return key
 }
 
-// buildHashKey constructs the Redis Hash key for a file
-func (c *Client) buildHashKey(hashID string) string {
-	return c.buildKey(fmt.Sprintf("file:%s", hashID))
+// buildKeyPrefix constructs the prefix for a file's flat keys
+func (c *Client) buildKeyPrefix(hashID string) string {
+	return c.buildKey(fmt.Sprintf("file:%s/", hashID))
 }
 
 // buildIndexKey constructs the key for the file index set
@@ -108,7 +108,7 @@ func (c *Client) buildIndexKey() string {
 }
 
 // GetMetadataFlat retrieves all metadata for a file as a flat map
-// Uses Redis Hash: HGETALL file:{hashId}
+// Uses flat keys: SCAN file:{hashId}/* then MGET
 func (c *Client) GetMetadataFlat(hashID string) (map[string]string, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -120,10 +120,34 @@ func (c *Client) GetMetadataFlat(hashID string) (map[string]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	hashKey := c.buildHashKey(hashID)
-	result, err := c.client.HGetAll(ctx, hashKey).Result()
-	if err != nil {
-		return nil, fmt.Errorf("hgetall failed: %w", err)
+	prefix := c.buildKeyPrefix(hashID)
+	result := make(map[string]string)
+
+	// Scan for all keys with this prefix
+	var cursor uint64
+	for {
+		keys, nextCursor, err := c.client.Scan(ctx, cursor, prefix+"*", 1000).Result()
+		if err != nil {
+			return nil, fmt.Errorf("scan failed: %w", err)
+		}
+
+		if len(keys) > 0 {
+			values, err := c.client.MGet(ctx, keys...).Result()
+			if err != nil {
+				return nil, fmt.Errorf("mget failed: %w", err)
+			}
+			for i, key := range keys {
+				field := strings.TrimPrefix(key, prefix)
+				if values[i] != nil {
+					result[field] = values[i].(string)
+				}
+			}
+		}
+
+		cursor = nextCursor
+		if cursor == 0 {
+			break
+		}
 	}
 
 	if len(result) == 0 {
@@ -133,8 +157,8 @@ func (c *Client) GetMetadataFlat(hashID string) (map[string]string, error) {
 	return result, nil
 }
 
-// SetMetadataFlat stores metadata for a file using Redis Hash
-// Uses Redis Hash: HMSET file:{hashId} prop1 val1 prop2 val2...
+// SetMetadataFlat stores metadata for a file using flat keys
+// Uses pipeline SET for each key: file:{hashId}/{property}
 func (c *Client) SetMetadataFlat(hashID string, metadata map[string]string) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -150,11 +174,15 @@ func (c *Client) SetMetadataFlat(hashID string, metadata map[string]string) erro
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	hashKey := c.buildHashKey(hashID)
+	prefix := c.buildKeyPrefix(hashID)
+	pipe := c.client.Pipeline()
 
-	// Use HMSET to set all fields at once
-	if err := c.client.HMSet(ctx, hashKey, metadata).Err(); err != nil {
-		return fmt.Errorf("hmset failed: %w", err)
+	for field, value := range metadata {
+		pipe.Set(ctx, prefix+field, value, 0)
+	}
+
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("pipeline exec failed: %w", err)
 	}
 
 	// Add to index set
@@ -188,7 +216,7 @@ func (c *Client) GetAllHashIDs() ([]string, error) {
 }
 
 // GetProperty retrieves a single property value
-// Uses Redis Hash: HGET file:{hashId} {property}
+// Uses flat key: GET file:{hashId}/{property}
 func (c *Client) GetProperty(hashID, property string) (string, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -200,8 +228,8 @@ func (c *Client) GetProperty(hashID, property string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	hashKey := c.buildHashKey(hashID)
-	result, err := c.client.HGet(ctx, hashKey, property).Result()
+	key := c.buildKeyPrefix(hashID) + property
+	result, err := c.client.Get(ctx, key).Result()
 	if err == redis.Nil {
 		return "", nil
 	}
@@ -209,7 +237,7 @@ func (c *Client) GetProperty(hashID, property string) (string, error) {
 }
 
 // SetProperty sets a single property value
-// Uses Redis Hash: HSET file:{hashId} {property} {value}
+// Uses flat key: SET file:{hashId}/{property} {value}
 func (c *Client) SetProperty(hashID, property, value string) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -221,11 +249,11 @@ func (c *Client) SetProperty(hashID, property, value string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	hashKey := c.buildHashKey(hashID)
+	key := c.buildKeyPrefix(hashID) + property
 
-	// Use HSET to set the field
-	if err := c.client.HSet(ctx, hashKey, property, value).Err(); err != nil {
-		return fmt.Errorf("hset failed: %w", err)
+	// Use SET to set the key
+	if err := c.client.Set(ctx, key, value, 0).Err(); err != nil {
+		return fmt.Errorf("set failed: %w", err)
 	}
 
 	// Add to index set
@@ -237,7 +265,7 @@ func (c *Client) SetProperty(hashID, property, value string) error {
 }
 
 // DeleteMetadata deletes all metadata for a file
-// Uses Redis Hash: DEL file:{hashId}
+// Uses SCAN + DEL for flat keys: file:{hashId}/*
 func (c *Client) DeleteMetadata(hashID string) (int64, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -249,25 +277,37 @@ func (c *Client) DeleteMetadata(hashID string) (int64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	hashKey := c.buildHashKey(hashID)
+	prefix := c.buildKeyPrefix(hashID)
 
-	// Get field count before deletion
-	fieldCount, err := c.client.HLen(ctx, hashKey).Result()
-	if err != nil {
-		return 0, fmt.Errorf("hlen failed: %w", err)
-	}
+	// Scan and delete all keys with this prefix
+	var deletedCount int64
+	var cursor uint64
+	for {
+		keys, nextCursor, err := c.client.Scan(ctx, cursor, prefix+"*", 1000).Result()
+		if err != nil {
+			return deletedCount, fmt.Errorf("scan failed: %w", err)
+		}
 
-	// Delete the hash
-	if err := c.client.Del(ctx, hashKey).Err(); err != nil {
-		return 0, fmt.Errorf("del failed: %w", err)
+		if len(keys) > 0 {
+			deleted, err := c.client.Del(ctx, keys...).Result()
+			if err != nil {
+				return deletedCount, fmt.Errorf("del failed: %w", err)
+			}
+			deletedCount += deleted
+		}
+
+		cursor = nextCursor
+		if cursor == 0 {
+			break
+		}
 	}
 
 	// Remove from index set
 	if err := c.client.SRem(ctx, c.buildIndexKey(), hashID).Err(); err != nil {
-		return fieldCount, fmt.Errorf("srem index failed: %w", err)
+		return deletedCount, fmt.Errorf("srem index failed: %w", err)
 	}
 
-	return fieldCount, nil
+	return deletedCount, nil
 }
 
 // CountFiles returns the number of unique files stored
@@ -302,23 +342,23 @@ func (c *Client) LookupPathByCID(cid string) (string, error) {
 		return "", err
 	}
 
-	// For each hash, check poster and backdrop CIDs using Hash operations
+	// For each hash, check poster and backdrop CIDs using flat keys
 	for _, hashID := range hashIDs {
-		hashKey := c.buildHashKey(hashID)
+		prefix := c.buildKeyPrefix(hashID)
 
 		// Check poster
-		posterCID, err := c.client.HGet(ctx, hashKey, "poster").Result()
+		posterCID, err := c.client.Get(ctx, prefix+"poster").Result()
 		if err == nil && posterCID == cid {
-			posterPath, err := c.client.HGet(ctx, hashKey, "posterPath").Result()
+			posterPath, err := c.client.Get(ctx, prefix+"posterPath").Result()
 			if err == nil && posterPath != "" {
 				return posterPath, nil
 			}
 		}
 
 		// Check backdrop
-		backdropCID, err := c.client.HGet(ctx, hashKey, "backdrop").Result()
+		backdropCID, err := c.client.Get(ctx, prefix+"backdrop").Result()
 		if err == nil && backdropCID == cid {
-			backdropPath, err := c.client.HGet(ctx, hashKey, "backdropPath").Result()
+			backdropPath, err := c.client.Get(ctx, prefix+"backdropPath").Result()
 			if err == nil && backdropPath != "" {
 				return backdropPath, nil
 			}
@@ -341,7 +381,7 @@ func (c *Client) getAllHashIDsInternal(ctx context.Context) ([]string, error) {
 
 // MergeMetadataFlat merges new metadata into existing (PATCH semantics)
 // New keys are added, existing keys are updated, missing keys are NOT deleted
-// Uses Redis Hash: HMSET file:{hashId}
+// Uses pipeline SET for flat keys: file:{hashId}/{property}
 func (c *Client) MergeMetadataFlat(hashID string, metadata map[string]string) (int, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -357,11 +397,15 @@ func (c *Client) MergeMetadataFlat(hashID string, metadata map[string]string) (i
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	hashKey := c.buildHashKey(hashID)
+	prefix := c.buildKeyPrefix(hashID)
+	pipe := c.client.Pipeline()
 
-	// Use HMSET to merge fields
-	if err := c.client.HMSet(ctx, hashKey, metadata).Err(); err != nil {
-		return 0, fmt.Errorf("hmset failed: %w", err)
+	for field, value := range metadata {
+		pipe.Set(ctx, prefix+field, value, 0)
+	}
+
+	if _, err := pipe.Exec(ctx); err != nil {
+		return 0, fmt.Errorf("pipeline exec failed: %w", err)
 	}
 
 	// Add to index set
@@ -373,7 +417,7 @@ func (c *Client) MergeMetadataFlat(hashID string, metadata map[string]string) (i
 }
 
 // DeleteProperty deletes a single property
-// Uses Redis Hash: HDEL file:{hashId} {property}
+// Uses flat key: DEL file:{hashId}/{property}
 func (c *Client) DeleteProperty(hashID, property string) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -385,11 +429,11 @@ func (c *Client) DeleteProperty(hashID, property string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	hashKey := c.buildHashKey(hashID)
-	return c.client.HDel(ctx, hashKey, property).Err()
+	key := c.buildKeyPrefix(hashID) + property
+	return c.client.Del(ctx, key).Err()
 }
 
-// AddToSet adds a value to a set-type field (stored as pipe-delimited string in Hash field)
+// AddToSet adds a value to a set-type field (stored as pipe-delimited string in flat key)
 // Returns true if value was added, false if it already existed
 func (c *Client) AddToSet(hashID, property, value string) (bool, error) {
 	c.mu.Lock()
@@ -402,10 +446,10 @@ func (c *Client) AddToSet(hashID, property, value string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	hashKey := c.buildHashKey(hashID)
+	key := c.buildKeyPrefix(hashID) + property
 
 	// Get current value
-	current, err := c.client.HGet(ctx, hashKey, property).Result()
+	current, err := c.client.Get(ctx, key).Result()
 	if err != nil && err != redis.Nil {
 		return false, err
 	}
@@ -427,8 +471,8 @@ func (c *Client) AddToSet(hashID, property, value string) (bool, error) {
 	values = append(values, value)
 	newValue := strings.Join(values, "|")
 
-	// Save back using HSET
-	if err := c.client.HSet(ctx, hashKey, property, newValue).Err(); err != nil {
+	// Save back using SET
+	if err := c.client.Set(ctx, key, newValue, 0).Err(); err != nil {
 		return false, err
 	}
 
@@ -440,7 +484,7 @@ func (c *Client) AddToSet(hashID, property, value string) (bool, error) {
 	return true, nil
 }
 
-// RemoveFromSet removes a value from a set-type field (stored in Hash)
+// RemoveFromSet removes a value from a set-type field (stored in flat key)
 // Returns true if value was removed, false if it didn't exist
 func (c *Client) RemoveFromSet(hashID, property, value string) (bool, error) {
 	c.mu.Lock()
@@ -453,12 +497,12 @@ func (c *Client) RemoveFromSet(hashID, property, value string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	hashKey := c.buildHashKey(hashID)
+	key := c.buildKeyPrefix(hashID) + property
 
 	// Get current value
-	current, err := c.client.HGet(ctx, hashKey, property).Result()
+	current, err := c.client.Get(ctx, key).Result()
 	if err == redis.Nil {
-		return false, nil // Field doesn't exist
+		return false, nil // Key doesn't exist
 	}
 	if err != nil {
 		return false, err
@@ -482,13 +526,13 @@ func (c *Client) RemoveFromSet(hashID, property, value string) (bool, error) {
 		return false, nil
 	}
 
-	// Save back (or delete field if empty)
+	// Save back (or delete key if empty)
 	if len(newValues) == 0 {
-		return true, c.client.HDel(ctx, hashKey, property).Err()
+		return true, c.client.Del(ctx, key).Err()
 	}
 
 	newValue := strings.Join(newValues, "|")
-	return true, c.client.HSet(ctx, hashKey, property, newValue).Err()
+	return true, c.client.Set(ctx, key, newValue, 0).Err()
 }
 
 // GetMemoryInfo returns Redis memory usage information
@@ -540,12 +584,29 @@ func (c *Client) ClearAllMetadata() (int64, error) {
 
 	var deletedCount int64
 
-	// Delete each file's hash
+	// Delete each file's flat keys
 	for _, hashID := range hashIDs {
-		hashKey := c.buildHashKey(hashID)
-		if err := c.client.Del(ctx, hashKey).Err(); err != nil {
-			log.Printf("[Storage] Warning: failed to delete %s: %v", hashKey, err)
-			continue
+		prefix := c.buildKeyPrefix(hashID)
+
+		// Scan and delete all keys with this prefix
+		var cursor uint64
+		for {
+			keys, nextCursor, err := c.client.Scan(ctx, cursor, prefix+"*", 1000).Result()
+			if err != nil {
+				log.Printf("[Storage] Warning: failed to scan %s: %v", prefix, err)
+				break
+			}
+
+			if len(keys) > 0 {
+				if err := c.client.Del(ctx, keys...).Err(); err != nil {
+					log.Printf("[Storage] Warning: failed to delete keys for %s: %v", hashID, err)
+				}
+			}
+
+			cursor = nextCursor
+			if cursor == 0 {
+				break
+			}
 		}
 		deletedCount++
 	}
@@ -598,4 +659,43 @@ func (c *Client) XAdd(stream string, maxLen int64, fields map[string]interface{}
 	}
 
 	return id, nil
+}
+
+// ClearStream deletes a Redis stream entirely
+func (c *Client) ClearStream(stream string) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.client == nil {
+		return fmt.Errorf("not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := c.client.Del(ctx, stream).Err(); err != nil {
+		return fmt.Errorf("del stream failed: %w", err)
+	}
+
+	return nil
+}
+
+// GetStreamLength returns the length of a Redis stream
+func (c *Client) GetStreamLength(stream string) (int64, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.client == nil {
+		return 0, fmt.Errorf("not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	length, err := c.client.XLen(ctx, stream).Result()
+	if err != nil {
+		return 0, fmt.Errorf("xlen failed: %w", err)
+	}
+
+	return length, nil
 }

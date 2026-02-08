@@ -66,10 +66,59 @@ func (d *Dispatcher) dispatchToStream(event FileEvent) {
 	if event.OldPath != "" {
 		fields["oldPath"] = event.OldPath
 	}
+	if event.WatcherID != "" {
+		fields["watcherId"] = event.WatcherID
+	}
 
 	// Publish to stream
 	_, err := client.XAdd(EventsStream, StreamMaxLen, fields)
 	if err != nil {
 		log.Printf("[Dispatcher] Failed to publish to stream: %v", err)
 	}
+}
+
+// EmitReset clears the stream and emits a reset event
+// This is called when triggering a full rescan
+func (d *Dispatcher) EmitReset(watcherID string) error {
+	d.mu.RLock()
+	client := d.storageClient
+	d.mu.RUnlock()
+
+	if client == nil || !client.IsConnected() {
+		return fmt.Errorf("storage client not connected")
+	}
+
+	// Delete the stream to clear all historical events
+	if err := client.ClearStream(EventsStream); err != nil {
+		log.Printf("[Dispatcher] Warning: failed to clear stream: %v", err)
+		// Continue anyway - we'll emit the reset event
+	}
+
+	log.Printf("[Dispatcher] Cleared stream %s for reset", EventsStream)
+
+	// Emit reset event as the first message in the fresh stream
+	event := FileEvent{
+		Type:      EventTypeReset,
+		Path:      "",  // No specific path for reset
+		WatcherID: watcherID,
+		Timestamp: NowMS(),
+	}
+
+	// Dispatch synchronously for reset
+	d.dispatchToStream(event)
+
+	return nil
+}
+
+// GetStreamLength returns the current stream length
+func (d *Dispatcher) GetStreamLength() (int64, error) {
+	d.mu.RLock()
+	client := d.storageClient
+	d.mu.RUnlock()
+
+	if client == nil || !client.IsConnected() {
+		return 0, fmt.Errorf("storage client not connected")
+	}
+
+	return client.GetStreamLength(EventsStream)
 }

@@ -57,6 +57,11 @@ func (rm *RedisManager) Start() error {
 		"--dbfilename", "dump.rdb",
 		"--save", "60", "1", // Save after 60 seconds if at least 1 key changed
 		"--loglevel", "warning",
+		// Enable keyspace notifications for meta:events stream
+		// K = Keyspace events (publish to __keyspace@0__:keyname)
+		// g = Generic commands (DEL, EXPIRE, RENAME)
+		// $ = String commands (SET, MSET, etc.)
+		"--notify-keyspace-events", "Kg$",
 	}
 
 	rm.cmd = exec.Command("redis-server", args...)
