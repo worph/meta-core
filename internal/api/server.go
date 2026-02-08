@@ -14,6 +14,7 @@ import (
 	"github.com/metazla/meta-core/internal/mounts"
 	"github.com/metazla/meta-core/internal/storage"
 	"github.com/metazla/meta-core/internal/watcher"
+	"github.com/metazla/meta-core/internal/watchers"
 )
 
 // Server is the HTTP API server for meta-core
@@ -29,6 +30,9 @@ type Server struct {
 	watcherDispatcher *watcher.Dispatcher
 	fileWatcher       *watcher.Watcher
 	watcherHandlers   *watcher.Handlers
+	watchersManager   *watchers.Manager
+	watchersPoller    *watchers.Poller
+	watchersHandlers  *watchers.Handlers
 	router            *mux.Router
 	server            *http.Server
 }
@@ -50,18 +54,36 @@ func NewServer(
 		router:    mux.NewRouter(),
 	}
 
-	// Initialize file watcher (if enabled) - before mounts so we can pass scanFunc
+	// Initialize file watcher/scanner and dispatcher
 	var scanFunc mounts.ScanFunc
-	if cfg.EnableFileWatcher && len(cfg.WatchFolderList) > 0 {
+	if cfg.EnableFileWatcher {
 		s.watcherDispatcher = watcher.NewDispatcher()
+		// Wire storage client for Redis Stream publishing
+		if stor != nil {
+			s.watcherDispatcher.SetStorageClient(stor)
+		}
 		fileWatcher, err := watcher.NewWatcher(cfg, s.watcherDispatcher)
 		if err != nil {
 			log.Printf("[API] Warning: failed to initialize file watcher: %v", err)
 		} else {
 			s.fileWatcher = fileWatcher
 			s.watcherHandlers = watcher.NewHandlers(fileWatcher, s.watcherDispatcher)
-			// Create scan function from watcher
+			// Create scan function from watcher for mounts
 			scanFunc = fileWatcher.ScanMountPath
+		}
+
+		// Initialize watchers manager (polling-based file watching)
+		watchersManager, err := watchers.NewManager(cfg)
+		if err != nil {
+			log.Printf("[API] Warning: failed to initialize watchers manager: %v", err)
+		} else {
+			s.watchersManager = watchersManager
+
+			// Create watchers poller
+			if s.fileWatcher != nil {
+				s.watchersPoller = watchers.NewPoller(watchersManager, s.fileWatcher, s.watcherDispatcher)
+				s.watchersHandlers = watchers.NewHandlers(watchersManager, s.watchersPoller)
+			}
 		}
 	}
 
@@ -151,6 +173,12 @@ func (s *Server) setupRoutes() {
 		log.Println("[API] File watcher routes registered at /api/events/*, /api/scan/*")
 	}
 
+	// Watchers management routes (if watchers initialized)
+	if s.watchersHandlers != nil {
+		s.watchersHandlers.RegisterRoutes(s.router)
+		log.Println("[API] Watchers management routes registered at /api/watchers/*")
+	}
+
 	// Add middleware
 	s.router.Use(loggingMiddleware)
 	s.router.Use(corsMiddleware)
@@ -176,10 +204,10 @@ func (s *Server) Start() error {
 		}
 	}()
 
-	// Start file watcher (if initialized)
-	if s.fileWatcher != nil {
-		if err := s.fileWatcher.Start(); err != nil {
-			log.Printf("[API] Warning: failed to start file watcher: %v", err)
+	// Start watchers poller (if initialized)
+	if s.watchersPoller != nil {
+		if err := s.watchersPoller.Start(); err != nil {
+			log.Printf("[API] Warning: failed to start watchers poller: %v", err)
 		}
 	}
 
@@ -195,17 +223,17 @@ func (s *Server) Start() error {
 
 // Stop gracefully stops the HTTP server
 func (s *Server) Stop() error {
+	// Stop watchers poller
+	if s.watchersPoller != nil {
+		if err := s.watchersPoller.Stop(); err != nil {
+			log.Printf("[API] Warning: failed to stop watchers poller: %v", err)
+		}
+	}
+
 	// Stop mount poller
 	if s.mountPoller != nil {
 		if err := s.mountPoller.Stop(); err != nil {
 			log.Printf("[API] Warning: failed to stop mount poller: %v", err)
-		}
-	}
-
-	// Stop file watcher
-	if s.fileWatcher != nil {
-		if err := s.fileWatcher.Stop(); err != nil {
-			log.Printf("[API] Warning: failed to stop file watcher: %v", err)
 		}
 	}
 

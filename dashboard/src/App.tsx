@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom';
 import Dashboard from './pages/Dashboard';
 import Mounts from './pages/Mounts';
+import Watchers from './pages/Watchers';
 import Files from './pages/Files';
 import ServiceNav from './components/ServiceNav';
 
@@ -62,6 +63,12 @@ export default function App() {
           Mounts
         </NavLink>
         <NavLink
+          to="/watchers"
+          style={({ isActive }) => (isActive ? activeLinkStyle : linkStyle)}
+        >
+          Watchers
+        </NavLink>
+        <NavLink
           to="/files"
           style={({ isActive }) => (isActive ? activeLinkStyle : linkStyle)}
         >
@@ -80,6 +87,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/mounts" element={<Mounts />} />
+          <Route path="/watchers" element={<Watchers />} />
           <Route path="/files" element={<Files />} />
           <Route path="/editor" element={<EditorPage />} />
         </Routes>

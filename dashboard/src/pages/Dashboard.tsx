@@ -7,11 +7,20 @@ interface HealthStatus {
   timestamp: string;
 }
 
-interface ScanStatus {
-  status: string;
-  scanning: boolean;
+interface WatcherStatus {
+  id: string;
+  path: string;
+  intervalMs: number;
+  enabled: boolean;
+  active: boolean;
   lastScan: number;
   fileCount: number;
+  isScanning: boolean;
+}
+
+interface WatchersResponse {
+  watchers: WatcherStatus[];
+  count: number;
 }
 
 interface ServiceInfo {
@@ -42,7 +51,7 @@ const statStyle: React.CSSProperties = {
 
 export default function Dashboard() {
   const [health, setHealth] = useState<HealthStatus | null>(null);
-  const [scanStatus, setScanStatus] = useState<ScanStatus | null>(null);
+  const [watchersData, setWatchersData] = useState<WatchersResponse | null>(null);
   const [services, setServices] = useState<ServiceInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
 
@@ -55,10 +64,10 @@ export default function Dashboard() {
           setHealth(await healthRes.json());
         }
 
-        // Fetch scan status
-        const scanRes = await fetch('/api/scan/status');
-        if (scanRes.ok) {
-          setScanStatus(await scanRes.json());
+        // Fetch watchers status
+        const watchersRes = await fetch('/api/watchers');
+        if (watchersRes.ok) {
+          setWatchersData(await watchersRes.json());
         }
 
         // Fetch services
@@ -81,11 +90,17 @@ export default function Dashboard() {
 
   const handleTriggerScan = async () => {
     try {
-      await fetch('/api/scan/trigger', { method: 'POST' });
+      await fetch('/api/watchers/scan-all', { method: 'POST' });
     } catch (err) {
       console.error('Failed to trigger scan:', err);
     }
   };
+
+  // Aggregate watcher stats
+  const totalFiles = watchersData?.watchers.reduce((sum, w) => sum + w.fileCount, 0) || 0;
+  const isScanning = watchersData?.watchers.some(w => w.isScanning) || false;
+  const activeWatchers = watchersData?.watchers.filter(w => w.active).length || 0;
+  const lastScan = watchersData?.watchers.reduce((max, w) => Math.max(max, w.lastScan || 0), 0) || 0;
 
   return (
     <div style={{ padding: '2rem', maxWidth: '1200px', margin: '0 auto' }}>
@@ -114,16 +129,17 @@ export default function Dashboard() {
           )}
         </div>
 
-        {/* Scan Status Card */}
+        {/* Watchers Status Card */}
         <div style={cardStyle}>
-          <h3 style={{ marginBottom: '1rem', color: '#888' }}>File Watcher</h3>
-          {scanStatus ? (
+          <h3 style={{ marginBottom: '1rem', color: '#888' }}>File Watchers</h3>
+          {watchersData ? (
             <>
-              <div style={statStyle}>{scanStatus.fileCount}</div>
+              <div style={statStyle}>{totalFiles}</div>
               <p>Files discovered</p>
-              <p>Status: {scanStatus.scanning ? 'Scanning...' : scanStatus.status}</p>
-              {scanStatus.lastScan > 0 && (
-                <p>Last scan: {new Date(scanStatus.lastScan).toLocaleString()}</p>
+              <p>Watchers: {activeWatchers} active / {watchersData.count} total</p>
+              <p>Status: {isScanning ? 'Scanning...' : 'Idle'}</p>
+              {lastScan > 0 && (
+                <p>Last scan: {new Date(lastScan).toLocaleString()}</p>
               )}
               <button
                 onClick={handleTriggerScan}
@@ -137,7 +153,7 @@ export default function Dashboard() {
                   cursor: 'pointer',
                 }}
               >
-                Trigger Scan
+                Scan All
               </button>
             </>
           ) : (

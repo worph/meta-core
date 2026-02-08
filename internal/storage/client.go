@@ -570,3 +570,32 @@ func (c *Client) GetRedisClient() *redis.Client {
 func (c *Client) GetPrefix() string {
 	return c.prefix
 }
+
+// XAdd publishes an event to a Redis Stream
+// Uses XADD with MAXLEN ~ for approximate trimming
+func (c *Client) XAdd(stream string, maxLen int64, fields map[string]interface{}) (string, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.client == nil {
+		return "", fmt.Errorf("not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Build XADD arguments with approximate MAXLEN
+	args := &redis.XAddArgs{
+		Stream: stream,
+		MaxLen: maxLen,
+		Approx: true,
+		Values: fields,
+	}
+
+	id, err := c.client.XAdd(ctx, args).Result()
+	if err != nil {
+		return "", fmt.Errorf("xadd failed: %w", err)
+	}
+
+	return id, nil
+}

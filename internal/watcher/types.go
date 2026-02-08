@@ -22,15 +22,6 @@ type FileEvent struct {
 	OldPath     string        `json:"oldPath,omitempty"`     // For rename events
 }
 
-// Subscriber represents a webhook subscriber
-type Subscriber struct {
-	URL          string   `json:"url"`
-	RegisteredAt int64    `json:"registeredAt"`
-	EventTypes   []string `json:"eventTypes,omitempty"` // Empty means all
-	LastDelivery int64    `json:"lastDelivery,omitempty"`
-	FailCount    int      `json:"failCount"`
-}
-
 // PendingEvent tracks a file event that's being debounced
 type PendingEvent struct {
 	Event     FileEvent
@@ -39,22 +30,10 @@ type PendingEvent struct {
 	Timer     *time.Timer
 }
 
-// SubscribeRequest is the request to register a webhook
-type SubscribeRequest struct {
-	URL        string   `json:"url"`
-	EventTypes []string `json:"eventTypes,omitempty"`
-}
-
 // EventsListResponse is the response for listing events
 type EventsListResponse struct {
 	Events []FileEvent `json:"events"`
 	Count  int         `json:"count"`
-}
-
-// SubscribersListResponse is the response for listing subscribers
-type SubscribersListResponse struct {
-	Subscribers []Subscriber `json:"subscribers"`
-	Count       int          `json:"count"`
 }
 
 // ScanStatusResponse is the response for scan status

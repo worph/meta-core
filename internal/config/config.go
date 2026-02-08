@@ -104,6 +104,11 @@ func (c *Config) MountsErrorDir() string {
 	return c.MountsDir + "/errors"
 }
 
+// WatchersFilePath returns the path to the watchers configuration file
+func (c *Config) WatchersFilePath() string {
+	return c.MetaCorePath + "/watchers.json"
+}
+
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value

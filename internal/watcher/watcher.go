@@ -3,16 +3,13 @@ package watcher
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/metazla/meta-core/internal/config"
 )
 
@@ -21,186 +18,30 @@ const (
 	PartialHashSize = 64 * 1024 // 64KB
 )
 
-// Watcher monitors directories for file changes
+// Watcher provides file scanning and event dispatching
 type Watcher struct {
 	config     *config.Config
-	fsWatcher  *fsnotify.Watcher
 	debouncer  *Debouncer
 	dispatcher *Dispatcher
 	filesPath  string
-	watchPaths []string
 
 	mu          sync.RWMutex
-	isRunning   bool
-	isScanning  bool
-	lastScan    int64
-	fileCount   int
-	stopChan    chan struct{}
 	eventBuffer []FileEvent
 }
 
-// NewWatcher creates a new file watcher
+// NewWatcher creates a new file watcher/scanner
 func NewWatcher(cfg *config.Config, dispatcher *Dispatcher) (*Watcher, error) {
-	fsWatcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return nil, err
-	}
-
-	debouncer := NewDebouncer(time.Duration(cfg.DebounceMS) * time.Millisecond)
+	debouncer := NewDebouncer(0) // No debouncing for polling-based scanning
 
 	w := &Watcher{
 		config:      cfg,
-		fsWatcher:   fsWatcher,
 		debouncer:   debouncer,
 		dispatcher:  dispatcher,
 		filesPath:   cfg.FilesPath,
-		watchPaths:  cfg.WatchFolderList,
-		stopChan:    make(chan struct{}),
 		eventBuffer: make([]FileEvent, 0, 1000),
 	}
 
-	// Set debouncer callback
-	debouncer.SetCallback(func(event FileEvent) {
-		w.handleDebouncedEvent(event)
-	})
-
 	return w, nil
-}
-
-// Start begins watching for file changes
-func (w *Watcher) Start() error {
-	w.mu.Lock()
-	if w.isRunning {
-		w.mu.Unlock()
-		return nil
-	}
-	w.isRunning = true
-	w.mu.Unlock()
-
-	// Add watch paths
-	for _, watchPath := range w.watchPaths {
-		if err := w.addWatchRecursive(watchPath); err != nil {
-			log.Printf("[Watcher] Warning: failed to watch %s: %v", watchPath, err)
-		}
-	}
-
-	// Start event processing goroutine
-	go w.processEvents()
-
-	// Start initial scan
-	go w.RunScan()
-
-	log.Printf("[Watcher] Started watching %d paths", len(w.watchPaths))
-	return nil
-}
-
-// Stop stops the watcher
-func (w *Watcher) Stop() error {
-	w.mu.Lock()
-	if !w.isRunning {
-		w.mu.Unlock()
-		return nil
-	}
-	w.isRunning = false
-	w.mu.Unlock()
-
-	close(w.stopChan)
-	w.debouncer.Stop()
-	return w.fsWatcher.Close()
-}
-
-// addWatchRecursive adds a directory and all subdirectories to the watch list
-func (w *Watcher) addWatchRecursive(root string) error {
-	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil // Skip inaccessible paths
-		}
-		if info.IsDir() {
-			if err := w.fsWatcher.Add(path); err != nil {
-				log.Printf("[Watcher] Warning: cannot watch %s: %v", path, err)
-			}
-		}
-		return nil
-	})
-}
-
-// processEvents handles fsnotify events
-func (w *Watcher) processEvents() {
-	for {
-		select {
-		case <-w.stopChan:
-			return
-
-		case event, ok := <-w.fsWatcher.Events:
-			if !ok {
-				return
-			}
-			w.handleFsEvent(event)
-
-		case err, ok := <-w.fsWatcher.Errors:
-			if !ok {
-				return
-			}
-			log.Printf("[Watcher] Error: %v", err)
-		}
-	}
-}
-
-// handleFsEvent converts an fsnotify event to a FileEvent
-func (w *Watcher) handleFsEvent(event fsnotify.Event) {
-	// Get relative path
-	relPath, err := filepath.Rel(w.filesPath, event.Name)
-	if err != nil {
-		relPath = event.Name
-	}
-
-	// Clean up path
-	relPath = filepath.ToSlash(relPath)
-
-	// Determine event type
-	var eventType FileEventType
-	switch {
-	case event.Op&fsnotify.Create == fsnotify.Create:
-		eventType = EventTypeAdd
-		// If it's a new directory, add it to watch
-		if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
-			w.fsWatcher.Add(event.Name)
-		}
-	case event.Op&fsnotify.Write == fsnotify.Write:
-		eventType = EventTypeChange
-	case event.Op&fsnotify.Remove == fsnotify.Remove:
-		eventType = EventTypeDelete
-	case event.Op&fsnotify.Rename == fsnotify.Rename:
-		eventType = EventTypeRename
-	default:
-		return // Ignore other events
-	}
-
-	// Skip directories for file events (except remove)
-	if eventType != EventTypeDelete {
-		info, err := os.Stat(event.Name)
-		if err == nil && info.IsDir() {
-			return
-		}
-	}
-
-	// Get file info if available
-	var size int64
-	if eventType != EventTypeDelete {
-		if info, err := os.Stat(event.Name); err == nil {
-			size = info.Size()
-		}
-	}
-
-	fileEvent := FileEvent{
-		Type:      eventType,
-		Path:      relPath,
-		Size:      size,
-		Timestamp: NowMS(),
-	}
-
-	// Send to debouncer
-	w.debouncer.Add(fileEvent)
 }
 
 // handleDebouncedEvent processes a debounced event
@@ -224,44 +65,11 @@ func (w *Watcher) handleDebouncedEvent(event FileEvent) {
 
 	// Dispatch to subscribers
 	w.dispatcher.Dispatch(event)
-
-	log.Printf("[Watcher] Event: %s %s", event.Type, event.Path)
 }
 
-// RunScan performs a full directory scan
-func (w *Watcher) RunScan() {
-	w.mu.Lock()
-	if w.isScanning {
-		w.mu.Unlock()
-		return
-	}
-	w.isScanning = true
-	w.mu.Unlock()
-
-	defer func() {
-		w.mu.Lock()
-		w.isScanning = false
-		w.lastScan = NowMS()
-		w.mu.Unlock()
-	}()
-
-	log.Println("[Watcher] Starting directory scan...")
-
-	fileCount := 0
-	for _, watchPath := range w.watchPaths {
-		count := w.scanDirectory(watchPath)
-		fileCount += count
-	}
-
-	w.mu.Lock()
-	w.fileCount = fileCount
-	w.mu.Unlock()
-
-	log.Printf("[Watcher] Scan complete: %d files found", fileCount)
-}
-
-// scanDirectory scans a directory and emits add events for files
-func (w *Watcher) scanDirectory(root string) int {
+// ScanDirectory scans a directory and emits add events for files
+// Returns the count of files found
+func (w *Watcher) ScanDirectory(root string) int {
 	count := 0
 
 	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
@@ -286,7 +94,7 @@ func (w *Watcher) scanDirectory(root string) int {
 		}
 		relPath = filepath.ToSlash(relPath)
 
-		// Emit add event (through debouncer)
+		// Emit add event
 		event := FileEvent{
 			Type:      EventTypeAdd,
 			Path:      relPath,
@@ -299,7 +107,7 @@ func (w *Watcher) scanDirectory(root string) int {
 			event.PartialHash = hash
 		}
 
-		// Dispatch directly (skip debouncer for scan)
+		// Dispatch directly
 		w.dispatcher.Dispatch(event)
 		count++
 
@@ -314,25 +122,34 @@ func (w *Watcher) scanDirectory(root string) int {
 func (w *Watcher) ScanMountPath(mountPath string) (int, error) {
 	// Validate path is under filesPath
 	if !strings.HasPrefix(mountPath, w.filesPath) {
-		return 0, fmt.Errorf("mount path %s is not under files path %s", mountPath, w.filesPath)
+		// Try to normalize paths
+		absMount, err := filepath.Abs(mountPath)
+		if err == nil {
+			absFiles, err := filepath.Abs(w.filesPath)
+			if err == nil && strings.HasPrefix(absMount, absFiles) {
+				mountPath = absMount
+			}
+		}
 	}
 
 	// Check directory exists
 	info, err := os.Stat(mountPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return 0, fmt.Errorf("mount path %s does not exist", mountPath)
+			log.Printf("[Watcher] Mount path %s does not exist, skipping", mountPath)
+			return 0, nil
 		}
-		return 0, fmt.Errorf("failed to stat mount path %s: %w", mountPath, err)
+		return 0, err
 	}
 
 	if !info.IsDir() {
-		return 0, fmt.Errorf("mount path %s is not a directory", mountPath)
+		log.Printf("[Watcher] Mount path %s is not a directory, skipping", mountPath)
+		return 0, nil
 	}
 
 	// Scan the directory
 	log.Printf("[Watcher] Scanning mount path: %s", mountPath)
-	count := w.scanDirectory(mountPath)
+	count := w.ScanDirectory(mountPath)
 	log.Printf("[Watcher] Mount scan complete: %s (%d files)", mountPath, count)
 
 	return count, nil
@@ -356,22 +173,9 @@ func (w *Watcher) GetRecentEvents(sinceMS int64, limit int) []FileEvent {
 	return result
 }
 
-// GetStatus returns watcher status
-func (w *Watcher) GetStatus() ScanStatusResponse {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-
-	status := "running"
-	if !w.isRunning {
-		status = "stopped"
-	}
-
-	return ScanStatusResponse{
-		Status:    status,
-		Scanning:  w.isScanning,
-		LastScan:  w.lastScan,
-		FileCount: w.fileCount,
-	}
+// GetFilesPath returns the files path
+func (w *Watcher) GetFilesPath() string {
+	return w.filesPath
 }
 
 // computePartialHash computes SHA-256 hash of first 64KB of a file
