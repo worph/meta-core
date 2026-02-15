@@ -23,7 +23,7 @@ import (
 // Server is the HTTP API server for meta-core
 type Server struct {
 	config            *config.Config
-	election          *leader.Election
+	roleProvider      leader.RoleProvider
 	discovery         *discovery.Service
 	cleaner           *discovery.Cleaner
 	storage           *storage.Client
@@ -48,15 +48,15 @@ type Server struct {
 // NewServer creates a new API server
 func NewServer(
 	cfg *config.Config,
-	election *leader.Election,
+	roleProvider leader.RoleProvider,
 	disc *discovery.Service,
 	cleaner *discovery.Cleaner,
 	stor *storage.Client,
 ) *Server {
 	s := &Server{
-		config:    cfg,
-		election:  election,
-		discovery: disc,
+		config:       cfg,
+		roleProvider: roleProvider,
+		discovery:    disc,
 		cleaner:   cleaner,
 		storage:   stor,
 		router:    mux.NewRouter(),

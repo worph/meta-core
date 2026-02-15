@@ -77,10 +77,10 @@ var startTime = time.Now()
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	response := HealthResponse{
 		Status:    "ok",
-		Role:      string(s.election.Role()),
+		Role:      string(s.roleProvider.Role()),
 		Redis:     s.storage.Health(),
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		Leader:    s.election.LeaderInfo(),
+		Leader:    s.roleProvider.LeaderInfo(),
 	}
 
 	if !response.Redis {
@@ -100,13 +100,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	response := StatusResponse{
 		Status:      "ok",
-		Role:        string(s.election.Role()),
+		Role:        string(s.roleProvider.Role()),
 		Redis:       s.storage.Health(),
 		ServiceName: s.config.ServiceName,
 		Version:     s.config.ServiceVersion,
 		Uptime:      int64(time.Since(startTime).Seconds()),
 		FileCount:   fileCount,
-		Leader:      s.election.LeaderInfo(),
+		Leader:      s.roleProvider.LeaderInfo(),
 	}
 
 	if !response.Redis {
@@ -118,7 +118,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 // handleLeader handles GET /leader
 func (s *Server) handleLeader(w http.ResponseWriter, r *http.Request) {
-	info := s.election.LeaderInfo()
+	info := s.roleProvider.LeaderInfo()
 	if info == nil {
 		writeError(w, http.StatusServiceUnavailable, "no leader available")
 		return
@@ -130,7 +130,7 @@ func (s *Server) handleLeader(w http.ResponseWriter, r *http.Request) {
 // handleRole handles GET /role
 func (s *Server) handleRole(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
-		"role": string(s.election.Role()),
+		"role": string(s.roleProvider.Role()),
 	})
 }
 
@@ -147,7 +147,7 @@ type URLsResponse struct {
 // handleURLs handles GET /urls
 // Returns URLs for the current leader (or this instance if leader)
 func (s *Server) handleURLs(w http.ResponseWriter, r *http.Request) {
-	info := s.election.LeaderInfo()
+	info := s.roleProvider.LeaderInfo()
 	if info == nil {
 		writeError(w, http.StatusServiceUnavailable, "no leader available")
 		return
@@ -159,7 +159,7 @@ func (s *Server) handleURLs(w http.ResponseWriter, r *http.Request) {
 		ApiUrl:    info.ApiUrl,
 		RedisUrl:  info.RedisUrl,
 		WebdavUrl: info.WebdavUrl,
-		IsLeader:  s.election.IsLeader(),
+		IsLeader:  s.roleProvider.IsLeader(),
 	}
 
 	writeJSON(w, http.StatusOK, response)

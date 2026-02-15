@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -24,36 +25,23 @@ func main() {
 	cfg := config.Load()
 	log.Printf("[meta-core] Service: %s, HTTP Port: %d", cfg.ServiceName, cfg.HTTPPort)
 
-	// Create storage client
+	// Create role provider (reads META_CORE_ROLE from environment, set by leader-election.sh)
+	roleProvider := leader.NewLocalRoleProvider(cfg)
+	log.Printf("[meta-core] Role: %s", roleProvider.Role())
+
+	// Connect to local Redis (supervisord starts Redis before meta-core)
+	redisURL := fmt.Sprintf("redis://localhost:%d", cfg.RedisPort)
+	log.Printf("[meta-core] Connecting to Redis at %s", redisURL)
+
 	storageClient := storage.NewClient("")
-
-	// Create leader election
-	election := leader.NewElection(cfg)
-
-	// Wire up storage connector to election
-	election.SetStorageConnector(&storageConnectorAdapter{client: storageClient})
-
-	// Set up leader/follower callbacks
-	election.OnBecomeLeader(func() {
-		log.Println("[meta-core] Became LEADER - Redis is running")
-	})
-
-	election.OnBecomeFollower(func(info *leader.LeaderLockInfo) {
-		log.Printf("[meta-core] Became FOLLOWER - Leader at %s (Redis: %s)", info.BaseUrl, info.RedisUrl)
-	})
-
-	election.OnLeaderLost(func() {
-		log.Println("[meta-core] Lost leadership")
-	})
-
-	// Start leader election
-	if err := election.Start(); err != nil {
-		log.Fatalf("[meta-core] Failed to start leader election: %v", err)
+	if err := storageClient.Connect(redisURL); err != nil {
+		log.Fatalf("[meta-core] Failed to connect to Redis: %v", err)
 	}
+	log.Println("[meta-core] Connected to Redis")
 
 	// Create and start service discovery
 	disc := discovery.NewService(cfg)
-	disc.SetRoleProvider(&roleProviderAdapter{election: election})
+	disc.SetRoleProvider(&roleProviderAdapter{provider: roleProvider})
 	if err := disc.Start(); err != nil {
 		log.Fatalf("[meta-core] Failed to start service discovery: %v", err)
 	}
@@ -65,7 +53,7 @@ func main() {
 	}
 
 	// Create and start API server
-	apiServer := api.NewServer(cfg, election, disc, cleaner, storageClient)
+	apiServer := api.NewServer(cfg, roleProvider, disc, cleaner, storageClient)
 	if err := apiServer.Start(); err != nil {
 		log.Fatalf("[meta-core] Failed to start API server: %v", err)
 	}
@@ -90,10 +78,6 @@ func main() {
 		log.Printf("[meta-core] Error stopping service discovery: %v", err)
 	}
 
-	if err := election.Stop(); err != nil {
-		log.Printf("[meta-core] Error stopping leader election: %v", err)
-	}
-
 	if err := storageClient.Close(); err != nil {
 		log.Printf("[meta-core] Error closing storage client: %v", err)
 	}
@@ -108,24 +92,11 @@ func waitForShutdown() {
 	<-sigChan
 }
 
-// storageConnectorAdapter adapts storage.Client to leader.StorageConnector
-type storageConnectorAdapter struct {
-	client *storage.Client
-}
-
-func (a *storageConnectorAdapter) Connect(url string) error {
-	return a.client.Connect(url)
-}
-
-func (a *storageConnectorAdapter) Close() error {
-	return a.client.Close()
-}
-
-// roleProviderAdapter adapts leader.Election to discovery.RoleProvider
+// roleProviderAdapter adapts leader.RoleProvider to discovery.RoleProvider
 type roleProviderAdapter struct {
-	election *leader.Election
+	provider leader.RoleProvider
 }
 
 func (a *roleProviderAdapter) Role() string {
-	return string(a.election.Role())
+	return string(a.provider.Role())
 }

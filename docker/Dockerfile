@@ -3,11 +3,17 @@
 # Multi-stage build for meta-core as a standalone service
 #
 # Includes:
-# - meta-core Go binary (leader election, Redis, HTTP API, Mount API, Watcher)
+# - Bash-based leader election script (flock on shared volume)
+# - meta-core Go binary (HTTP API, Mount API, Watcher)
 # - nginx (dashboard, WebDAV, API proxy)
-# - Redis (leader-managed)
+# - Redis (managed by supervisord on leader)
 # - rclone (remote mount daemon)
-# - supervisord (process management)
+# - supervisord (process management - runs on leader only)
+#
+# Architecture:
+# - leader-election.sh handles flock, starts supervisord on leader
+# - Followers remain dormant, retry flock every 5s
+# - Only leader runs Redis, meta-core, nginx, rclone, mount-watcher
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -103,6 +109,7 @@ RUN mkdir -p \
 COPY docker/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY docker/nginx.conf /etc/nginx/nginx.conf
 COPY docker/mount-watcher.sh /app/scripts/mount-watcher.sh
+COPY docker/leader-election.sh /app/scripts/leader-election.sh
 COPY docker/entrypoint.sh /entrypoint.sh
 
 # Copy dashboard static files from builder
@@ -112,7 +119,7 @@ COPY --from=dashboard-builder /app/dist /app/dashboard/dist
 COPY --from=editor-builder /app/dist /app/editor/dist
 
 # Set permissions
-RUN chmod +x /app/scripts/mount-watcher.sh /entrypoint.sh
+RUN chmod +x /app/scripts/mount-watcher.sh /app/scripts/leader-election.sh /entrypoint.sh
 
 # Create htpasswd for rclone basic auth (admin:admin)
 RUN htpasswd -bc /etc/nginx/.htpasswd admin admin
@@ -137,4 +144,4 @@ HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -sf http://localhost/health || exit 1
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
+CMD ["/app/scripts/leader-election.sh"]

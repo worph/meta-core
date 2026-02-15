@@ -68,6 +68,15 @@ func (p *Poller) Start() error {
 
 	log.Println("[WatcherPoller] Starting file watcher polling service")
 
+	// Clear file:events stream on startup to prevent duplicate events from accumulating
+	// across container restarts. Since in-memory state is empty, all files will be
+	// re-emitted as "add" events - we need a fresh stream to match.
+	if p.dispatcher != nil {
+		if err := p.dispatcher.EmitReset("startup"); err != nil {
+			log.Printf("[WatcherPoller] Warning: failed to clear stream on startup: %v", err)
+		}
+	}
+
 	// Initial sync with watcher configurations
 	go p.syncWithWatchers()
 
