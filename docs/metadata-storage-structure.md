@@ -4,40 +4,49 @@ This document describes how MetaMesh stores file metadata in Redis, the key stru
 
 ## Overview
 
-MetaMesh uses Redis as its primary metadata storage, storing file metadata as **Redis Hashes** with flattened key-value pairs. This design enables:
+MetaMesh uses Redis as its primary metadata storage, storing file metadata as **flat string keys**. Each property is stored as a separate Redis key rather than using Redis Hashes. This design enables:
 
-- Efficient nested object storage without JSON serialization overhead
-- Individual field updates without full document rewrites
-- Cross-service access via Redis pub/sub notifications
+- **Redis keyspace notifications** for field-level change detection
+- **Pattern-based subscriptions** (e.g., `file:*/tmdb/*` for TMDB updates)
+- **meta:events stream** integration for real-time updates across services
+- Individual field updates without affecting other properties
 - Fast VFS lookups using content-based hash IDs
 
 ## Key Structure
 
-### Hash-Based Storage
+### Flat Key Storage
 
-Each file's metadata is stored as a Redis Hash:
+Each file property is stored as a separate Redis STRING key:
 
 ```
-Hash Key:    file:{hashId}
-Hash Fields: property/path (e.g., "fileinfo/duration", "titles/eng")
-Hash Values: String values
+Key Pattern:  file:{hashId}/{property/path}
+Key Type:     STRING
+Value:        String value
 ```
 
 **Example Redis commands:**
 ```bash
-# Store file metadata
-HMSET file:bafkr4ih5kapbjzq... \
-  "cid_midhash256" "bafkr4ih5kapbjzq..." \
-  "filePath" "/files/watch/movie.mkv" \
-  "fileinfo/duration" "7200.5" \
-  "fileinfo/formatName" "matroska,webm"
+# Store file metadata (each property is a separate key)
+SET "file:bafkr4ih5kapbjzq.../cid_midhash256" "bafkr4ih5kapbjzq..."
+SET "file:bafkr4ih5kapbjzq.../filePath" "/files/watch/movie.mkv"
+SET "file:bafkr4ih5kapbjzq.../fileinfo/duration" "7200.5"
+SET "file:bafkr4ih5kapbjzq.../fileinfo/formatName" "matroska,webm"
 
-# Retrieve all metadata
-HGETALL file:bafkr4ih5kapbjzq...
+# Retrieve single field
+GET "file:bafkr4ih5kapbjzq.../fileinfo/duration"
 
-# Get single field
-HGET file:bafkr4ih5kapbjzq... "fileinfo/duration"
+# Retrieve all metadata for a file (scan by prefix)
+SCAN 0 MATCH "file:bafkr4ih5kapbjzq.../*" COUNT 1000
 ```
+
+### Why Flat Keys?
+
+The flat key structure (vs. Redis Hashes) enables:
+
+1. **Keyspace Notifications**: Redis publishes events when individual keys change
+2. **Pattern Subscriptions**: Services can subscribe to `__keyspace@0__:file:*/tmdb/*`
+3. **Selective Updates**: Update one field without touching others
+4. **Stream Integration**: The `meta:events` stream captures field-level changes
 
 ### File Index
 
@@ -50,6 +59,66 @@ Value: {hashId1, hashId2, hashId3, ...}
 ```
 
 This enables fast bulk queries like "get all files" without scanning keys.
+
+```bash
+# Get all hash IDs
+SMEMBERS "file:__index__"
+
+# Count total files
+SCARD "file:__index__"
+
+# Check if a file exists
+SISMEMBER "file:__index__" "bafkr4ih5kapbjzq..."
+```
+
+### Keyspace Notifications
+
+Redis keyspace notifications are enabled to detect metadata changes. This requires the `notify-keyspace-events` configuration:
+
+```bash
+# Required Redis config (set by meta-core)
+CONFIG SET notify-keyspace-events "K$"
+
+# K = Keyspace events (published on __keyspace@<db>__:<key>)
+# $ = String commands (SET, etc.)
+```
+
+Services can subscribe to keyspace events for real-time updates:
+
+```bash
+# Subscribe to all file key changes
+PSUBSCRIBE '__keyspace@0__:file:*'
+
+# Subscribe to specific field pattern (e.g., TMDB updates)
+PSUBSCRIBE '__keyspace@0__:file:*/tmdb/*'
+```
+
+### meta:events Stream
+
+The `meta:events` stream provides reliable event delivery for file system events from meta-core:
+
+```
+Stream Key: meta:events
+Entry Fields:
+  - type: add | change | delete | rename | reset
+  - path: File path relative to /files
+  - midhash256: Content hash (for add/change events)
+  - oldPath: Previous path (for rename events)
+  - timestamp: Event timestamp
+```
+
+Consumer groups enable reliable processing with acknowledgment:
+
+```bash
+# Create consumer group
+XGROUP CREATE meta:events mygroup 0 MKSTREAM
+
+# Read new events (blocking)
+XREADGROUP GROUP mygroup myconsumer BLOCK 5000 STREAMS meta:events >
+
+# Acknowledge processed events
+XACK meta:events mygroup <entry-id>
+```
 
 ## Primary Hash ID
 
@@ -151,7 +220,7 @@ File Discovered
     └─ full-hash   → cid_sha2-256, cid_sha1
          ↓
 [Plugin Callbacks]
-    └─ Merge metadata into Redis via HMSET
+    └─ Store metadata via flat keys (SET per property)
 ```
 
 ## Core Metadata Types
@@ -275,18 +344,46 @@ fileinfo/streamdetails/embeddedimage/0/type    = "cover"
 - `language` - ISO 639-2 code
 - `format` - subrip, ass, pgs, vobsub
 
-## Redis Pub/Sub Notifications
+## Real-Time Notifications
 
-MetaMesh uses Redis pub/sub to notify other services of metadata changes.
+MetaMesh provides multiple mechanisms for real-time metadata change notifications:
 
-### Channels
+### 1. meta:events Stream (Recommended)
+
+The `meta:events` Redis stream provides reliable, ordered event delivery with consumer groups:
+
+```bash
+# File system events from meta-core watcher
+XREAD STREAMS meta:events 0
+
+# Event types: add, change, delete, rename, reset
+```
+
+Benefits:
+- **Reliable delivery** via consumer groups and acknowledgment
+- **Replay capability** for catching up after restarts
+- **Ordered processing** with stream IDs
+
+### 2. Keyspace Notifications
+
+For field-level change detection, subscribe to Redis keyspace notifications:
+
+```bash
+# All file metadata changes
+PSUBSCRIBE '__keyspace@0__:file:*'
+
+# Specific plugin updates (e.g., TMDB enrichment)
+PSUBSCRIBE '__keyspace@0__:file:*/tmdb/*'
+```
+
+### 3. Pub/Sub Channels (Legacy)
+
+Batch notification channels are still supported:
 
 ```
 meta-sort:file:batch    # Batch file updates (every 5 seconds)
 meta-sort:scan:reset    # Full rescan notification
 ```
-
-### Batch Update Message Format
 
 ```json
 {
@@ -299,17 +396,23 @@ meta-sort:scan:reset    # Full rescan notification
 }
 ```
 
-This enables meta-fuse to update its VFS in near real-time without polling.
-
 ## Complete Example
 
 Here's a complete metadata example for a movie file:
 
 ```bash
-# Query all metadata
-redis-cli HGETALL file:bafkr4ih5kapbjzq...
+# Query all keys for a file
+redis-cli --scan --pattern 'file:bafkr4ih5kapbjzq.../*'
 
-# Result (reconstructed as nested object)
+# Example flat keys stored in Redis:
+# file:bafkr4ih5kapbjzq.../cid_midhash256      = "bafkr4ih5kapbjzq..."
+# file:bafkr4ih5kapbjzq.../filePath            = "/files/watch/movies/Inception.2010.1080p.BluRay.x264.mkv"
+# file:bafkr4ih5kapbjzq.../fileType            = "video"
+# file:bafkr4ih5kapbjzq.../fileinfo/duration   = "8878.5"
+# file:bafkr4ih5kapbjzq.../titles/eng          = "Inception"
+# ...
+
+# When reconstructed by the API (nested object representation)
 {
   # Content identification
   "cid_midhash256": "bafkr4ih5kapbjzq...",
@@ -393,18 +496,49 @@ redis-cli HGETALL file:bafkr4ih5kapbjzq...
 ## Debugging
 
 ```bash
-# List all file keys
-docker exec meta-sort-dev redis-cli KEYS 'file:*' | head -20
-
-# Get all metadata for a file
-docker exec meta-sort-dev redis-cli HGETALL 'file:bafkr4ih5...'
-
-# Get specific field
-docker exec meta-sort-dev redis-cli HGET 'file:bafkr4ih5...' 'fileinfo/duration'
+# List all file hash IDs
+docker exec meta-core-dev redis-cli SMEMBERS 'file:__index__'
 
 # Count total files
-docker exec meta-sort-dev redis-cli SCARD 'file:__index__'
+docker exec meta-core-dev redis-cli SCARD 'file:__index__'
 
-# Monitor metadata changes in real-time
-docker exec meta-sort-dev redis-cli SUBSCRIBE 'meta-sort:file:batch'
+# Get a sample hash ID
+docker exec meta-core-dev redis-cli SRANDMEMBER 'file:__index__'
+
+# List all keys for a specific file (flat key scan)
+docker exec meta-core-dev redis-cli --scan --pattern 'file:bafkr4ih5.../*'
+
+# Get specific field (flat key)
+docker exec meta-core-dev redis-cli GET 'file:bafkr4ih5.../fileinfo/duration'
+
+# Get filePath for a file
+docker exec meta-core-dev redis-cli GET 'file:bafkr4ih5.../filePath'
+
+# Verify keys are STRING type (not HASH)
+docker exec meta-core-dev redis-cli TYPE 'file:bafkr4ih5.../filePath'
+# Should return: string
+
+# Monitor metadata changes via stream
+docker exec meta-core-dev redis-cli XREAD STREAMS 'meta:events' 0
+
+# Monitor keyspace notifications (requires notify-keyspace-events enabled)
+docker exec meta-core-dev redis-cli PSUBSCRIBE '__keyspace@0__:file:*'
 ```
+
+## meta:events Stream
+
+The `meta:events` stream captures metadata change events for real-time notifications:
+
+```bash
+# View recent events
+docker exec meta-core-dev redis-cli XRANGE 'meta:events' - + COUNT 10
+
+# Read events from a consumer group
+docker exec meta-core-dev redis-cli XREADGROUP GROUP mygroup myconsumer STREAMS 'meta:events' >
+```
+
+Stream events contain:
+- `type`: Event type (add, change, delete, rename, reset)
+- `path`: File path
+- `midhash256`: Content hash (for add/change)
+- `timestamp`: Event timestamp

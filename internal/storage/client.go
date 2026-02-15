@@ -633,7 +633,8 @@ func (c *Client) GetPrefix() string {
 }
 
 // XAdd publishes an event to a Redis Stream
-// Uses XADD with MAXLEN ~ for approximate trimming
+// If maxLen > 0, uses XADD with MAXLEN ~ for approximate trimming
+// If maxLen <= 0, no trimming is applied (stream grows unbounded)
 func (c *Client) XAdd(stream string, maxLen int64, fields map[string]interface{}) (string, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -645,12 +646,16 @@ func (c *Client) XAdd(stream string, maxLen int64, fields map[string]interface{}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Build XADD arguments with approximate MAXLEN
+	// Build XADD arguments
 	args := &redis.XAddArgs{
 		Stream: stream,
-		MaxLen: maxLen,
-		Approx: true,
 		Values: fields,
+	}
+
+	// Only set MaxLen if positive (0 means no limit)
+	if maxLen > 0 {
+		args.MaxLen = maxLen
+		args.Approx = true
 	}
 
 	id, err := c.client.XAdd(ctx, args).Result()

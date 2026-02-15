@@ -11,8 +11,6 @@ import (
 const (
 	// EventsStream is the Redis Stream name for file events
 	EventsStream = "file:events"
-	// StreamMaxLen is the approximate max length for the stream
-	StreamMaxLen = 10000
 )
 
 // Dispatcher sends file events to Redis Stream
@@ -70,8 +68,8 @@ func (d *Dispatcher) dispatchToStream(event FileEvent) {
 		fields["watcherId"] = event.WatcherID
 	}
 
-	// Publish to stream
-	_, err := client.XAdd(EventsStream, StreamMaxLen, fields)
+	// Publish to stream (no MaxLen - stream is cleared on reset)
+	_, err := client.XAdd(EventsStream, 0, fields)
 	if err != nil {
 		log.Printf("[Dispatcher] Failed to publish to stream: %v", err)
 	}

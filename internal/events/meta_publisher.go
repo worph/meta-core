@@ -14,8 +14,6 @@ import (
 const (
 	// MetaEventsStream is the Redis stream name for metadata events
 	MetaEventsStream = "meta:events"
-	// StreamMaxLen is the maximum stream length (approximate)
-	StreamMaxLen = 10000
 )
 
 // MetaPublisher subscribes to Redis keyspace notifications
@@ -48,6 +46,16 @@ func (p *MetaPublisher) Start() error {
 	}
 	p.running = true
 	p.mu.Unlock()
+
+	// Clear the stream on startup - consumers will re-bootstrap from Redis keys
+	// This ensures the stream only contains events from the current session
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := p.client.Del(ctx, MetaEventsStream).Err(); err != nil {
+		log.Printf("[MetaPublisher] Warning: failed to clear stream on startup: %v", err)
+	} else {
+		log.Printf("[MetaPublisher] Cleared %s stream for fresh start", MetaEventsStream)
+	}
 
 	p.wg.Add(1)
 	go p.subscribeLoop()
@@ -125,11 +133,9 @@ func (p *MetaPublisher) publishEvent(channel, operation string) {
 		"ts":   fmt.Sprintf("%d", time.Now().UnixMilli()),
 	}
 
-	// Add to stream
+	// Add to stream (no MaxLen - stream is cleared on meta-core restart)
 	_, err := p.client.XAdd(p.ctx, &redis.XAddArgs{
 		Stream: MetaEventsStream,
-		MaxLen: StreamMaxLen,
-		Approx: true,
 		Values: fields,
 	}).Result()
 
