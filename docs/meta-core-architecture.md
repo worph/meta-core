@@ -15,6 +15,7 @@ MetaMesh consists of three services that require shared access to metadata and f
 | **meta-sort** | TypeScript | Watches folders, extracts metadata, writes to KV |
 | **meta-fuse** | TypeScript/Rust | Serves virtual filesystem from KV metadata |
 | **meta-stremio** | Python | Stremio addon for HLS streaming |
+| **meta-dup** | TypeScript | Duplicate detection service |
 
 ### Problem Statement
 
@@ -44,71 +45,91 @@ This design enables:
 
 ## Architecture Design
 
-### Sidecar Pattern
+### Standalone Container Pattern
 
-Meta-core runs as a **sidecar process** in each container, alongside the main service:
+Meta-core runs as a **standalone container** that other services connect to via HTTP API:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  Container (meta-sort / meta-fuse / meta-stremio)               │
-│                                                                 │
-│  ┌──────────────────┐    HTTP API      ┌──────────────────────┐│
-│  │   Main Service   │◄────────────────►│     meta-core        ││
-│  │                  │  localhost:9000  │     (Go binary)      ││
-│  │  - TypeScript    │                  │                      ││
-│  │  - Python        │                  │  - Leader election   ││
-│  │  - Any language  │                  │  - Redis management  ││
-│  │                  │                  │  - Service discovery ││
-│  └──────────────────┘                  │  - File access API   ││
-│                                        └──────────┬───────────┘│
-│                                                   │             │
-└───────────────────────────────────────────────────┼─────────────┘
-                                                    │
-                    ┌───────────────────────────────┼───────────────┐
-                    │     /meta-core (shared volume)                │
-                    │                               ▼               │
-                    │  ┌─────────────────────────────────────────┐ │
-                    │  │  locks/                                 │ │
-                    │  │    kv-leader.lock    (flock marker)     │ │
-                    │  │    kv-leader.info    (leader JSON)      │ │
-                    │  │  db/                                    │ │
-                    │  │    redis/            (RDB + AOF)        │ │
-                    │  │  services/                              │ │
-                    │  │    meta-sort.json    (service registry) │ │
-                    │  │    meta-fuse.json                       │ │
-                    │  │    meta-stremio.json                    │ │
-                    │  └─────────────────────────────────────────┘ │
-                    └──────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────┐
+│                    meta-core container (standalone)                    │
+│                                                                        │
+│  ┌──────────────┐  ┌─────────┐  ┌──────────┐  ┌────────────────────┐  │
+│  │ Leader       │  │ Redis   │  │ WebDAV   │  │ HTTP API (:9000)   │  │
+│  │ Election     │  │ Server  │  │ Server   │  │ /meta, /urls,      │  │
+│  │ (flock)      │  │         │  │          │  │ /health, /services │  │
+│  └──────────────┘  └─────────┘  └──────────┘  └────────────────────┘  │
+│                                                                        │
+│  Writes: /meta-core/locks/kv-leader.info (URLs for all services)      │
+└──────────────────────────────────────────────┬────────────────────────┘
+                                               │
+                    ┌──────────────────────────┼────────────────────────┐
+                    │     /meta-core (shared volume)                    │
+                    │                          ▼                        │
+                    │  ┌─────────────────────────────────────────────┐ │
+                    │  │  locks/                                     │ │
+                    │  │    kv-leader.lock    (flock marker)         │ │
+                    │  │    kv-leader.info    (leader JSON)          │ │
+                    │  │  db/                                        │ │
+                    │  │    redis/            (RDB + AOF)            │ │
+                    │  │  services/                                  │ │
+                    │  │    meta-sort-*.json  (service registry)     │ │
+                    │  │    meta-fuse-*.json                         │ │
+                    │  │    meta-stremio-*.json                      │ │
+                    │  │  mounts/                                    │ │
+                    │  │    mounts.json       (mount configurations) │ │
+                    │  └─────────────────────────────────────────────┘ │
+                    └──────────────────────────────────────────────────┘
+                              ▲                    ▲
+         ┌────────────────────┘                    └────────────────────┐
+         │                                                              │
+┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+│   meta-sort     │  │   meta-fuse     │  │  meta-stremio   │  │    meta-dup     │
+│   container     │  │   container     │  │   container     │  │   container     │
+│                 │  │                 │  │                 │  │                 │
+│ Reads leader    │  │ Reads leader    │  │ Reads leader    │  │ Reads leader    │
+│ .info, calls    │  │ .info, calls    │  │ .info, calls    │  │ .info, calls    │
+│ HTTP API        │  │ HTTP API        │  │ HTTP API        │  │ HTTP API        │
+└─────────────────┘  └─────────────────┘  └─────────────────┘  └─────────────────┘
 
                     ┌──────────────────────────────────────────────┐
                     │     /files (shared volume)                   │
                     │                                              │
-                    │  media/                                      │
-                    │    movies/                                   │
-                    │      Movie.2024.mkv                          │
-                    │    series/                                   │
-                    │      Show.S01E01.mkv                         │
+                    │  watch/     (host media, read-only)          │
+                    │  test/      (test media)                     │
+                    │  plugin/    (plugin output, read-write)      │
+                    │  corn/      (SMB/rclone mounts)              │
                     └──────────────────────────────────────────────┘
 ```
 
 ### Multi-Container Topology
 
-Across all containers, exactly **one meta-core instance** is the leader:
+Meta-core runs as a **standalone container**. Other services connect to it via HTTP API:
 
 ```
+                    ┌─────────────────────────────────────┐
+                    │        meta-core container          │
+                    │         ★ LEADER                    │
+                    │                                     │
+                    │  ┌─────────┐  ┌──────────────────┐  │
+                    │  │ Redis   │  │ HTTP API (:9000) │  │
+                    │  │ Server  │  │ WebDAV Server    │  │
+                    │  └─────────┘  └──────────────────┘  │
+                    └────────────────────┬────────────────┘
+                                         │
+            ┌────────────────────────────┼────────────────────────────┐
+            │                            │                            │
+            ▼                            ▼                            ▼
 ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
 │  meta-sort          │  │  meta-fuse          │  │  meta-stremio       │
 │  container          │  │  container          │  │  container          │
 │                     │  │                     │  │                     │
 │  ┌───────────────┐  │  │  ┌───────────────┐  │  │  ┌───────────────┐  │
-│  │  meta-core    │  │  │  │  meta-core    │  │  │  │  meta-core    │  │
-│  │  ★ LEADER     │  │  │  │  follower     │  │  │  │  follower     │  │
-│  │               │  │  │  │               │  │  │  │               │  │
-│  │  [Redis]──────┼──┼──┼──┼───────────────┼──┼──┼──┼───────────────│  │
-│  │               │  │  │  │               │  │  │  │               │  │
+│  │ LeaderClient  │  │  │  │ LeaderClient  │  │  │  │ LeaderClient  │  │
+│  │ (reads info,  │  │  │  │ (reads info,  │  │  │  │ (reads info,  │  │
+│  │ calls HTTP)   │  │  │  │ calls HTTP)   │  │  │  │ calls HTTP)   │  │
 │  └───────────────┘  │  │  └───────────────┘  │  │  └───────────────┘  │
-│         ▲           │  │         │           │  │         │           │
-│         │ HTTP      │  │         │ HTTP      │  │         │ HTTP      │
+│         ▲           │  │         ▲           │  │         ▲           │
+│         │           │  │         │           │  │         │           │
 │         ▼           │  │         ▼           │  │         ▼           │
 │  ┌───────────────┐  │  │  ┌───────────────┐  │  │  ┌───────────────┐  │
 │  │  meta-sort    │  │  │  │  meta-fuse    │  │  │  │  meta-stremio │  │
@@ -124,24 +145,40 @@ Across all containers, exactly **one meta-core instance** is the leader:
                     └──────────────────────────────┘
 ```
 
+For high availability, multiple meta-core instances can run with flock-based failover:
+
+```
+┌─────────────────────┐      ┌─────────────────────┐
+│  meta-core          │      │  meta-core-2        │
+│  ★ LEADER           │      │  follower           │
+│                     │      │                     │
+│  [Redis] ───────────┼──────┼─► Connects to       │
+│                     │      │   leader's Redis    │
+└─────────────────────┘      └─────────────────────┘
+          │
+          ▼
+   /meta-core/locks/kv-leader.lock (flock held by leader)
+```
+
 ---
 
 ## Leader Election
 
 ### Mechanism: flock-based Consensus
 
-Meta-core uses **POSIX file locking (flock)** on a shared filesystem for leader election. This approach requires no external consensus system (etcd, Consul, Zookeeper).
+Meta-core uses **POSIX file locking (flock)** on a shared filesystem for leader election. The election is performed by `leader-election.sh` which starts supervisord when the lock is acquired. The Go binary only ever runs as leader (followers loop in bash and never start the binary). This approach requires no external consensus system (etcd, Consul, Zookeeper).
 
 ```
 Leader Election Flow:
 
-    meta-core startup
+    Container startup
            │
            ▼
     ┌──────────────────┐
+    │ leader-election  │
+    │ .sh              │
     │ Try flock() on   │
     │ kv-leader.lock   │
-    │ (non-blocking)   │
     └────────┬─────────┘
              │
      ┌───────┴───────┐
@@ -149,19 +186,22 @@ Leader Election Flow:
   acquired        blocked
      │               │
      ▼               ▼
-┌─────────┐    ┌──────────┐
-│ LEADER  │    │ FOLLOWER │
-└────┬────┘    └────┬─────┘
-     │              │
-     ▼              ▼
-┌──────────┐  ┌────────────┐
-│ Spawn    │  │ Read       │
-│ Redis    │  │ leader.info│
-│          │  │            │
-│ Write    │  │ Connect to │
-│ leader   │  │ leader     │
-│ .info    │  │ Redis      │
-└──────────┘  └────────────┘
+┌─────────────┐  ┌──────────────┐
+│ Write       │  │ Sleep and    │
+│ leader.info │  │ retry flock  │
+│             │  │              │
+│ exec        │  └──────────────┘
+│ supervisord │
+└──────┬──────┘
+       │
+       ▼
+┌──────────────┐
+│ meta-core    │
+│ (Go binary)  │
+│              │
+│ Spawns Redis │
+│ Starts API   │
+└──────────────┘
 ```
 
 ### Lock File Structure
@@ -172,16 +212,11 @@ Leader Election Flow:
 - Automatically released on process death (kernel handles cleanup)
 
 **`/meta-core/locks/kv-leader.info`**
-```json
-{
-  "hostname": "meta-sort-dev",
-  "redis_url": "redis://10.0.1.50:6379",
-  "http_url": "http://10.0.1.50:9000",
-  "started_at": "2024-01-15T10:30:00Z",
-  "pid": 12345,
-  "version": "1.0.0"
-}
 ```
+http://10.0.1.50:9000
+```
+
+Plain text file containing the leader's API URL. Services read this to discover the leader, then call the `/urls` API endpoint for full connection details (Redis URL, WebDAV URL, etc.).
 
 ### Failover Behavior
 
@@ -224,6 +259,96 @@ Follower meta-core instances:
 2. **Proxy requests to leader** for writes
 3. **Cache metadata locally** for fast reads (optional)
 4. **Attempt leader acquisition** on leader failure
+
+### WebDAV Caching Architecture
+
+Meta-core provides a WebDAV server at `/webdav/` with integrated caching:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     WebDAV Server                                │
+│                                                                  │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────┐ │
+│  │ HTTP Handler │─►│ Cache Layer  │─►│ File System (/files)   │ │
+│  │              │  │              │  │                        │ │
+│  │ GET/PUT/     │  │ LRU Index    │  │ - watch/               │ │
+│  │ DELETE/MKCOL │  │ TTL Expiry   │  │ - plugin/              │ │
+│  │              │  │ Invalidation │  │ - corn/                │ │
+│  └──────────────┘  └──────────────┘  └────────────────────────┘ │
+│                           │                                      │
+│                           ▼                                      │
+│                    ┌──────────────┐                              │
+│                    │ Redis        │                              │
+│                    │ Keyspace     │                              │
+│                    │ Notifications│                              │
+│                    └──────────────┘                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Cache features:
+- **LRU Index**: Tracks file access times and sizes for eviction
+- **Eviction**: Removes least-recently-used entries when limit exceeded
+- **TTL**: Expires entries after configured time (`CACHE_TTL_SECONDS`)
+- **Invalidation**: Cache invalidator listens to Redis keyspace changes
+- **Directory Listing**: Returns JSON for programmatic access
+
+### File Watching System
+
+Meta-core scans directories and emits events for file changes:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     File Watcher                                 │
+│                                                                  │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────┐ │
+│  │ Directory    │─►│ State        │─►│ Event Dispatcher       │ │
+│  │ Scanner      │  │ Registry     │  │                        │ │
+│  │              │  │              │  │ - Debouncing           │ │
+│  │ - Recursive  │  │ - File hash  │  │ - Buffering            │ │
+│  │ - MidHash256 │  │ - Timestamps │  │ - SSE streaming        │ │
+│  └──────────────┘  └──────────────┘  └────────────────────────┘ │
+│                                               │                  │
+│                                               ▼                  │
+│                                    ┌──────────────────────────┐ │
+│                                    │ meta:events stream       │ │
+│                                    │ (add/change/delete/      │ │
+│                                    │  rename/reset)           │ │
+│                                    └──────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Components:
+- **Directory Scanner**: Recursively scans file trees, computes MidHash256
+- **State Registry**: Tracks file states for change detection
+- **Debouncer**: Batches rapid events for efficiency
+- **Event Dispatcher**: Routes events to subscribers with buffering
+
+Events are published to the `meta:events` Redis stream.
+
+### Mount Management
+
+Meta-core manages SMB/rclone mount configurations:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Mount Manager                                │
+│                                                                  │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────┐ │
+│  │ Config       │─►│ Validator    │─►│ Health Monitor         │ │
+│  │ (mounts.json)│  │              │  │                        │ │
+│  │              │  │ - SMB params │  │ - Accessibility check  │ │
+│  │ - id         │  │ - rclone cfg │  │ - Error tracking       │ │
+│  │ - type       │  │ - paths      │  │ - Status reporting     │ │
+│  │ - path       │  │              │  │                        │ │
+│  └──────────────┘  └──────────────┘  └────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Features:
+- **Configuration**: Mount configs stored in `/meta-core/mounts/mounts.json`
+- **Validation**: Validates mount commands and parameters
+- **Health Monitoring**: Polls mount points for accessibility
+- **Error Handling**: Tracks mount errors in separate error files
 
 ---
 
@@ -308,6 +433,38 @@ Service Discovery
   GET  /services                  → List registered services
   POST /services/{name}           → Register/heartbeat service
   DELETE /services/{name}         → Deregister service
+
+Mount Management
+  GET  /api/mounts/list           → List all mounts
+  POST /api/mounts/add            → Add new mount
+  DELETE /api/mounts/{id}         → Remove mount
+
+File Watching
+  GET  /api/scan/status           → Scan status
+  POST /api/scan/trigger          → Trigger rescan
+  GET  /api/events/stream         → Stream file events (SSE)
+
+Cache Management
+  GET  /api/cache/status          → Cache statistics
+  POST /api/cache/clear           → Clear cache
+  GET  /api/cache/stats           → Detailed metrics
+
+KV Browser
+  GET  /api/kv/info               → Storage statistics
+  GET  /api/kv/keys               → Key listing with cursor
+  GET  /api/kv/key/{key}          → Get key value
+
+Metadata Editor
+  GET  /api/metadata/hash-ids     → All hash IDs
+  GET  /api/metadata/list         → Paginated listing
+  POST /api/metadata/search       → Advanced search
+  POST /api/metadata/batch        → Batch updates
+  POST /api/metadata/clear        → Clear all metadata
+
+WebDAV
+  GET/PUT/DELETE /webdav/*        → File operations
+  MKCOL/COPY/MOVE /webdav/*       → Directory operations
+  PROPFIND /webdav/*              → Property queries
 ```
 
 ### Health Endpoint
@@ -318,7 +475,6 @@ GET /health
 Response:
 {
   "status": "healthy",
-  "role": "leader",              // or "follower"
   "leader": {
     "hostname": "meta-sort-dev",
     "http_url": "http://10.0.1.50:9000",
@@ -478,24 +634,47 @@ Meta-core is implemented in Go for the following reasons:
 meta-core
 ├── cmd/
 │   └── meta-core/
-│       └── main.go           # Entry point
+│       └── main.go              # Entry point
 ├── internal/
-│   ├── leader/
-│   │   ├── election.go       # flock-based election
-│   │   └── redis.go          # Redis process management
-│   ├── api/
-│   │   ├── server.go         # HTTP server setup
-│   │   ├── health.go         # Health endpoints
-│   │   ├── meta.go           # Metadata endpoints
-│   │   ├── data.go           # Data endpoints
-│   │   └── services.go       # Service discovery endpoints
-│   ├── storage/
-│   │   ├── redis.go          # Redis client wrapper
-│   │   └── cache.go          # Optional local cache
-│   └── config/
-│       └── config.go         # Configuration loading
-├── go.mod
-└── go.sum
+│   ├── api/                     # HTTP server and handlers
+│   │   ├── server.go            # HTTP server setup
+│   │   ├── health.go            # Health endpoints
+│   │   ├── meta.go              # Metadata endpoints
+│   │   ├── data.go              # Data endpoints
+│   │   ├── services.go          # Service discovery endpoints
+│   │   ├── mounts.go            # Mount management endpoints
+│   │   ├── cache.go             # Cache management endpoints
+│   │   └── kv.go                # KV browser endpoints
+│   ├── cache/                   # WebDAV caching with LRU
+│   │   ├── lru.go               # LRU index implementation
+│   │   ├── invalidator.go       # Keyspace notification listener
+│   │   └── manager.go           # Cache lifecycle management
+│   ├── config/                  # Configuration loading
+│   │   └── config.go
+│   ├── discovery/               # Service registration
+│   │   └── discovery.go
+│   ├── events/                  # Keyspace notification publisher
+│   │   └── publisher.go
+│   ├── leader/                  # Role provider and leader info
+│   │   ├── election.go          # flock-based election
+│   │   └── redis.go             # Redis process management
+│   ├── mounts/                  # SMB/rclone management
+│   │   ├── config.go            # Mount configuration
+│   │   └── health.go            # Mount health monitoring
+│   ├── storage/                 # Redis client wrapper
+│   │   └── client.go
+│   ├── watcher/                 # File scanning and events
+│   │   ├── scanner.go           # Directory scanner
+│   │   ├── dispatcher.go        # Event dispatcher
+│   │   └── debouncer.go         # Event debouncing
+│   ├── watchers/                # Polling-based watchers
+│   │   └── config.go
+│   └── webdav/                  # WebDAV protocol handler
+│       └── handler.go
+├── test/
+├── docs/
+├── Makefile
+└── go.mod
 ```
 
 ### Process Management
@@ -813,6 +992,31 @@ healthcheck:
 
 ---
 
+## WebDAV URL Configuration
+
+Meta-core exposes two WebDAV URLs via the `/urls` API to support both internal and external file access:
+
+| Field | Purpose | Example |
+|-------|---------|---------|
+| `webdavUrl` | External access (via nginx/HTTPS) | `https://media.example.com/webdav` |
+| `webdavUrlInternal` | Internal container-to-container | `http://meta-core-1:9000/webdav` |
+
+### URL Composition
+
+- **External** (`webdavUrl`): `{BASE_URL}/webdav`
+  - Uses `BASE_URL` env var if set, otherwise falls back to `http://{ip}:{API_PORT}`
+
+- **Internal** (`webdavUrlInternal`): `http://{hostname}:{META_CORE_HTTP_PORT}/webdav`
+  - Uses container hostname (Docker DNS resolvable)
+  - Port 9000 is the direct Go WebDAV server
+
+### Usage Patterns
+
+- **Container plugins** should use `webdavUrlInternal` for file access (direct connection, lower latency)
+- **External clients** should use `webdavUrl` for browser/remote access (may include SSL termination)
+
+---
+
 ## Configuration Reference
 
 ### Environment Variables
@@ -829,6 +1033,10 @@ healthcheck:
 | `META_CORE_LOG_LEVEL` | `info` | Log verbosity |
 | `META_CORE_CACHE_ENABLED` | `false` | Enable local read cache |
 | `META_CORE_CACHE_TTL` | `60` | Cache TTL (seconds) |
+| `ENABLE_FILE_WATCHER` | `true` | Enable file scanning |
+| `CACHE_ENABLED` | `true` | Enable WebDAV caching |
+| `CACHE_MAX_SIZE_GB` | `100` | Max cache size |
+| `CACHE_TTL_SECONDS` | `3600` | Cache entry TTL |
 
 ### File Paths
 
@@ -839,6 +1047,9 @@ healthcheck:
 | `/meta-core/db/redis/dump.rdb` | Redis RDB snapshot |
 | `/meta-core/db/redis/appendonly.aof` | Redis AOF log |
 | `/meta-core/services/*.json` | Service registry files |
+| `/meta-core/mounts/mounts.json` | Mount configurations |
+| `/meta-core/cache/` | Cached files directory |
+| `/meta-core/watchers.json` | Watcher configurations |
 
 ---
 

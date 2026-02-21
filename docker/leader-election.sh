@@ -82,9 +82,6 @@ while true; do
         # Write leader info before starting services
         write_leader_info
 
-        # Export role for meta-core Go binary to read
-        export META_CORE_ROLE="leader"
-
         # exec supervisord - replaces this process
         # When supervisord exits, the flock is released automatically
         echo "[election] Starting supervisord..."

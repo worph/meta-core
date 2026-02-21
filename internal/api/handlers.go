@@ -34,7 +34,6 @@ var contentTypeByExt = map[string]string{
 // HealthResponse is the response for /health
 type HealthResponse struct {
 	Status    string                 `json:"status"`
-	Role      string                 `json:"role"`
 	Redis     bool                   `json:"redis"`
 	Timestamp string                 `json:"timestamp"`
 	Leader    *leader.LeaderLockInfo `json:"leader,omitempty"`
@@ -43,7 +42,6 @@ type HealthResponse struct {
 // StatusResponse is the response for /status
 type StatusResponse struct {
 	Status      string                 `json:"status"`
-	Role        string                 `json:"role"`
 	Redis       bool                   `json:"redis"`
 	ServiceName string                 `json:"serviceName"`
 	Version     string                 `json:"version"`
@@ -77,10 +75,9 @@ var startTime = time.Now()
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	response := HealthResponse{
 		Status:    "ok",
-		Role:      string(s.roleProvider.Role()),
 		Redis:     s.storage.Health(),
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		Leader:    s.roleProvider.LeaderInfo(),
+		Leader:    s.leaderProvider.LeaderInfo(),
 	}
 
 	if !response.Redis {
@@ -100,13 +97,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	response := StatusResponse{
 		Status:      "ok",
-		Role:        string(s.roleProvider.Role()),
 		Redis:       s.storage.Health(),
 		ServiceName: s.config.ServiceName,
 		Version:     s.config.ServiceVersion,
 		Uptime:      int64(time.Since(startTime).Seconds()),
 		FileCount:   fileCount,
-		Leader:      s.roleProvider.LeaderInfo(),
+		Leader:      s.leaderProvider.LeaderInfo(),
 	}
 
 	if !response.Redis {
@@ -118,7 +114,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 // handleLeader handles GET /leader
 func (s *Server) handleLeader(w http.ResponseWriter, r *http.Request) {
-	info := s.roleProvider.LeaderInfo()
+	info := s.leaderProvider.LeaderInfo()
 	if info == nil {
 		writeError(w, http.StatusServiceUnavailable, "no leader available")
 		return
@@ -127,39 +123,32 @@ func (s *Server) handleLeader(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, info)
 }
 
-// handleRole handles GET /role
-func (s *Server) handleRole(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{
-		"role": string(s.roleProvider.Role()),
-	})
-}
-
 // URLsResponse is the response for /urls
 type URLsResponse struct {
-	Hostname  string `json:"hostname"`
-	BaseUrl   string `json:"baseUrl"`
-	ApiUrl    string `json:"apiUrl"`
-	RedisUrl  string `json:"redisUrl"`
-	WebdavUrl string `json:"webdavUrl"`
-	IsLeader  bool   `json:"isLeader"`
+	Hostname          string `json:"hostname"`
+	BaseUrl           string `json:"baseUrl"`
+	ApiUrl            string `json:"apiUrl"`
+	RedisUrl          string `json:"redisUrl"`
+	WebdavUrl         string `json:"webdavUrl"`
+	WebdavUrlInternal string `json:"webdavUrlInternal"`
 }
 
 // handleURLs handles GET /urls
-// Returns URLs for the current leader (or this instance if leader)
+// Returns URLs for this instance (always leader since Go binary only runs as leader)
 func (s *Server) handleURLs(w http.ResponseWriter, r *http.Request) {
-	info := s.roleProvider.LeaderInfo()
+	info := s.leaderProvider.LeaderInfo()
 	if info == nil {
 		writeError(w, http.StatusServiceUnavailable, "no leader available")
 		return
 	}
 
 	response := URLsResponse{
-		Hostname:  info.Hostname,
-		BaseUrl:   info.BaseUrl,
-		ApiUrl:    info.ApiUrl,
-		RedisUrl:  info.RedisUrl,
-		WebdavUrl: info.WebdavUrl,
-		IsLeader:  s.roleProvider.IsLeader(),
+		Hostname:          info.Hostname,
+		BaseUrl:           info.BaseUrl,
+		ApiUrl:            info.ApiUrl,
+		RedisUrl:          info.RedisUrl,
+		WebdavUrl:         info.WebdavUrl,
+		WebdavUrlInternal: info.WebdavUrlInternal,
 	}
 
 	writeJSON(w, http.StatusOK, response)

@@ -376,6 +376,38 @@ PSUBSCRIBE '__keyspace@0__:file:*'
 PSUBSCRIBE '__keyspace@0__:file:*/tmdb/*'
 ```
 
+### Cache Invalidation
+
+The WebDAV cache in meta-core integrates with keyspace notifications for automatic invalidation:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Cache Invalidation Flow                       │
+│                                                                  │
+│  Redis Keyspace                Cache                             │
+│  ┌──────────────┐              Invalidator                       │
+│  │ SET file:*/  │ ──────────► ┌──────────────┐                  │
+│  │ DEL file:*/  │  subscribe  │ Listens to   │                  │
+│  └──────────────┘              │ __keyspace@  │                  │
+│                                │ 0__:file:*   │                  │
+│                                └──────┬───────┘                  │
+│                                       │                          │
+│                                       ▼                          │
+│                                ┌──────────────┐                  │
+│                                │ Remove from  │                  │
+│                                │ LRU cache    │                  │
+│                                └──────────────┘                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Flow:
+1. Cache invalidator subscribes to `__keyspace@0__:file:*`
+2. When metadata changes (SET/DEL), invalidator receives notification
+3. Invalidator removes the corresponding file from the WebDAV cache
+4. Next access fetches fresh copy from source filesystem
+
+This ensures cached files stay synchronized with metadata changes.
+
 ### 3. Pub/Sub Channels (Legacy)
 
 Batch notification channels are still supported:
@@ -492,6 +524,9 @@ redis-cli --scan --pattern 'file:bafkr4ih5kapbjzq.../*'
 | File Processor | `packages/meta-sort/packages/meta-sort-core/src/logic/fileProcessor/FileProcessorPiscina.ts` |
 | Pub/Sub Pipeline | `packages/meta-sort/packages/meta-sort-core/src/logic/pipeline/StreamingPipeline.ts` |
 | Type Definitions | `packages/meta-interface/src/lib/metadata-type/*.ts` |
+| meta-core Storage | `packages/meta-core/internal/storage/client.go` |
+| meta-core Events | `packages/meta-core/internal/events/publisher.go` |
+| meta-core Cache | `packages/meta-core/internal/cache/` |
 
 ## Debugging
 
@@ -523,6 +558,22 @@ docker exec meta-core-dev redis-cli XREAD STREAMS 'meta:events' 0
 
 # Monitor keyspace notifications (requires notify-keyspace-events enabled)
 docker exec meta-core-dev redis-cli PSUBSCRIBE '__keyspace@0__:file:*'
+
+# meta-core API debugging
+# Cache status
+curl http://localhost:9000/api/cache/status
+
+# Clear cache
+curl -X POST http://localhost:9000/api/cache/clear
+
+# Watch events stream (SSE)
+curl http://localhost:9000/api/events/stream
+
+# KV browser - storage info
+curl http://localhost:9000/api/kv/info
+
+# Scan status
+curl http://localhost:9000/api/scan/status
 ```
 
 ## meta:events Stream

@@ -11,60 +11,27 @@ import (
 
 // LeaderLockInfo contains all URLs and metadata for the leader
 type LeaderLockInfo struct {
-	Hostname  string `json:"hostname"`
-	BaseUrl   string `json:"baseUrl"`
-	ApiUrl    string `json:"apiUrl"`   // meta-core API (port 9000)
-	RedisUrl  string `json:"redisUrl"`
-	WebdavUrl string `json:"webdavUrl"`
-	Timestamp int64  `json:"timestamp"`
-	PID       int    `json:"pid"`
+	Hostname          string `json:"hostname"`
+	BaseUrl           string `json:"baseUrl"`
+	ApiUrl            string `json:"apiUrl"`            // meta-core API (port 9000)
+	RedisUrl          string `json:"redisUrl"`
+	WebdavUrl         string `json:"webdavUrl"`         // External WebDAV URL (via baseUrl)
+	WebdavUrlInternal string `json:"webdavUrlInternal"` // Internal WebDAV URL (direct to port 9000)
+	Timestamp         int64  `json:"timestamp"`
+	PID               int    `json:"pid"`
 }
 
-// Role represents the current role of this instance
-type Role string
-
-const (
-	RoleUnknown  Role = "unknown"
-	RoleLeader   Role = "leader"
-	RoleFollower Role = "follower"
-)
-
-// RoleProvider provides role and leader info
-// This interface is used by the API server to get role information
-// without needing the full election logic (which is now in bash)
-type RoleProvider interface {
-	Role() Role
-	LeaderInfo() *LeaderLockInfo
-	IsLeader() bool
-}
-
-// LocalRoleProvider provides role info for this instance
-// It reads the role from environment and builds leader info locally
-// This is used when running as the leader (started by leader-election.sh)
-type LocalRoleProvider struct {
+// LeaderInfoProvider provides leader info for this instance
+// The Go binary only ever runs as leader (followers loop in bash and never start the binary)
+type LeaderInfoProvider struct {
 	config     *config.Config
-	role       Role
 	leaderInfo *LeaderLockInfo
 }
 
-// NewLocalRoleProvider creates a RoleProvider for the local instance
-// It reads META_CORE_ROLE from environment (set by leader-election.sh)
-func NewLocalRoleProvider(cfg *config.Config) *LocalRoleProvider {
-	roleStr := os.Getenv("META_CORE_ROLE")
-	var role Role
-	switch roleStr {
-	case "leader":
-		role = RoleLeader
-	case "follower":
-		role = RoleFollower
-	default:
-		// Default to leader if not set (for backward compatibility)
-		role = RoleLeader
-	}
-
-	provider := &LocalRoleProvider{
+// NewLeaderInfoProvider creates a LeaderInfoProvider for the local instance
+func NewLeaderInfoProvider(cfg *config.Config) *LeaderInfoProvider {
+	provider := &LeaderInfoProvider{
 		config: cfg,
-		role:   role,
 	}
 
 	// Build leader info (always, since we're the leader when running)
@@ -73,13 +40,8 @@ func NewLocalRoleProvider(cfg *config.Config) *LocalRoleProvider {
 	return provider
 }
 
-// Role returns the current role
-func (p *LocalRoleProvider) Role() Role {
-	return p.role
-}
-
 // LeaderInfo returns the leader info
-func (p *LocalRoleProvider) LeaderInfo() *LeaderLockInfo {
+func (p *LeaderInfoProvider) LeaderInfo() *LeaderLockInfo {
 	if p.leaderInfo == nil {
 		return nil
 	}
@@ -90,13 +52,8 @@ func (p *LocalRoleProvider) LeaderInfo() *LeaderLockInfo {
 	return &info
 }
 
-// IsLeader returns true if this instance is the leader
-func (p *LocalRoleProvider) IsLeader() bool {
-	return p.role == RoleLeader
-}
-
 // buildLeaderInfo creates leader info for this instance
-func (p *LocalRoleProvider) buildLeaderInfo() *LeaderLockInfo {
+func (p *LeaderInfoProvider) buildLeaderInfo() *LeaderLockInfo {
 	ip := getLocalIP()
 	hostname, _ := os.Hostname()
 
@@ -106,14 +63,23 @@ func (p *LocalRoleProvider) buildLeaderInfo() *LeaderLockInfo {
 		baseUrl = fmt.Sprintf("http://%s:%d", ip, p.config.APIPort)
 	}
 
+	// External WebDAV URL: for clients outside Docker (via nginx, potentially HTTPS)
+	// Uses baseUrl which may include custom scheme/port
+	webdavUrl := baseUrl + "/webdav"
+
+	// Internal WebDAV URL: direct to Go WebDAV server (no nginx overhead)
+	// Uses hostname (Docker DNS resolvable) and HTTPPort (9000)
+	webdavUrlInternal := fmt.Sprintf("http://%s:%d/webdav", hostname, p.config.HTTPPort)
+
 	return &LeaderLockInfo{
-		Hostname:  hostname,
-		BaseUrl:   baseUrl,
-		ApiUrl:    fmt.Sprintf("http://%s:%d", ip, p.config.HTTPPort),
-		RedisUrl:  fmt.Sprintf("redis://%s:%d", ip, p.config.RedisPort),
-		WebdavUrl: fmt.Sprintf("http://%s:%d/webdav", ip, p.config.APIPort),
-		Timestamp: time.Now().UnixMilli(),
-		PID:       os.Getpid(),
+		Hostname:          hostname,
+		BaseUrl:           baseUrl,
+		ApiUrl:            fmt.Sprintf("http://%s:%d", ip, p.config.HTTPPort),
+		RedisUrl:          fmt.Sprintf("redis://%s:%d", ip, p.config.RedisPort),
+		WebdavUrl:         webdavUrl,
+		WebdavUrlInternal: webdavUrlInternal,
+		Timestamp:         time.Now().UnixMilli(),
+		PID:               os.Getpid(),
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/metazla/meta-core/internal/api"
 	"github.com/metazla/meta-core/internal/config"
@@ -25,23 +26,33 @@ func main() {
 	cfg := config.Load()
 	log.Printf("[meta-core] Service: %s, HTTP Port: %d", cfg.ServiceName, cfg.HTTPPort)
 
-	// Create role provider (reads META_CORE_ROLE from environment, set by leader-election.sh)
-	roleProvider := leader.NewLocalRoleProvider(cfg)
-	log.Printf("[meta-core] Role: %s", roleProvider.Role())
+	// Create leader info provider (Go binary only runs as leader - followers loop in bash)
+	leaderProvider := leader.NewLeaderInfoProvider(cfg)
 
 	// Connect to local Redis (supervisord starts Redis before meta-core)
+	// Retry connection since Redis may still be loading its dataset
 	redisURL := fmt.Sprintf("redis://localhost:%d", cfg.RedisPort)
 	log.Printf("[meta-core] Connecting to Redis at %s", redisURL)
 
 	storageClient := storage.NewClient("")
-	if err := storageClient.Connect(redisURL); err != nil {
-		log.Fatalf("[meta-core] Failed to connect to Redis: %v", err)
+	maxRetries := 30
+	retryDelay := 1 // seconds
+	var err error
+	for i := 0; i < maxRetries; i++ {
+		err = storageClient.Connect(redisURL)
+		if err == nil {
+			break
+		}
+		log.Printf("[meta-core] Redis connection attempt %d/%d failed: %v", i+1, maxRetries, err)
+		time.Sleep(time.Duration(retryDelay) * time.Second)
+	}
+	if err != nil {
+		log.Fatalf("[meta-core] Failed to connect to Redis after %d attempts: %v", maxRetries, err)
 	}
 	log.Println("[meta-core] Connected to Redis")
 
 	// Create and start service discovery
 	disc := discovery.NewService(cfg)
-	disc.SetRoleProvider(&roleProviderAdapter{provider: roleProvider})
 	if err := disc.Start(); err != nil {
 		log.Fatalf("[meta-core] Failed to start service discovery: %v", err)
 	}
@@ -53,7 +64,7 @@ func main() {
 	}
 
 	// Create and start API server
-	apiServer := api.NewServer(cfg, roleProvider, disc, cleaner, storageClient)
+	apiServer := api.NewServer(cfg, leaderProvider, disc, cleaner, storageClient)
 	if err := apiServer.Start(); err != nil {
 		log.Fatalf("[meta-core] Failed to start API server: %v", err)
 	}
@@ -92,11 +103,3 @@ func waitForShutdown() {
 	<-sigChan
 }
 
-// roleProviderAdapter adapts leader.RoleProvider to discovery.RoleProvider
-type roleProviderAdapter struct {
-	provider leader.RoleProvider
-}
-
-func (a *roleProviderAdapter) Role() string {
-	return string(a.provider.Role())
-}

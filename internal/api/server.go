@@ -23,7 +23,7 @@ import (
 // Server is the HTTP API server for meta-core
 type Server struct {
 	config            *config.Config
-	roleProvider      leader.RoleProvider
+	leaderProvider    *leader.LeaderInfoProvider
 	discovery         *discovery.Service
 	cleaner           *discovery.Cleaner
 	storage           *storage.Client
@@ -48,18 +48,18 @@ type Server struct {
 // NewServer creates a new API server
 func NewServer(
 	cfg *config.Config,
-	roleProvider leader.RoleProvider,
+	leaderProvider *leader.LeaderInfoProvider,
 	disc *discovery.Service,
 	cleaner *discovery.Cleaner,
 	stor *storage.Client,
 ) *Server {
 	s := &Server{
-		config:       cfg,
-		roleProvider: roleProvider,
-		discovery:    disc,
-		cleaner:   cleaner,
-		storage:   stor,
-		router:    mux.NewRouter(),
+		config:         cfg,
+		leaderProvider: leaderProvider,
+		discovery:      disc,
+		cleaner:        cleaner,
+		storage:        stor,
+		router:         mux.NewRouter(),
 	}
 
 	// Initialize file watcher/scanner and dispatcher
@@ -130,7 +130,6 @@ func (s *Server) setupRoutes() {
 	s.router.HandleFunc("/health", s.handleHealth).Methods("GET")
 	s.router.HandleFunc("/status", s.handleStatus).Methods("GET")
 	s.router.HandleFunc("/leader", s.handleLeader).Methods("GET")
-	s.router.HandleFunc("/role", s.handleRole).Methods("GET")
 	s.router.HandleFunc("/urls", s.handleURLs).Methods("GET")
 
 	// Metadata Editor API routes (must be before /meta/{hash} routes)

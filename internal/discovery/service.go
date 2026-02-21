@@ -21,22 +21,15 @@ type ServiceInfo struct {
 	BaseUrl       string `json:"baseUrl"`
 	Status        string `json:"status"`
 	LastHeartbeat string `json:"lastHeartbeat"`
-	Role          string `json:"role,omitempty"` // "leader", "follower", or empty (for non-meta-core services)
-}
-
-// RoleProvider interface for getting the current role
-type RoleProvider interface {
-	Role() string
 }
 
 // Service handles service registration and discovery
 type Service struct {
-	config       *config.Config
-	servicesDir  string
-	serviceFile  string
-	info         *ServiceInfo
-	roleProvider RoleProvider
-	mu           sync.RWMutex
+	config      *config.Config
+	servicesDir string
+	serviceFile string
+	info        *ServiceInfo
+	mu          sync.RWMutex
 
 	stopChan chan struct{}
 	wg       sync.WaitGroup
@@ -51,11 +44,6 @@ func NewService(cfg *config.Config) *Service {
 		serviceFile: filepath.Join(cfg.ServicesDir(), cfg.ServiceName+"-"+hostname+".json"),
 		stopChan:    make(chan struct{}),
 	}
-}
-
-// SetRoleProvider sets the role provider for this service
-func (s *Service) SetRoleProvider(rp RoleProvider) {
-	s.roleProvider = rp
 }
 
 // Start begins service registration and heartbeat
@@ -115,11 +103,6 @@ func (s *Service) buildServiceInfo() *ServiceInfo {
 		LastHeartbeat: time.Now().UTC().Format(time.RFC3339),
 	}
 
-	// Add role if role provider is set (e.g., for meta-core)
-	if s.roleProvider != nil {
-		info.Role = s.roleProvider.Role()
-	}
-
 	return info
 }
 
@@ -164,7 +147,7 @@ func (s *Service) heartbeatLoop() {
 	}
 }
 
-// heartbeat updates the last heartbeat timestamp and role
+// heartbeat updates the last heartbeat timestamp
 func (s *Service) heartbeat() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -174,11 +157,6 @@ func (s *Service) heartbeat() {
 	}
 
 	s.info.LastHeartbeat = time.Now().UTC().Format(time.RFC3339)
-
-	// Update role in case it changed (e.g., leader election)
-	if s.roleProvider != nil {
-		s.info.Role = s.roleProvider.Role()
-	}
 
 	if err := s.writeServiceInfo(s.info); err != nil {
 		log.Printf("[Discovery] Failed to update heartbeat: %v", err)

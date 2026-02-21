@@ -12,7 +12,6 @@ import (
 // MockHealthResponse represents the expected health response structure
 type MockHealthResponse struct {
 	Status    string `json:"status"`
-	Role      string `json:"role"`
 	Redis     bool   `json:"redis"`
 	Timestamp string `json:"timestamp"`
 }
@@ -21,7 +20,6 @@ func TestHealthResponseFormat(t *testing.T) {
 	// Test that the health response has the expected format
 	response := MockHealthResponse{
 		Status:    "ok",
-		Role:      "leader",
 		Redis:     true,
 		Timestamp: "2024-01-01T00:00:00Z",
 	}
@@ -37,7 +35,7 @@ func TestHealthResponseFormat(t *testing.T) {
 	}
 
 	// Check required fields
-	requiredFields := []string{"status", "role", "redis", "timestamp"}
+	requiredFields := []string{"status", "redis", "timestamp"}
 	for _, field := range requiredFields {
 		if _, exists := parsed[field]; !exists {
 			t.Errorf("Missing required field: %s", field)
@@ -56,7 +54,6 @@ func TestRouterSetup(t *testing.T) {
 		{"/health", "GET"},
 		{"/status", "GET"},
 		{"/leader", "GET"},
-		{"/role", "GET"},
 		{"/meta/{hash}", "GET"},
 		{"/meta/{hash}", "PUT"},
 		{"/meta/{hash}", "DELETE"},
@@ -83,7 +80,6 @@ func TestRouterSetup(t *testing.T) {
 		{"GET", "/health"},
 		{"GET", "/status"},
 		{"GET", "/leader"},
-		{"GET", "/role"},
 		{"GET", "/meta/testhash123"},
 		{"PUT", "/meta/testhash123"},
 		{"DELETE", "/meta/testhash123"},

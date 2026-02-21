@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react';
 
 interface HealthStatus {
   status: string;
-  role: string;
   redis: boolean;
   timestamp: string;
 }
@@ -121,7 +120,6 @@ export default function Dashboard() {
               <div style={statStyle}>
                 {health.status === 'ok' ? 'Healthy' : health.status}
               </div>
-              <p>Role: <strong>{health.role}</strong></p>
               <p>Redis: {health.redis ? 'Connected' : 'Disconnected'}</p>
             </>
           ) : (

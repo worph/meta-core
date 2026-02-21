@@ -10,11 +10,15 @@ meta-core runs alongside each MetaMesh service (meta-sort, meta-fuse, meta-strem
 
 | Feature | Description |
 |---------|-------------|
-| **Leader Election** | POSIX flock-based distributed consensus on shared filesystem |
+| **Leader Election** | flock-based leader election (Go binary only runs as leader) |
 | **Redis Management** | Leader spawns Redis with AOF+RDB persistence, auto-restart on crash |
 | **HTTP API** | Language-agnostic REST interface for metadata and service discovery |
 | **Service Discovery** | File-based registry with heartbeats and stale detection |
 | **Metadata Storage** | Flat key-value schema with connection pooling and batch operations |
+| **File Watching** | Directory scanning, MidHash256 computation, event dispatch |
+| **Mount Management** | SMB/rclone configuration, health monitoring |
+| **WebDAV Server** | File access with LRU caching and cache invalidation |
+| **Event Publishing** | Redis keyspace notifications to meta:events stream |
 
 ### Design Characteristics
 
@@ -26,24 +30,36 @@ meta-core runs alongside each MetaMesh service (meta-sort, meta-fuse, meta-strem
 
 ## Architecture
 
+meta-core runs as a **standalone container** that other services connect to via HTTP API:
+
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Container (meta-sort / meta-fuse / meta-stremio)          │
-│                                                             │
-│  ┌──────────────┐      HTTP API      ┌──────────────────┐  │
-│  │ Main Service │ ◄────────────────► │   meta-core      │  │
-│  │ (TS/Python)  │    localhost:9000  │   (Go binary)    │  │
-│  └──────────────┘                    └────────┬─────────┘  │
-│                                               │             │
-└───────────────────────────────────────────────┼─────────────┘
-                                                │
-                        ┌───────────────────────┴───────────────┐
-                        │  /meta-core (shared volume)           │
-                        │  ├── locks/kv-leader.lock             │
-                        │  ├── locks/kv-leader.info             │
-                        │  ├── db/redis/                        │
-                        │  └── services/*.json                  │
-                        └───────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────┐
+│                    meta-core container (standalone)                    │
+│                                                                        │
+│  ┌──────────────┐  ┌─────────┐  ┌──────────┐  ┌────────────────────┐  │
+│  │ Role         │  │ Redis   │  │ WebDAV   │  │ HTTP API (:9000)   │  │
+│  │ Provider     │  │ Server  │  │ Server   │  │ /meta, /urls,      │  │
+│  │              │  │         │  │          │  │ /health, /services │  │
+│  └──────────────┘  └─────────┘  └──────────┘  └────────────────────┘  │
+│                                                                        │
+│  Writes: /meta-core/locks/kv-leader.info (URLs for all services)      │
+└──────────────────────────────────────────────┬────────────────────────┘
+                                               │
+        ┌──────────────────────────────────────┴──────────────────────────┐
+        │                    /meta-core (shared volume)                    │
+        │  ├── locks/kv-leader.info  (leader URLs)                        │
+        │  ├── db/redis/             (Redis data)                         │
+        │  ├── services/             (hostname-based .json)               │
+        │  └── mounts/               (mount configurations)               │
+        └─────────────────────────────────────────────────────────────────┘
+                 ▲                    ▲                    ▲
+    ┌────────────┘                    │                    └────────────┐
+    │                                 │                                 │
+┌───────────────┐          ┌───────────────┐          ┌───────────────┐
+│  meta-sort    │          │  meta-fuse    │          │ meta-stremio  │
+│  (reads info, │          │  (reads info, │          │  (reads info, │
+│  calls HTTP)  │          │  calls HTTP)  │          │  calls HTTP)  │
+└───────────────┘          └───────────────┘          └───────────────┘
 ```
 
 ## Quick Start
@@ -95,6 +111,10 @@ docker run -v meta-core:/meta-core -v files:/files meta-core
 | `HEALTH_CHECK_INTERVAL_MS` | `5000` | Health check interval |
 | `HEARTBEAT_INTERVAL_MS` | `30000` | Service heartbeat interval |
 | `STALE_THRESHOLD_MS` | `60000` | Stale service threshold |
+| `ENABLE_FILE_WATCHER` | `true` | Enable file scanning |
+| `CACHE_ENABLED` | `true` | Enable WebDAV caching |
+| `CACHE_MAX_SIZE_GB` | `100` | Maximum cache size in GB |
+| `CACHE_TTL_SECONDS` | `3600` | Cache entry TTL |
 
 ## API Reference
 
@@ -103,19 +123,15 @@ docker run -v meta-core:/meta-core -v files:/files meta-core
 ```bash
 # Health check
 curl http://localhost:9000/health
-# {"status":"ok","role":"leader","redis":true,"timestamp":"..."}
+# {"status":"ok","redis":true,"timestamp":"..."}
 
 # Detailed status
 curl http://localhost:9000/status
-# {"status":"ok","role":"leader","serviceName":"meta-core","version":"1.0.0",...}
+# {"status":"ok","serviceName":"meta-core","version":"1.0.0",...}
 
 # Current leader
 curl http://localhost:9000/leader
 # {"host":"meta-sort-dev","api":"redis://10.0.1.50:6379","http":"http://10.0.1.50:8180",...}
-
-# This instance's role
-curl http://localhost:9000/role
-# {"role":"leader"}
 ```
 
 ### Metadata Operations
@@ -177,6 +193,111 @@ curl http://localhost:9000/services/meta-sort
 # {"name":"meta-sort","version":"2.0.0","api":"http://...","status":"running",...}
 ```
 
+### Mount Management
+
+```bash
+# List all mounts
+curl http://localhost:9000/api/mounts/list
+# {"mounts":[{"id":"smb-nas","type":"smb","path":"/files/corn/nas",...}]}
+
+# Add a new mount
+curl -X POST http://localhost:9000/api/mounts/add \
+  -H "Content-Type: application/json" \
+  -d '{"type":"smb","path":"/files/corn/nas","config":{...}}'
+
+# Remove a mount
+curl -X DELETE http://localhost:9000/api/mounts/smb-nas
+```
+
+### File Watching
+
+```bash
+# Get scan status
+curl http://localhost:9000/api/scan/status
+# {"scanning":false,"lastScan":"2024-01-15T10:30:00Z","filesFound":12847}
+
+# Trigger rescan
+curl -X POST http://localhost:9000/api/scan/trigger
+
+# Stream file events (SSE)
+curl http://localhost:9000/api/events/stream
+# data: {"type":"add","path":"movies/Movie.mkv","midhash256":"bafkr..."}
+```
+
+### Cache Management
+
+```bash
+# Get cache status
+curl http://localhost:9000/api/cache/status
+# {"enabled":true,"size":"2.5GB","entries":150,"maxSize":"100GB"}
+
+# Clear cache
+curl -X POST http://localhost:9000/api/cache/clear
+
+# Detailed cache stats
+curl http://localhost:9000/api/cache/stats
+```
+
+### KV Browser
+
+```bash
+# Storage statistics
+curl http://localhost:9000/api/kv/info
+# {"totalKeys":50000,"memoryUsed":"256MB",...}
+
+# List keys with cursor pagination
+curl "http://localhost:9000/api/kv/keys?cursor=0&count=100"
+
+# Get specific key value
+curl http://localhost:9000/api/kv/key/file:bafkr.../title
+```
+
+### Metadata Editor
+
+```bash
+# Get all hash IDs
+curl http://localhost:9000/api/metadata/hash-ids
+# {"hashIds":["bafkr...","bafks..."]}
+
+# Paginated metadata listing
+curl "http://localhost:9000/api/metadata/list?page=0&pageSize=50"
+
+# Search metadata
+curl -X POST http://localhost:9000/api/metadata/search \
+  -H "Content-Type: application/json" \
+  -d '{"query":"inception","fields":["title"]}'
+
+# Batch update
+curl -X POST http://localhost:9000/api/metadata/batch \
+  -H "Content-Type: application/json" \
+  -d '{"operations":[{"hashId":"bafkr...","updates":{"title":"New Title"}}]}'
+
+# Clear all metadata
+curl -X POST http://localhost:9000/api/metadata/clear
+```
+
+### WebDAV Access
+
+```bash
+# List directory (returns JSON)
+curl http://localhost:9000/webdav/
+# [{"name":"watch","isDir":true},{"name":"plugin","isDir":true}]
+
+# Get file
+curl http://localhost:9000/webdav/watch/movie.mkv --output movie.mkv
+
+# Upload file
+curl -X PUT http://localhost:9000/webdav/plugin/output.txt \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @output.txt
+
+# Create directory
+curl -X MKCOL http://localhost:9000/webdav/newdir/
+
+# Delete file/directory
+curl -X DELETE http://localhost:9000/webdav/oldfile.txt
+```
+
 ## Leader Election
 
 meta-core uses POSIX file locking (flock) for distributed leader election:
@@ -223,16 +344,13 @@ election.OnLeaderLost(func() {
 
 ### Lock Info Format
 
-```json
-{
-  "host": "meta-sort-dev",
-  "api": "redis://10.0.1.50:6379",
-  "http": "http://10.0.1.50:8180",
-  "baseUrl": "http://localhost:8180",
-  "timestamp": 1704067200000,
-  "pid": 12345
-}
+The `kv-leader.info` file contains a plain text API URL:
+
 ```
+http://10.0.1.50:9000
+```
+
+Services read this file to discover the leader, then call the `/urls` API endpoint to get full connection details (Redis URL, WebDAV URL, base URL, etc.).
 
 ## Redis Management
 
@@ -347,6 +465,12 @@ make clean
 | `internal/storage` | Redis client wrapper with flat key-value operations |
 | `internal/discovery` | Service registration, heartbeat loop, discovery |
 | `internal/api` | HTTP server, router, and all endpoint handlers |
+| `internal/cache` | WebDAV file caching with LRU eviction and invalidation |
+| `internal/events` | Redis keyspace notification publisher to meta:events |
+| `internal/watcher` | File system scanning, MidHash256 computation, event dispatch |
+| `internal/watchers` | Polling-based watcher configuration management |
+| `internal/mounts` | SMB/rclone mount configuration and health monitoring |
+| `internal/webdav` | WebDAV protocol handler with caching integration |
 
 ### Startup Sequence
 
@@ -357,9 +481,13 @@ make clean
 4. Register role transition callbacks
 5. Start election (acquire lock or become follower)
 6. Start service discovery (register + heartbeat loop)
-7. Start HTTP API server
-8. Wait for SIGINT/SIGTERM
-9. Shutdown in reverse order
+7. Initialize dead service cleaner
+8. Initialize cache manager (if enabled)
+9. Initialize file watcher (if enabled)
+10. Initialize mount manager
+11. Start HTTP API server
+12. Wait for SIGINT/SIGTERM
+13. Shutdown in reverse order
 ```
 
 ## Integration
@@ -397,6 +525,8 @@ metadata = response.json()['metadata']
 |------------|---------|---------|
 | `github.com/gorilla/mux` | v1.8.1 | HTTP router |
 | `github.com/redis/go-redis/v9` | v9.4.0 | Redis client |
+| `golang.org/x/net` | v0.20.0 | WebDAV support |
+| `github.com/google/uuid` | v1.6.0 | UUID generation |
 | Go stdlib | - | context, encoding/json, net, os, sync, syscall |
 
 ### Runtime Requirements
