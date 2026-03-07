@@ -143,3 +143,63 @@ func (p *MetaPublisher) publishEvent(channel, operation string) {
 		log.Printf("[MetaPublisher] Error publishing event: %v", err)
 	}
 }
+
+// publishEventDirect publishes an event directly (not from keyspace notification)
+func (p *MetaPublisher) publishEventDirect(operation, key string) {
+	fields := map[string]interface{}{
+		"type": operation,
+		"key":  key,
+		"ts":   fmt.Sprintf("%d", time.Now().UnixMilli()),
+	}
+
+	_, err := p.client.XAdd(p.ctx, &redis.XAddArgs{
+		Stream: MetaEventsStream,
+		Values: fields,
+	}).Result()
+
+	if err != nil {
+		log.Printf("[MetaPublisher] Error publishing direct event: %v", err)
+	}
+}
+
+// RepublishFunc is a function type for getting metadata that can be republished
+type RepublishFunc func() (hashIDs []string, getMetadata func(hashID string) (map[string]string, error), err error)
+
+// RepublishAllMetadata iterates over all existing file metadata and publishes events
+// This is called on startup and can be triggered via API
+func (p *MetaPublisher) RepublishAllMetadata(republishFunc RepublishFunc) (int, error) {
+	p.mu.RLock()
+	running := p.running
+	p.mu.RUnlock()
+
+	if !running {
+		return 0, fmt.Errorf("publisher not running")
+	}
+
+	// Get all hash IDs and metadata getter
+	hashIDs, getMetadata, err := republishFunc()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get hash IDs: %w", err)
+	}
+
+	log.Printf("[MetaPublisher] Republishing events for %d files...", len(hashIDs))
+
+	publishedCount := 0
+	for _, hashID := range hashIDs {
+		// Get all properties for this file
+		metadata, err := getMetadata(hashID)
+		if err != nil || metadata == nil {
+			continue
+		}
+
+		// Publish a set event for each property
+		for property := range metadata {
+			key := fmt.Sprintf("file:%s/%s", hashID, property)
+			p.publishEventDirect("set", key)
+			publishedCount++
+		}
+	}
+
+	log.Printf("[MetaPublisher] Republished %d property events", publishedCount)
+	return publishedCount, nil
+}

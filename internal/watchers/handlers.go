@@ -2,22 +2,28 @@ package watchers
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 
 	"github.com/gorilla/mux"
 )
 
+// RepublishCallback is a function type for republishing metadata events
+type RepublishCallback func() (int, error)
+
 // Handlers provides HTTP handlers for watchers management
 type Handlers struct {
-	manager *Manager
-	poller  *Poller
+	manager           *Manager
+	poller            *Poller
+	republishCallback RepublishCallback
 }
 
 // NewHandlers creates new watchers handlers
-func NewHandlers(manager *Manager, poller *Poller) *Handlers {
+func NewHandlers(manager *Manager, poller *Poller, republishCallback RepublishCallback) *Handlers {
 	return &Handlers{
-		manager: manager,
-		poller:  poller,
+		manager:           manager,
+		poller:            poller,
+		republishCallback: republishCallback,
 	}
 }
 
@@ -209,10 +215,22 @@ func (h *Handlers) handleResetAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Republish all metadata events after reset
+	republishedCount := 0
+	if h.republishCallback != nil {
+		count, err := h.republishCallback()
+		if err != nil {
+			log.Printf("[Handlers] Warning: failed to republish metadata after reset: %v", err)
+		} else {
+			republishedCount = count
+		}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":     "ok",
-		"message":    "All watchers reset",
-		"totalFiles": totalCount,
+		"status":           "ok",
+		"message":          "All watchers reset",
+		"totalFiles":       totalCount,
+		"republishedEvents": republishedCount,
 	})
 }
 

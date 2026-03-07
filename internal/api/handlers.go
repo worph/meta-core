@@ -400,7 +400,8 @@ func (s *Server) handleGetFileByCID(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, fileInfo.Name(), fileInfo.ModTime(), file)
 }
 
-// handleListServices handles GET /services
+// handleListServices handles GET /services and GET /api/services
+// Supports optional ?current=<service-name> query parameter
 func (s *Server) handleListServices(w http.ResponseWriter, r *http.Request) {
 	services, err := s.discovery.DiscoverAll()
 	if err != nil {
@@ -408,10 +409,18 @@ func (s *Server) handleListServices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	response := map[string]interface{}{
 		"services": services,
 		"count":    len(services),
-	})
+	}
+
+	// Add 'current' field if query parameter is provided
+	current := r.URL.Query().Get("current")
+	if current != "" {
+		response["current"] = current
+	}
+
+	writeJSON(w, http.StatusOK, response)
 }
 
 // handleGetService handles GET /services/{name}

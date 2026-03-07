@@ -90,7 +90,8 @@ func NewServer(
 			// Create watchers poller
 			if s.fileWatcher != nil {
 				s.watchersPoller = watchers.NewPoller(watchersManager, s.fileWatcher, s.watcherDispatcher)
-				s.watchersHandlers = watchers.NewHandlers(watchersManager, s.watchersPoller)
+				// Pass republish callback to handlers (handles nil metaPublisher case)
+				s.watchersHandlers = watchers.NewHandlers(watchersManager, s.watchersPoller, s.RepublishMetadata)
 			}
 		}
 	}
@@ -173,7 +174,9 @@ func (s *Server) setupRoutes() {
 	s.router.HandleFunc("/file/cid", s.handleComputeFileCID).Methods("POST")
 
 	// Service discovery
+	// Both /services and /api/services are supported for consistency with other services
 	s.router.HandleFunc("/services", s.handleListServices).Methods("GET")
+	s.router.HandleFunc("/api/services", s.handleListServices).Methods("GET")
 	s.router.HandleFunc("/services/cleanup/stats", s.handleCleanupStats).Methods("GET")
 	s.router.HandleFunc("/services/{name}", s.handleGetService).Methods("GET")
 
@@ -271,6 +274,16 @@ func (s *Server) Start() error {
 		s.metaPublisher = events.NewMetaPublisher(s.storage.GetRedisClient())
 		if err := s.metaPublisher.Start(); err != nil {
 			log.Printf("[API] Warning: failed to start meta publisher: %v", err)
+		} else {
+			// Republish events for all existing metadata
+			go func() {
+				count, err := s.RepublishMetadata()
+				if err != nil {
+					log.Printf("[API] Warning: failed to republish metadata on startup: %v", err)
+				} else {
+					log.Printf("[API] Republished %d metadata events on startup", count)
+				}
+			}()
 		}
 	}
 
@@ -324,6 +337,28 @@ func (s *Server) Stop() error {
 	defer cancel()
 
 	return s.server.Shutdown(ctx)
+}
+
+// RepublishMetadata republishes all existing metadata to the meta:events stream
+// This is called on startup and after reset-all
+func (s *Server) RepublishMetadata() (int, error) {
+	if s.metaPublisher == nil {
+		return 0, fmt.Errorf("meta publisher not initialized")
+	}
+	if s.storage == nil || !s.storage.IsConnected() {
+		return 0, fmt.Errorf("storage not connected")
+	}
+
+	// Create the republish function that wraps storage methods
+	republishFunc := func() ([]string, func(string) (map[string]string, error), error) {
+		hashIDs, err := s.storage.GetAllHashIDs()
+		if err != nil {
+			return nil, nil, err
+		}
+		return hashIDs, s.storage.GetMetadataFlat, nil
+	}
+
+	return s.metaPublisher.RepublishAllMetadata(republishFunc)
 }
 
 // loggingMiddleware logs all requests
