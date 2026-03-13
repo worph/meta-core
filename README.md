@@ -17,7 +17,7 @@ meta-core runs alongside each MetaMesh service (meta-sort, meta-fuse, meta-strem
 | **Metadata Storage** | Flat key-value schema with connection pooling and batch operations |
 | **File Watching** | Directory scanning, MidHash256 computation, event dispatch |
 | **Mount Management** | SMB/rclone configuration, health monitoring |
-| **WebDAV Server** | File access with LRU caching and cache invalidation |
+| **WebDAV Server** | File access with nginx proxy_cache |
 | **Event Publishing** | Redis keyspace notifications to meta:events stream |
 
 ### Design Characteristics
@@ -112,9 +112,6 @@ docker run -v meta-core:/meta-core -v files:/files meta-core
 | `HEARTBEAT_INTERVAL_MS` | `30000` | Service heartbeat interval |
 | `STALE_THRESHOLD_MS` | `60000` | Stale service threshold |
 | `ENABLE_FILE_WATCHER` | `true` | Enable file scanning |
-| `CACHE_ENABLED` | `true` | Enable WebDAV caching |
-| `CACHE_MAX_SIZE_GB` | `100` | Maximum cache size in GB |
-| `CACHE_TTL_SECONDS` | `3600` | Cache entry TTL |
 
 ## API Reference
 
@@ -222,20 +219,6 @@ curl -X POST http://localhost:9000/api/scan/trigger
 # Stream file events (SSE)
 curl http://localhost:9000/api/events/stream
 # data: {"type":"add","path":"movies/Movie.mkv","midhash256":"bafkr..."}
-```
-
-### Cache Management
-
-```bash
-# Get cache status
-curl http://localhost:9000/api/cache/status
-# {"enabled":true,"size":"2.5GB","entries":150,"maxSize":"100GB"}
-
-# Clear cache
-curl -X POST http://localhost:9000/api/cache/clear
-
-# Detailed cache stats
-curl http://localhost:9000/api/cache/stats
 ```
 
 ### KV Browser
@@ -465,7 +448,6 @@ make clean
 | `internal/storage` | Redis client wrapper with flat key-value operations |
 | `internal/discovery` | Service registration, heartbeat loop, discovery |
 | `internal/api` | HTTP server, router, and all endpoint handlers |
-| `internal/cache` | WebDAV file caching with LRU eviction and invalidation |
 | `internal/events` | Redis keyspace notification publisher to meta:events |
 | `internal/watcher` | File system scanning, MidHash256 computation, event dispatch |
 | `internal/watchers` | Polling-based watcher configuration management |
@@ -482,12 +464,11 @@ make clean
 5. Start election (acquire lock or become follower)
 6. Start service discovery (register + heartbeat loop)
 7. Initialize dead service cleaner
-8. Initialize cache manager (if enabled)
-9. Initialize file watcher (if enabled)
-10. Initialize mount manager
-11. Start HTTP API server
-12. Wait for SIGINT/SIGTERM
-13. Shutdown in reverse order
+8. Initialize file watcher (if enabled)
+9. Initialize mount manager
+10. Start HTTP API server (WebDAV caching handled by nginx)
+11. Wait for SIGINT/SIGTERM
+12. Shutdown in reverse order
 ```
 
 ## Integration

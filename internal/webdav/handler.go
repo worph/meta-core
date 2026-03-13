@@ -10,25 +10,22 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/metazla/meta-core/internal/cache"
 	"github.com/metazla/meta-core/internal/config"
 	"golang.org/x/net/webdav"
 )
 
-// Handler handles WebDAV requests with caching support
+// Handler handles WebDAV requests (caching is handled by nginx proxy_cache)
 type Handler struct {
-	config       *config.Config
-	cacheManager *cache.Manager
-	filesPath    string
-	webdavFS     webdav.Handler
+	config    *config.Config
+	filesPath string
+	webdavFS  webdav.Handler
 }
 
-// NewHandler creates a new WebDAV handler with caching support
-func NewHandler(cfg *config.Config, cacheManager *cache.Manager) *Handler {
+// NewHandler creates a new WebDAV handler
+func NewHandler(cfg *config.Config) *Handler {
 	h := &Handler{
-		config:       cfg,
-		cacheManager: cacheManager,
-		filesPath:    cfg.FilesPath,
+		config:    cfg,
+		filesPath: cfg.FilesPath,
 	}
 
 	// Create standard WebDAV handler for write operations
@@ -76,7 +73,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleRead handles GET and HEAD requests with caching
+// handleRead handles GET and HEAD requests (caching is done by nginx proxy_cache)
 func (h *Handler) handleRead(w http.ResponseWriter, r *http.Request, path string) {
 	fullPath := filepath.Join(h.filesPath, path)
 
@@ -97,15 +94,8 @@ func (h *Handler) handleRead(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 
-	// Serve file through cache
-	if err := h.cacheManager.ServeFile(w, r, path); err != nil {
-		if os.IsNotExist(err) {
-			http.Error(w, "Not found", http.StatusNotFound)
-		} else {
-			log.Printf("[WebDAV] Error serving file: %v", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-	}
+	// Serve file directly (nginx handles caching via proxy_cache)
+	http.ServeFile(w, r, fullPath)
 }
 
 // handleDirListing returns a directory listing as JSON
@@ -172,9 +162,7 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request, path string)
 		return
 	}
 
-	// Invalidate cache for this path
-	h.cacheManager.Invalidate(path)
-
+	// Note: nginx proxy_cache handles invalidation via TTL (1h inactive)
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -199,9 +187,7 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request, path stri
 		return
 	}
 
-	// Invalidate cache
-	h.cacheManager.Invalidate(path)
-
+	// Note: nginx proxy_cache handles invalidation via TTL (1h inactive)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -268,10 +254,7 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, path st
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-
-		// Invalidate cache for both paths
-		h.cacheManager.Invalidate(path)
-		h.cacheManager.Invalidate(destPath)
+		// Note: nginx proxy_cache handles invalidation via TTL (1h inactive)
 	} else {
 		// Copy file
 		if err := copyFile(srcFullPath, destFullPath); err != nil {

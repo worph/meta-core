@@ -262,34 +262,37 @@ Follower meta-core instances:
 
 ### WebDAV Caching Architecture
 
-Meta-core provides a WebDAV server at `/webdav/` with integrated caching:
+Meta-core provides a WebDAV server at `/webdav/` with nginx proxy_cache for file caching:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                     WebDAV Server                                │
+│                     nginx (:80)                                   │
 │                                                                  │
 │  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────┐ │
-│  │ HTTP Handler │─►│ Cache Layer  │─►│ File System (/files)   │ │
-│  │              │  │              │  │                        │ │
-│  │ GET/PUT/     │  │ LRU Index    │  │ - watch/               │ │
-│  │ DELETE/MKCOL │  │ TTL Expiry   │  │ - plugin/              │ │
-│  │              │  │ Invalidation │  │ - corn/                │ │
-│  └──────────────┘  └──────────────┘  └────────────────────────┘ │
-│                           │                                      │
-│                           ▼                                      │
-│                    ┌──────────────┐                              │
-│                    │ Redis        │                              │
-│                    │ Keyspace     │                              │
-│                    │ Notifications│                              │
-│                    └──────────────┘                              │
+│  │ HTTP Request │─►│ proxy_cache  │─►│ Go WebDAV Handler      │ │
+│  │              │  │              │  │ (:9000)                │ │
+│  │ GET/HEAD     │  │ Cached ─────►│  │                        │ │
+│  │ PUT/DELETE   │  │ Bypass ─────►│  │                        │ │
+│  │ MKCOL        │  │              │  │                        │ │
+│  └──────────────┘  └──────────────┘  └──────────────────────┐ │
+│                           │                                  │ │
+│         /meta-core/cache/ │                                  ▼ │
+│         (nginx managed)   │              ┌────────────────────┐│
+│                           │              │ File System        ││
+│                           │              │ (/files)           ││
+│                           │              │ - watch/           ││
+│                           │              │ - plugin/          ││
+│                           │              │ - corn/            ││
+│                           │              └────────────────────┘│
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 Cache features:
-- **LRU Index**: Tracks file access times and sizes for eviction
-- **Eviction**: Removes least-recently-used entries when limit exceeded
-- **TTL**: Expires entries after configured time (`CACHE_TTL_SECONDS`)
-- **Invalidation**: Cache invalidator listens to Redis keyspace changes
+- **proxy_cache**: nginx handles caching of GET/HEAD requests with 1-hour TTL
+- **Slice module**: Large files cached in 1MB chunks for efficient range requests
+- **TTL-based expiry**: Entries expire after 1 hour of inactivity
+- **X-Cache-Status header**: Returns MISS/HIT/EXPIRED for debugging
+- **Write bypass**: PUT/DELETE/MKCOL operations bypass cache
 - **Directory Listing**: Returns JSON for programmatic access
 
 ### File Watching System
@@ -443,11 +446,6 @@ File Watching
   GET  /api/scan/status           → Scan status
   POST /api/scan/trigger          → Trigger rescan
   GET  /api/events/stream         → Stream file events (SSE)
-
-Cache Management
-  GET  /api/cache/status          → Cache statistics
-  POST /api/cache/clear           → Clear cache
-  GET  /api/cache/stats           → Detailed metrics
 
 KV Browser
   GET  /api/kv/info               → Storage statistics
@@ -643,12 +641,7 @@ meta-core
 │   │   ├── data.go              # Data endpoints
 │   │   ├── services.go          # Service discovery endpoints
 │   │   ├── mounts.go            # Mount management endpoints
-│   │   ├── cache.go             # Cache management endpoints
 │   │   └── kv.go                # KV browser endpoints
-│   ├── cache/                   # WebDAV caching with LRU
-│   │   ├── lru.go               # LRU index implementation
-│   │   ├── invalidator.go       # Keyspace notification listener
-│   │   └── manager.go           # Cache lifecycle management
 │   ├── config/                  # Configuration loading
 │   │   └── config.go
 │   ├── discovery/               # Service registration
@@ -1034,9 +1027,6 @@ Meta-core exposes two WebDAV URLs via the `/urls` API to support both internal a
 | `META_CORE_CACHE_ENABLED` | `false` | Enable local read cache |
 | `META_CORE_CACHE_TTL` | `60` | Cache TTL (seconds) |
 | `ENABLE_FILE_WATCHER` | `true` | Enable file scanning |
-| `CACHE_ENABLED` | `true` | Enable WebDAV caching |
-| `CACHE_MAX_SIZE_GB` | `100` | Max cache size |
-| `CACHE_TTL_SECONDS` | `3600` | Cache entry TTL |
 
 ### File Paths
 
@@ -1048,7 +1038,7 @@ Meta-core exposes two WebDAV URLs via the `/urls` API to support both internal a
 | `/meta-core/db/redis/appendonly.aof` | Redis AOF log |
 | `/meta-core/services/*.json` | Service registry files |
 | `/meta-core/mounts/mounts.json` | Mount configurations |
-| `/meta-core/cache/` | Cached files directory |
+| `/meta-core/cache/` | nginx proxy_cache directory |
 | `/meta-core/watchers.json` | Watcher configurations |
 
 ---

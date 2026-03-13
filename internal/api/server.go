@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/metazla/meta-core/internal/cache"
 	"github.com/metazla/meta-core/internal/config"
 	"github.com/metazla/meta-core/internal/discovery"
 	"github.com/metazla/meta-core/internal/events"
@@ -36,9 +35,6 @@ type Server struct {
 	watchersManager   *watchers.Manager
 	watchersPoller    *watchers.Poller
 	watchersHandlers  *watchers.Handlers
-	cacheManager      *cache.Manager
-	cacheHandlers     *cache.Handlers
-	cacheInvalidator  *cache.Invalidator
 	metaPublisher     *events.MetaPublisher
 	webdavHandler     *webdav.Handler
 	router            *mux.Router
@@ -109,17 +105,8 @@ func NewServer(
 		mountsManager.SetPoller(s.mountPoller)
 	}
 
-	// Initialize cache manager
-	cacheManager, err := cache.NewManager(cfg)
-	if err != nil {
-		log.Printf("[API] Warning: failed to initialize cache manager: %v", err)
-	} else {
-		s.cacheManager = cacheManager
-		s.cacheHandlers = cache.NewHandlers(cacheManager)
-		s.webdavHandler = webdav.NewHandler(cfg, cacheManager)
-
-		// Cache invalidator will be initialized in Start() after Redis is connected
-	}
+	// Initialize WebDAV handler (caching is handled by nginx proxy_cache)
+	s.webdavHandler = webdav.NewHandler(cfg)
 
 	s.setupRoutes()
 	return s
@@ -201,13 +188,7 @@ func (s *Server) setupRoutes() {
 		log.Println("[API] Watchers management routes registered at /api/watchers/*")
 	}
 
-	// Cache management routes (if cache initialized)
-	if s.cacheHandlers != nil {
-		s.cacheHandlers.RegisterRoutes(s.router)
-		log.Println("[API] Cache management routes registered at /api/cache/*")
-	}
-
-	// WebDAV handler (if cache initialized)
+	// WebDAV handler (caching is handled by nginx proxy_cache)
 	if s.webdavHandler != nil {
 		s.router.PathPrefix("/webdav/").Handler(s.webdavHandler)
 		s.router.PathPrefix("/webdav").Handler(s.webdavHandler)
@@ -253,21 +234,6 @@ func (s *Server) Start() error {
 		}
 	}
 
-	// Start cache manager (if initialized)
-	if s.cacheManager != nil {
-		if err := s.cacheManager.Start(); err != nil {
-			log.Printf("[API] Warning: failed to start cache manager: %v", err)
-		}
-
-		// Initialize cache invalidator now that Redis is connected
-		if s.storage != nil && s.storage.IsConnected() {
-			s.cacheInvalidator = cache.NewInvalidator(s.cacheManager, s.storage.GetRedisClient())
-			if err := s.cacheInvalidator.Start(); err != nil {
-				log.Printf("[API] Warning: failed to start cache invalidator: %v", err)
-			}
-		}
-	}
-
 	// Start meta publisher (if storage is connected)
 	// Publishes keyspace notifications to meta:events stream
 	if s.storage != nil && s.storage.IsConnected() {
@@ -310,20 +276,6 @@ func (s *Server) Stop() error {
 	if s.metaPublisher != nil {
 		if err := s.metaPublisher.Stop(); err != nil {
 			log.Printf("[API] Warning: failed to stop meta publisher: %v", err)
-		}
-	}
-
-	// Stop cache invalidator
-	if s.cacheInvalidator != nil {
-		if err := s.cacheInvalidator.Stop(); err != nil {
-			log.Printf("[API] Warning: failed to stop cache invalidator: %v", err)
-		}
-	}
-
-	// Stop cache manager
-	if s.cacheManager != nil {
-		if err := s.cacheManager.Stop(); err != nil {
-			log.Printf("[API] Warning: failed to stop cache manager: %v", err)
 		}
 	}
 
