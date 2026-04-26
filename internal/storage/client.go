@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -618,6 +620,378 @@ func (c *Client) ClearAllMetadata() (int64, error) {
 
 	log.Printf("[Storage] Cleared %d file metadata entries", deletedCount)
 	return deletedCount, nil
+}
+
+// ScanKeys lists the immediate children at the given prefix, S3-style.
+//
+// Walks the keyspace under prefix using Redis SCAN. When delimiter is set,
+// keys with a delimiter occurrence after the prefix collapse into a branch
+// path (the prefix up to and including that first delimiter); the rest are
+// returned as leaves. When delimiter is empty all matching keys are leaves.
+//
+// Continues SCAN-ing until either the keyspace is exhausted (nextCursor == "0")
+// or leaves+branches reaches maxResults — whichever comes first. The caller
+// passes nextCursor back to continue. Results are deduped and sorted.
+func (c *Client) ScanKeys(prefix, delimiter, cursorStr string, maxResults int) ([]string, []string, string, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.client == nil {
+		return nil, nil, "", fmt.Errorf("not connected")
+	}
+
+	if maxResults <= 0 {
+		maxResults = 500
+	}
+
+	var cursor uint64
+	if cursorStr != "" {
+		if v, err := strconv.ParseUint(cursorStr, 10, 64); err == nil {
+			cursor = v
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	fullPrefix := c.buildKey(prefix)
+	pattern := escapeGlob(fullPrefix) + "*"
+
+	leafSet := make(map[string]struct{})
+	branchSet := make(map[string]struct{})
+
+	for {
+		// SCAN COUNT is a hint; ask for a larger batch when grouping by
+		// delimiter since many keys collapse into one branch.
+		scanCount := int64(maxResults * 4)
+		if scanCount > 5000 {
+			scanCount = 5000
+		}
+		keys, next, err := c.client.Scan(ctx, cursor, pattern, scanCount).Result()
+		if err != nil {
+			return nil, nil, "", fmt.Errorf("scan failed: %w", err)
+		}
+		for _, k := range keys {
+			userKey := strings.TrimPrefix(k, c.prefix)
+			suffix := strings.TrimPrefix(userKey, prefix)
+			if delimiter != "" {
+				if idx := strings.Index(suffix, delimiter); idx >= 0 {
+					branchSet[prefix+suffix[:idx+len(delimiter)]] = struct{}{}
+					continue
+				}
+			}
+			leafSet[userKey] = struct{}{}
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+		if len(leafSet)+len(branchSet) >= maxResults {
+			break
+		}
+	}
+
+	leaves := make([]string, 0, len(leafSet))
+	for k := range leafSet {
+		leaves = append(leaves, k)
+	}
+	branches := make([]string, 0, len(branchSet))
+	for k := range branchSet {
+		branches = append(branches, k)
+	}
+	sort.Strings(leaves)
+	sort.Strings(branches)
+	return leaves, branches, strconv.FormatUint(cursor, 10), nil
+}
+
+// FindMatch is a single value-search hit.
+type FindMatch struct {
+	Key       string `json:"key"`
+	Value     string `json:"value"`
+	EntryPath string `json:"entryPath"`
+	Field     string `json:"field"`
+}
+
+// FindByValue scans every key whose path ends with /<field> for each field
+// in fields, MGETs them, and returns the keys whose value contains the
+// substring (case-insensitive). Returns truncated when limit was hit before
+// the scan exhausted.
+//
+// EntryPath is the parent prefix up to (and including) the slash before
+// field — i.e. the file branch path. Useful for revealing the matched entry
+// in the tree.
+func (c *Client) FindByValue(contains string, fields []string, limit int) ([]FindMatch, bool, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.client == nil {
+		return nil, false, fmt.Errorf("not connected")
+	}
+	if contains == "" || len(fields) == 0 {
+		return nil, false, nil
+	}
+	if limit <= 0 {
+		limit = 200
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	needle := strings.ToLower(contains)
+	var matches []FindMatch
+	truncated := false
+
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		if len(matches) >= limit {
+			truncated = true
+			break
+		}
+		// Walk all keys ending with /field via SCAN MATCH "*/<field>".
+		pattern := "*/" + escapeGlob(field)
+		if c.prefix != "" {
+			pattern = escapeGlob(c.prefix) + pattern
+		}
+		var keysToFetch []string
+		var cursor uint64
+		for {
+			keys, next, err := c.client.Scan(ctx, cursor, pattern, 1000).Result()
+			if err != nil {
+				return nil, false, fmt.Errorf("scan failed: %w", err)
+			}
+			keysToFetch = append(keysToFetch, keys...)
+			cursor = next
+			if cursor == 0 {
+				break
+			}
+			if len(keysToFetch) > 20000 {
+				break
+			}
+		}
+		// MGET in chunks (Redis limits the number of args per command).
+		for chunkStart := 0; chunkStart < len(keysToFetch); chunkStart += 500 {
+			chunkEnd := chunkStart + 500
+			if chunkEnd > len(keysToFetch) {
+				chunkEnd = len(keysToFetch)
+			}
+			chunk := keysToFetch[chunkStart:chunkEnd]
+			values, err := c.client.MGet(ctx, chunk...).Result()
+			if err != nil {
+				return nil, false, fmt.Errorf("mget failed: %w", err)
+			}
+			for i, v := range values {
+				if v == nil {
+					continue
+				}
+				sv, _ := v.(string)
+				if !strings.Contains(strings.ToLower(sv), needle) {
+					continue
+				}
+				userKey := strings.TrimPrefix(chunk[i], c.prefix)
+				entryPath := strings.TrimSuffix(userKey, field)
+				matches = append(matches, FindMatch{
+					Key:       userKey,
+					Value:     sv,
+					EntryPath: entryPath,
+					Field:     field,
+				})
+				if len(matches) >= limit {
+					truncated = true
+					break
+				}
+			}
+			if truncated {
+				break
+			}
+		}
+	}
+
+	sort.Slice(matches, func(i, j int) bool { return matches[i].Key < matches[j].Key })
+	return matches, truncated, nil
+}
+
+// SearchKeys returns up to limit keys whose full path contains the substring.
+// truncated is true when the search stopped at limit before exhausting Redis.
+func (c *Client) SearchKeys(contains string, limit int) ([]string, bool, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.client == nil {
+		return nil, false, fmt.Errorf("not connected")
+	}
+
+	if contains == "" {
+		return nil, false, nil
+	}
+	if limit <= 0 {
+		limit = 500
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pattern := escapeGlob(c.prefix) + "*" + escapeGlob(contains) + "*"
+
+	results := make([]string, 0, limit)
+	truncated := false
+	var cursor uint64
+	for {
+		keys, next, err := c.client.Scan(ctx, cursor, pattern, 1000).Result()
+		if err != nil {
+			return nil, false, fmt.Errorf("scan failed: %w", err)
+		}
+		for _, k := range keys {
+			if len(results) >= limit {
+				truncated = true
+				break
+			}
+			results = append(results, strings.TrimPrefix(k, c.prefix))
+		}
+		cursor = next
+		if truncated || cursor == 0 {
+			break
+		}
+	}
+	sort.Strings(results)
+	return results, truncated, nil
+}
+
+// GetKeyInfo returns the Redis type ("string", "set", "hash", ...) and, for
+// string-typed keys, the value. exists is false when the key is absent.
+func (c *Client) GetKeyInfo(key string) (kind string, value string, exists bool, err error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.client == nil {
+		return "", "", false, fmt.Errorf("not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	full := c.buildKey(key)
+	t, err := c.client.Type(ctx, full).Result()
+	if err != nil {
+		return "", "", false, fmt.Errorf("type failed: %w", err)
+	}
+	if t == "none" {
+		return "", "", false, nil
+	}
+	if t != "string" {
+		return t, "", true, nil
+	}
+	v, err := c.client.Get(ctx, full).Result()
+	if err == redis.Nil {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, fmt.Errorf("get failed: %w", err)
+	}
+	return "string", v, true, nil
+}
+
+// SetRawValue writes a string value at the exact key. Refuses to overwrite a
+// key whose existing Redis type is not "string".
+func (c *Client) SetRawValue(key, value string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.client == nil {
+		return fmt.Errorf("not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	full := c.buildKey(key)
+	t, err := c.client.Type(ctx, full).Result()
+	if err != nil {
+		return fmt.Errorf("type failed: %w", err)
+	}
+	if t != "none" && t != "string" {
+		return fmt.Errorf("key has incompatible type %q (only string is editable)", t)
+	}
+	return c.client.Set(ctx, full, value, 0).Err()
+}
+
+// DeleteRawKey deletes the exact key. Returns true if the key existed.
+func (c *Client) DeleteRawKey(key string) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.client == nil {
+		return false, fmt.Errorf("not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	n, err := c.client.Del(ctx, c.buildKey(key)).Result()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// IndexAdd adds a hash ID to the file index set. Idempotent.
+func (c *Client) IndexAdd(hashID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.client == nil {
+		return fmt.Errorf("not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	return c.client.SAdd(ctx, c.buildIndexKey(), hashID).Err()
+}
+
+// IndexRemoveIfEmpty removes hashID from the index set when no
+// file:<hashID>/* keys remain. Returns true if the index entry was removed.
+func (c *Client) IndexRemoveIfEmpty(hashID string) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.client == nil {
+		return false, fmt.Errorf("not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	prefix := c.buildKeyPrefix(hashID)
+	keys, _, err := c.client.Scan(ctx, 0, prefix+"*", 1).Result()
+	if err != nil {
+		return false, fmt.Errorf("scan failed: %w", err)
+	}
+	if len(keys) > 0 {
+		return false, nil
+	}
+	removed, err := c.client.SRem(ctx, c.buildIndexKey(), hashID).Result()
+	if err != nil {
+		return false, fmt.Errorf("srem failed: %w", err)
+	}
+	return removed > 0, nil
+}
+
+// escapeGlob escapes Redis SCAN MATCH glob metacharacters so a literal string
+// can be embedded inside a pattern. Redis uses *, ?, [, \ as metacharacters.
+func escapeGlob(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch r {
+		case '*', '?', '[', ']', '\\':
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // GetRedisClient returns the underlying redis client for advanced operations

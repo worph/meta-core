@@ -23,3 +23,5 @@ go.work
 dashboard/node_modules/*
 dist/*
 dashboard/dist/*
+editor/dist/
+editor/node_modules/

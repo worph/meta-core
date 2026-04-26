@@ -135,6 +135,12 @@ func (s *Server) setupRoutes() {
 	// KV Browser API routes
 	s.router.HandleFunc("/api/kv/info", s.handleKVInfo).Methods("GET")
 	s.router.HandleFunc("/api/kv/keys", s.handleKVKeys).Methods("GET")
+	s.router.HandleFunc("/api/kv/tree", s.handleKVTree).Methods("GET")
+	s.router.HandleFunc("/api/kv/search", s.handleKVSearch).Methods("GET")
+	s.router.HandleFunc("/api/kv/find", s.handleKVFind).Methods("GET")
+	s.router.HandleFunc("/api/kv/value", s.handleKVValueGet).Methods("GET")
+	s.router.HandleFunc("/api/kv/value", s.handleKVValuePut).Methods("PUT")
+	s.router.HandleFunc("/api/kv/value", s.handleKVValueDelete).Methods("DELETE")
 	s.router.HandleFunc("/api/kv/key/{key:.*}", s.handleKVGetKey).Methods("GET")
 
 	// Metadata operations - base endpoints
