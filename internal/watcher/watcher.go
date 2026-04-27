@@ -4,10 +4,12 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/metazla/meta-core/internal/config"
+	"github.com/metazla/meta-core/internal/storage"
 )
 
 
@@ -18,9 +20,37 @@ type Watcher struct {
 	dispatcher    *Dispatcher
 	filesPath     string
 	stateRegistry *StateRegistry
+	storage       *storage.Client
 
 	mu          sync.RWMutex
 	eventBuffer []FileEvent
+}
+
+// SetStorageClient lets the watcher persist the (path, size, mtime, midhash)
+// tuple to Redis whenever it computes a midhash. Without this, only the
+// in-memory state registry knows about the file — Redis would only learn
+// about it via downstream consumers of the event stream.
+func (w *Watcher) SetStorageClient(s *storage.Client) {
+	w.storage = s
+}
+
+// writeFileTuple persists path/size/mtime/midhash for a freshly-hashed file.
+// Caller already has all four values from its existing os.Stat / FileInfo —
+// no extra IO is performed here beyond the Redis write itself.
+//
+// This is the inverse-index that lets a fresh meta-core boot skip
+// re-mid-hashing files whose (path, size, mtime) match what's in Redis.
+func (w *Watcher) writeFileTuple(absPath string, size, mtimeNano int64, midhash string) {
+	if w.storage == nil || midhash == "" {
+		return
+	}
+	if _, err := w.storage.MergeMetadataFlat(midhash, map[string]string{
+		"filePath":  absPath,
+		"sizeByte":  strconv.FormatInt(size, 10),
+		"mtimeNano": strconv.FormatInt(mtimeNano, 10),
+	}); err != nil {
+		log.Printf("[Watcher] failed to write tuple for %s: %v", midhash, err)
+	}
 }
 
 // NewWatcher creates a new file watcher/scanner
@@ -44,7 +74,7 @@ func (w *Watcher) handleDebouncedEvent(event FileEvent) {
 	// Compute midhash256 for add/change events
 	if event.Type == EventTypeAdd || event.Type == EventTypeChange {
 		fullPath := filepath.Join(w.filesPath, event.Path)
-		if hash, err := ComputeMidHash256(fullPath); err == nil {
+		if hash, err := ComputeMidHash256(fullPath, event.Size); err == nil {
 			event.MidHash256 = hash
 		}
 	}
@@ -90,16 +120,20 @@ func (w *Watcher) ScanDirectory(root string) int {
 		relPath = filepath.ToSlash(relPath)
 
 		// Emit add event
+		curSize := info.Size()
+		curMtime := info.ModTime().UnixNano()
 		event := FileEvent{
 			Type:      EventTypeAdd,
 			Path:      relPath,
-			Size:      info.Size(),
+			Size:      curSize,
 			Timestamp: NowMS(),
 		}
 
-		// Compute midhash256
-		if hash, err := ComputeMidHash256(path); err == nil {
+		// Compute midhash256 — uses the size we already have from Walk's
+		// FileInfo, so no extra os.Stat is needed.
+		if hash, err := ComputeMidHash256(path, curSize); err == nil {
 			event.MidHash256 = hash
+			w.writeFileTuple(path, curSize, curMtime, hash)
 		}
 
 		// Dispatch directly
@@ -160,9 +194,11 @@ func (w *Watcher) ScanDirectoryDiff(root string, watcherID string) DiffScanResul
 				Timestamp: NowMS(),
 			}
 
-			// Compute midhash256
-			if hash, err := ComputeMidHash256(path); err == nil {
+			// Compute midhash256 — size is already known from the walk's
+			// FileInfo, no extra stat needed.
+			if hash, err := ComputeMidHash256(path, currentSize); err == nil {
 				event.MidHash256 = hash
+				w.writeFileTuple(path, currentSize, currentMtime, hash)
 			}
 
 			// Dispatch event
@@ -185,9 +221,10 @@ func (w *Watcher) ScanDirectoryDiff(root string, watcherID string) DiffScanResul
 				Timestamp: NowMS(),
 			}
 
-			// Compute midhash256
-			if hash, err := ComputeMidHash256(path); err == nil {
+			// Compute midhash256 — reuse the size we already have.
+			if hash, err := ComputeMidHash256(path, currentSize); err == nil {
 				event.MidHash256 = hash
+				w.writeFileTuple(path, currentSize, currentMtime, hash)
 			}
 
 			// Dispatch event
@@ -225,6 +262,75 @@ func (w *Watcher) ScanDirectoryDiff(root string, watcherID string) DiffScanResul
 
 	result.Total = state.Count()
 	return result
+}
+
+// WatcherRoot pairs a watcher's id with the absolute path it watches. The
+// hydrator uses Root to decide which Redis-tracked file belongs to which
+// in-memory WatcherState.
+type WatcherRoot struct {
+	ID   string
+	Root string
+}
+
+// HydrateStateFromStorage repopulates the per-watcher in-memory state from
+// the (filePath, sizeByte, mtimeNano) tuples in Redis. After this runs, the
+// next scan tick will see existing files as "known" and skip
+// ComputeMidHash256 for any whose size+mtime match — turning a cold-start
+// rescan from minutes to seconds on a populated library.
+//
+// Files whose filePath doesn't fall under any watcher's root are silently
+// skipped; files missing any tuple field are skipped too (a partial record
+// can't seed valid state).
+//
+// Returns counts so the caller can log / surface them.
+func (w *Watcher) HydrateStateFromStorage(roots []WatcherRoot) (loaded, skipped int, err error) {
+	if w.storage == nil || !w.storage.IsConnected() {
+		return 0, 0, nil
+	}
+
+	tuples, err := w.storage.GetTuplesForAllFiles()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// Sort roots by length descending so longest-prefix wins when paths
+	// nest (e.g. /files/watch/foo and /files/watch).
+	sortedRoots := make([]WatcherRoot, len(roots))
+	copy(sortedRoots, roots)
+	for i := 1; i < len(sortedRoots); i++ {
+		for j := i; j > 0 && len(sortedRoots[j].Root) > len(sortedRoots[j-1].Root); j-- {
+			sortedRoots[j], sortedRoots[j-1] = sortedRoots[j-1], sortedRoots[j]
+		}
+	}
+
+	// State keys are relative to w.filesPath (matching ScanDirectoryDiff's
+	// Rel(w.filesPath, path) convention). The watcher root only decides
+	// *which* per-watcher state map this file lives in.
+	for _, t := range tuples {
+		matched := false
+		for _, r := range sortedRoots {
+			if t.FilePath == r.Root || strings.HasPrefix(t.FilePath, r.Root+"/") {
+				rel, err := filepath.Rel(w.filesPath, t.FilePath)
+				if err != nil {
+					rel = t.FilePath
+				}
+				rel = filepath.ToSlash(rel)
+				ws := w.stateRegistry.GetOrCreate(r.ID)
+				ws.Set(rel, &FileState{
+					Size:      t.Size,
+					MtimeNano: t.MtimeNano,
+					MidHash:   t.HashID,
+				})
+				loaded++
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			skipped++
+		}
+	}
+	return loaded, skipped, nil
 }
 
 // ClearState clears the tracked state for a watcher

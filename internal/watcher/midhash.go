@@ -26,15 +26,13 @@ const (
 // The size prefix (8-byte big-endian) ensures that files with identical
 // middle content but different sizes produce different hashes.
 //
+// fileSize must be passed in by the caller (typically from a FileInfo it
+// already has from filepath.Walk or a previous os.Stat). This function
+// deliberately does NOT call os.Stat itself — re-statting every file during
+// a scan doubles the syscall count, which matters on slow / network drives.
+//
 // Returns: CID v1 string in base32lower format (prefixed with "b")
-func ComputeMidHash256(filePath string) (string, error) {
-	// Get file info
-	fileInfo, err := os.Stat(filePath)
-	if err != nil {
-		return "", err
-	}
-	fileSize := fileInfo.Size()
-
+func ComputeMidHash256(filePath string, fileSize int64) (string, error) {
 	// Open file
 	file, err := os.Open(filePath)
 	if err != nil {

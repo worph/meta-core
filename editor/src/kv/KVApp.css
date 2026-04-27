@@ -522,3 +522,54 @@
   max-height: 160px;
   overflow: auto;
 }
+
+.kv-app-gear {
+  margin-left: 0.25rem;
+  font-size: 1.05rem;
+  opacity: 0.6;
+}
+
+.kv-app-gear:hover {
+  opacity: 1;
+}
+
+.kv-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  z-index: 1000;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 4vh 1rem;
+  overflow-y: auto;
+}
+
+.kv-modal {
+  position: relative;
+  background: white;
+  color: inherit;
+  border-radius: 8px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+  width: min(960px, 100%);
+  max-height: 92vh;
+  overflow-y: auto;
+}
+
+.kv-modal-close {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.75rem;
+  background: transparent;
+  border: none;
+  font-size: 1.6rem;
+  line-height: 1;
+  cursor: pointer;
+  color: inherit;
+  opacity: 0.6;
+  z-index: 1;
+}
+
+.kv-modal-close:hover {
+  opacity: 1;
+}

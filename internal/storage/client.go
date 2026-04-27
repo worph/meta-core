@@ -537,6 +537,93 @@ func (c *Client) RemoveFromSet(hashID, property, value string) (bool, error) {
 	return true, c.client.Set(ctx, key, newValue, 0).Err()
 }
 
+// FileTuple holds the (path, size, mtime) record for one file. Used by the
+// watcher hydrator at startup to avoid re-mid-hashing files whose tuple
+// matches what's already in Redis.
+type FileTuple struct {
+	HashID    string
+	FilePath  string
+	Size      int64
+	MtimeNano int64
+}
+
+// GetTuplesForAllFiles returns one FileTuple per indexed CID, fetched in
+// batched MGETs (no SCAN per CID). Skips files missing any of the three
+// fields. Sub-second on local Redis for ~10K files.
+func (c *Client) GetTuplesForAllFiles() ([]FileTuple, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.client == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	hashIDs, err := c.client.SMembers(ctx, c.buildIndexKey()).Result()
+	if err != nil {
+		return nil, fmt.Errorf("smembers index: %w", err)
+	}
+	if len(hashIDs) == 0 {
+		return nil, nil
+	}
+
+	// Build the key list: 3 keys per CID, in a fixed order so we can decode
+	// the MGET response by position. fields[i] for hashIDs[j] sits at
+	// keys[j*3+i].
+	const fieldsPerFile = 3
+	fields := [fieldsPerFile]string{"filePath", "sizeByte", "mtimeNano"}
+	keys := make([]string, 0, len(hashIDs)*fieldsPerFile)
+	for _, h := range hashIDs {
+		prefix := c.buildKeyPrefix(h)
+		for _, f := range fields {
+			keys = append(keys, prefix+f)
+		}
+	}
+
+	// Chunked MGET — Redis caps args per command; 1000 is a safe batch.
+	const batch = 1000
+	values := make([]interface{}, 0, len(keys))
+	for start := 0; start < len(keys); start += batch {
+		end := start + batch
+		if end > len(keys) {
+			end = len(keys)
+		}
+		chunk, err := c.client.MGet(ctx, keys[start:end]...).Result()
+		if err != nil {
+			return nil, fmt.Errorf("mget chunk [%d:%d]: %w", start, end, err)
+		}
+		values = append(values, chunk...)
+	}
+
+	out := make([]FileTuple, 0, len(hashIDs))
+	for i, h := range hashIDs {
+		base := i * fieldsPerFile
+		filePath, _ := values[base].(string)
+		sizeStr, _ := values[base+1].(string)
+		mtimeStr, _ := values[base+2].(string)
+		if filePath == "" || sizeStr == "" || mtimeStr == "" {
+			continue
+		}
+		size, err := strconv.ParseInt(sizeStr, 10, 64)
+		if err != nil {
+			continue
+		}
+		mtime, err := strconv.ParseInt(mtimeStr, 10, 64)
+		if err != nil {
+			continue
+		}
+		out = append(out, FileTuple{
+			HashID:    h,
+			FilePath:  filePath,
+			Size:      size,
+			MtimeNano: mtime,
+		})
+	}
+	return out, nil
+}
+
 // GetMemoryInfo returns Redis memory usage information
 func (c *Client) GetMemoryInfo() (string, error) {
 	c.mu.RLock()
@@ -1057,6 +1144,51 @@ func (c *Client) ClearStream(stream string) error {
 	}
 
 	return nil
+}
+
+// StreamEntry represents one entry from a Redis stream.
+type StreamEntry struct {
+	ID     string
+	Values map[string]interface{}
+}
+
+// XRevRange reads stream entries from newest to oldest.
+// start defaults to "+" (newest) and stop defaults to "-" (oldest) when empty.
+// If count > 0, at most that many entries are returned.
+func (c *Client) XRevRange(stream, start, stop string, count int64) ([]StreamEntry, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.client == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+
+	if start == "" {
+		start = "+"
+	}
+	if stop == "" {
+		stop = "-"
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var msgs []redis.XMessage
+	var err error
+	if count > 0 {
+		msgs, err = c.client.XRevRangeN(ctx, stream, start, stop, count).Result()
+	} else {
+		msgs, err = c.client.XRevRange(ctx, stream, start, stop).Result()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("xrevrange failed: %w", err)
+	}
+
+	entries := make([]StreamEntry, 0, len(msgs))
+	for _, m := range msgs {
+		entries = append(entries, StreamEntry{ID: m.ID, Values: m.Values})
+	}
+	return entries, nil
 }
 
 // GetStreamLength returns the length of a Redis stream

@@ -2,11 +2,17 @@
 # =============================================================================
 # Mount Watcher Script
 #
-# Monitors /meta-core/mounts/mounts.json and manages NFS, SMB, and rclone mounts.
-# Runs as a supervisord program, polling every 5 seconds.
+# Monitors /meta-core/mounts/mounts.json and manages mounts via the local
+# rclone RC daemon. After the rclone-only consolidation, this script no
+# longer shells out to mount.cifs / mount.nfs — every mount type is executed
+# through rclone's mount/mount endpoint.
 #
-# Uses findmnt to check actual mount status (source of truth).
-# Writes errors to /meta-core/mounts/errors/{id}.error
+# Mount types:
+#   - "smb"    → on-the-fly :smb: remote synthesised from SMB-* fields
+#   - "rclone" → references a pre-defined remote in rclone.conf
+#
+# All mounts are read-only by construction (no API surface to override).
+# Errors surface in /meta-core/mounts/errors/{id}.error
 # =============================================================================
 
 set -u
@@ -16,6 +22,16 @@ CONFIG_FILE="$CONFIG_DIR/mounts.json"
 ERROR_DIR="$CONFIG_DIR/errors"
 FILES_PATH="${FILES_PATH:-/files}"
 POLL_INTERVAL="${MOUNT_POLL_INTERVAL:-5}"
+
+# Fall-back VFS cache settings — applied when a mount entry leaves the field
+# blank. Must stay in sync with DefaultCacheMaxSize/MaxAge/DirCacheTime in
+# packages/meta-core/internal/mounts/types.go.
+DEFAULT_CACHE_MAX_SIZE="50G"
+DEFAULT_CACHE_MAX_AGE="24h"
+DEFAULT_DIR_CACHE_TIME="5m"
+
+RCLONE_RC_URL="${RCLONE_RC_URL:-http://127.0.0.1:5572}"
+RCLONE_RC_AUTH="${RCLONE_RC_AUTH:-admin:admin}"
 
 # ANSI colors
 RED='\033[0;31m'
@@ -54,9 +70,7 @@ init_dirs() {
 # Check if path is mounted (uses /proc/mounts for Alpine compatibility)
 is_mounted() {
     local mount_path="$1"
-    # Remove trailing slash for consistent matching
     local clean_path="${mount_path%/}"
-    # Check if the path appears as a mount point in /proc/mounts (field 2)
     grep -q " ${clean_path} " /proc/mounts 2>/dev/null
 }
 
@@ -74,145 +88,102 @@ write_error() {
     echo "$error" >> "$ERROR_DIR/$id.error"
 }
 
-# Mount NFS share (always read-only)
-do_mount_nfs() {
-    local id="$1"
-    local server="$2"
-    local path="$3"
-    local mount_path="$4"
-    local options="${5:-}"
+# Build the rclone remote source string for a mount entry. Echoes the result.
+# For type=smb, synthesises an on-the-fly :smb: remote so we don't have to
+# mutate rclone.conf at runtime. For type=rclone, joins the named remote with
+# the optional remote path.
+build_rclone_fs() {
+    local type="$1"
+    local smb_server="$2"
+    local smb_share="$3"
+    local smb_username="$4"
+    local smb_password_obscured="$5"
+    local smb_domain="$6"
+    local rclone_remote="$7"
+    local rclone_path="$8"
 
-    mkdir -p "$mount_path"
-
-    # Always mount read-only for safety
-    local mount_opts="ro"
-    [ -n "$options" ] && mount_opts="${mount_opts},${options}"
-
-    log "Mounting NFS (read-only): ${server}:${path} -> ${mount_path}"
-    output=$(mount -t nfs -o "${mount_opts}" "${server}:${path}" "${mount_path}" 2>&1)
-    local rc=$?
-
-    if [ $rc -eq 0 ]; then
-        clear_error "$id"
-        log_success "NFS mount successful: $mount_path"
-    else
-        write_error "$id" "$output"
-        log_error "NFS mount failed: $output"
-    fi
-    return $rc
-}
-
-# Mount SMB/CIFS share (always read-only)
-do_mount_smb() {
-    local id="$1"
-    local server="$2"
-    local share="$3"
-    local mount_path="$4"
-    local username="${5:-}"
-    local password_obscured="${6:-}"
-    local domain="${7:-}"
-    local options="${8:-}"
-
-    mkdir -p "$mount_path"
-
-    # Always mount read-only for safety
-    local mount_opts="ro"
-
-    # If we have credentials, reveal password and build options
-    if [ -n "$username" ]; then
-        mount_opts="${mount_opts},username=${username}"
-
-        if [ -n "$password_obscured" ]; then
-            # Reveal password using rclone (only exists in memory briefly)
-            local password
-            password=$(rclone reveal "$password_obscured" 2>/dev/null)
-            if [ -n "$password" ]; then
-                mount_opts="${mount_opts},password=${password}"
+    case "$type" in
+        smb)
+            # On-the-fly remote: :<backend>,k1=v1,k2=v2:<path>
+            # The obscured password is base64-ish (A-Za-z0-9+/_-=) so safe to
+            # embed without quoting.
+            local opts="host=${smb_server}"
+            if [ -n "$smb_username" ]; then
+                opts="${opts},user=${smb_username}"
             fi
-        fi
-
-        if [ -n "$domain" ]; then
-            mount_opts="${mount_opts},domain=${domain}"
-        fi
-    fi
-
-    # Add any additional options
-    if [ -n "$options" ]; then
-        if [ -n "$mount_opts" ]; then
-            mount_opts="${mount_opts},${options}"
-        else
-            mount_opts="$options"
-        fi
-    fi
-
-    log "Mounting SMB (read-only): //${server}/${share} -> ${mount_path}"
-
-    # Execute mount directly (not via eval) to handle special chars in password
-    local output
-    local rc
-    if [ -n "$mount_opts" ]; then
-        output=$(mount -t cifs "//${server}/${share}" "${mount_path}" -o "${mount_opts}" 2>&1)
-        rc=$?
-    else
-        output=$(mount -t cifs "//${server}/${share}" "${mount_path}" 2>&1)
-        rc=$?
-    fi
-
-    # Clear password from any variables (best effort)
-    password=""
-    mount_opts=""
-
-    if [ $rc -eq 0 ]; then
-        clear_error "$id"
-        log_success "SMB mount successful: $mount_path"
-    else
-        write_error "$id" "$output"
-        log_error "SMB mount failed: $output"
-    fi
-    return $rc
+            if [ -n "$smb_password_obscured" ]; then
+                opts="${opts},pass=${smb_password_obscured}"
+            fi
+            if [ -n "$smb_domain" ]; then
+                opts="${opts},domain=${smb_domain}"
+            fi
+            echo ":smb,${opts}:${smb_share}"
+            ;;
+        rclone)
+            echo "${rclone_remote}:${rclone_path}"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
 }
 
-# Mount rclone remote using RC API (always read-only)
+# Mount via rclone RC API (always read-only).
 do_mount_rclone() {
     local id="$1"
-    local remote="$2"
-    local remote_path="$3"
-    local mount_path="$4"
-    local options="${5:-}"
+    local fs="$2"
+    local mount_path="$3"
+    local cache_max_size="$4"
+    local cache_max_age="$5"
+    local dir_cache_time="$6"
 
     mkdir -p "$mount_path"
 
-    # Build the remote source string
-    local fs="${remote}:${remote_path}"
+    # Apply defaults for any blank cache fields.
+    [ -z "$cache_max_size" ] && cache_max_size="$DEFAULT_CACHE_MAX_SIZE"
+    [ -z "$cache_max_age" ]  && cache_max_age="$DEFAULT_CACHE_MAX_AGE"
+    [ -z "$dir_cache_time" ] && dir_cache_time="$DEFAULT_DIR_CACHE_TIME"
 
-    # Use rclone RC API to mount (always read-only for safety)
-    log "Mounting rclone (read-only): ${fs} -> ${mount_path}"
+    log "Mounting (rclone, read-only): ${fs} -> ${mount_path} (cache ${cache_max_size}/${cache_max_age}, dir-cache ${dir_cache_time})"
 
-    # Build JSON body for rclone mount with read-only option
+    # Build JSON body via python3 — embedding the obscured password and
+    # display fs string into a hand-rolled heredoc is asking for an injection
+    # bug the next time we add a field with a quote in it.
     local json_body
-    json_body=$(cat <<EOF
-{
-    "fs": "${fs}",
-    "mountPoint": "${mount_path}",
+    json_body=$(python3 -c '
+import json, sys
+print(json.dumps({
+    "fs": sys.argv[1],
+    "mountPoint": sys.argv[2],
     "mountOpt": {
-        "AllowOther": true,
-        "ReadOnly": true
+        "AllowOther": True,
+        "ReadOnly": True,
     },
     "vfsOpt": {
-        "CacheMode": 2,
-        "ReadOnly": true
-    }
-}
-EOF
-)
+        # CacheMode 3 = "full" — cache both reads and writes on local disk.
+        # CacheMode 2 ("writes") would silently bypass the cache for reads,
+        # which is the opposite of what we want for a read-only mount.
+        "CacheMode": 3,
+        "CacheMaxSize": sys.argv[3],
+        "CacheMaxAge": sys.argv[4],
+        "DirCacheTime": sys.argv[5],
+        # Note: ChunkStreams (per-file parallel TCP) helps single-stream
+        # throughput in isolation but, under the 4+ concurrent reads from
+        # the processing pipeline, multiplies into 16+ simultaneous SMB
+        # requests and tanks aggregate throughput. Left at default — rely on
+        # file-level concurrency from the pipeline for parallelism instead.
+        "ReadOnly": True,
+    },
+}))
+' "$fs" "$mount_path" "$cache_max_size" "$cache_max_age" "$dir_cache_time")
 
+    local output
     output=$(curl -s -X POST \
         -H "Content-Type: application/json" \
-        -u admin:admin \
+        -u "$RCLONE_RC_AUTH" \
         -d "$json_body" \
-        "http://127.0.0.1:5572/mount/mount" 2>&1)
+        "${RCLONE_RC_URL}/mount/mount" 2>&1)
 
-    # Wait a moment for mount to establish
     sleep 2
 
     if is_mounted "$mount_path"; then
@@ -221,7 +192,6 @@ EOF
         return 0
     else
         local error_msg="rclone mount failed"
-        # Try to extract error from response
         if echo "$output" | grep -q "error"; then
             error_msg="$output"
         fi
@@ -231,36 +201,28 @@ EOF
     fi
 }
 
-# Unmount a path
+# Unmount a path. Always goes through the rclone RC API now — every mount we
+# create lives behind rclone's FUSE driver.
 do_unmount() {
     local id="$1"
     local mount_path="$2"
-    local type="$3"
 
     if ! is_mounted "$mount_path"; then
         log "Already unmounted: $mount_path"
         return 0
     fi
 
-    if [ "$type" = "rclone" ]; then
-        # Use rclone RC API to unmount
-        log "Unmounting rclone: $mount_path"
-        curl -s -X POST \
-            -H "Content-Type: application/json" \
-            -u admin:admin \
-            -d "{\"mountPoint\":\"${mount_path}\"}" \
-            "http://127.0.0.1:5572/mount/unmount" > /dev/null 2>&1
-    else
-        log "Unmounting: $mount_path"
-        umount "$mount_path" 2>&1
-    fi
+    log "Unmounting: $mount_path"
+    curl -s -X POST \
+        -H "Content-Type: application/json" \
+        -u "$RCLONE_RC_AUTH" \
+        -d "{\"mountPoint\":\"${mount_path}\"}" \
+        "${RCLONE_RC_URL}/mount/unmount" > /dev/null 2>&1
 
-    # Wait a moment
     sleep 1
 
-    # Check if still mounted
+    # Fallback to lazy umount in case the FUSE process is wedged.
     if is_mounted "$mount_path"; then
-        # Force unmount with lazy option
         log_warn "Force unmounting (lazy): $mount_path"
         umount -l "$mount_path" 2>&1
         sleep 1
@@ -277,12 +239,11 @@ do_unmount() {
 
 # Process all mounts from config
 process_mounts() {
-    # Check if config file exists
     if [ ! -f "$CONFIG_FILE" ]; then
         return
     fi
 
-    # Parse JSON using python3
+    # Parse JSON using python3 — pipe-separated fields, NFS dropped.
     local mounts
     mounts=$(python3 -c '
 import sys, json
@@ -294,15 +255,12 @@ except:
     sys.exit(0)
 
 for m in data.get("mounts", []):
-    # Output pipe-separated values
     fields = [
         m.get("id", ""),
         m.get("type", ""),
         str(m.get("enabled", True)),
         str(m.get("desiredMounted", False)),
         m.get("mountPath", ""),
-        m.get("nfsServer", ""),
-        m.get("nfsPath", ""),
         m.get("smbServer", ""),
         m.get("smbShare", ""),
         m.get("smbUsername", ""),
@@ -310,7 +268,9 @@ for m in data.get("mounts", []):
         m.get("smbDomain", ""),
         m.get("rcloneRemote", ""),
         m.get("rclonePath", ""),
-        m.get("options", "")
+        m.get("cacheMaxSize", ""),
+        m.get("cacheMaxAge", ""),
+        m.get("dirCacheTime", ""),
     ]
     print("|".join(fields))
 ' 2>/dev/null)
@@ -319,48 +279,56 @@ for m in data.get("mounts", []):
         return
     fi
 
-    while IFS='|' read -r id type enabled desired mount_path nfs_server nfs_path smb_server smb_share smb_username smb_password_obscured smb_domain rclone_remote rclone_path options; do
+    while IFS='|' read -r id type enabled desired mount_path \
+        smb_server smb_share smb_username smb_password_obscured smb_domain \
+        rclone_remote rclone_path \
+        cache_max_size cache_max_age dir_cache_time; do
         # Skip empty lines
         [ -z "$id" ] && continue
 
-        # Check actual mount status
+        # Skip retired/legacy types — the Go-side migration disables NFS but a
+        # stale entry could still arrive here on a downgrade/upgrade race.
+        if [ "$type" != "smb" ] && [ "$type" != "rclone" ]; then
+            log_warn "Skipping unsupported mount type '$type' (id=$id) — only smb and rclone are supported"
+            continue
+        fi
+
         local is_mounted_now=false
         is_mounted "$mount_path" && is_mounted_now=true
 
-        # Handle disabled mounts - unmount if currently mounted
+        # Disabled → unmount if currently up
         if [ "$enabled" != "True" ] && [ "$enabled" != "true" ]; then
             if [ "$is_mounted_now" = true ]; then
                 log "Mount $id ($mount_path) disabled, unmounting..."
-                do_unmount "$id" "$mount_path" "$type"
+                do_unmount "$id" "$mount_path"
             fi
             continue
         fi
 
-        # Handle desired state
         if [ "$desired" = "True" ] || [ "$desired" = "true" ]; then
             # Should be mounted
             if [ "$is_mounted_now" = false ]; then
+                local fs
+                fs=$(build_rclone_fs "$type" \
+                    "$smb_server" "$smb_share" "$smb_username" \
+                    "$smb_password_obscured" "$smb_domain" \
+                    "$rclone_remote" "$rclone_path")
+
+                if [ -z "$fs" ]; then
+                    log_error "Could not build rclone fs spec for mount $id (type=$type)"
+                    write_error "$id" "Invalid mount config: missing required fields for type=$type"
+                    continue
+                fi
+
                 log "Mount $id ($mount_path) desired but not mounted, mounting..."
-                case "$type" in
-                    nfs)
-                        do_mount_nfs "$id" "$nfs_server" "$nfs_path" "$mount_path" "$options"
-                        ;;
-                    smb)
-                        do_mount_smb "$id" "$smb_server" "$smb_share" "$mount_path" "$smb_username" "$smb_password_obscured" "$smb_domain" "$options"
-                        ;;
-                    rclone)
-                        do_mount_rclone "$id" "$rclone_remote" "$rclone_path" "$mount_path" "$options"
-                        ;;
-                    *)
-                        log_error "Unknown mount type: $type"
-                        ;;
-                esac
+                do_mount_rclone "$id" "$fs" "$mount_path" \
+                    "$cache_max_size" "$cache_max_age" "$dir_cache_time"
             fi
         else
             # Should be unmounted
             if [ "$is_mounted_now" = true ]; then
                 log "Mount $id ($mount_path) not desired, unmounting..."
-                do_unmount "$id" "$mount_path" "$type"
+                do_unmount "$id" "$mount_path"
             fi
         fi
     done <<< "$mounts"
@@ -368,7 +336,7 @@ for m in data.get("mounts", []):
 
 # Main loop
 main() {
-    log "Starting mount watcher (poll interval: ${POLL_INTERVAL}s)"
+    log "Starting mount watcher (poll interval: ${POLL_INTERVAL}s, rclone-only)"
 
     init_dirs
 

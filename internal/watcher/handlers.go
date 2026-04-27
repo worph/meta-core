@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"strconv"
 
@@ -52,7 +53,14 @@ func (h *Handlers) handlePoll(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	events := h.watcher.GetRecentEvents(sinceMS, limit)
+	// Read events from the Redis `file:events` stream rather than the
+	// in-memory buffer. The buffer is fed by the unused debouncer path,
+	// so it is always empty in practice — the stream is the source of truth.
+	events, err := h.dispatcher.GetRecentEvents(sinceMS, limit)
+	if err != nil {
+		log.Printf("[watcher.handlePoll] failed to read stream: %v", err)
+		events = []FileEvent{}
+	}
 
 	writeJSON(w, http.StatusOK, EventsListResponse{
 		Events: events,

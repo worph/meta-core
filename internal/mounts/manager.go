@@ -19,11 +19,12 @@ import (
 
 // Manager handles mount configuration and status
 type Manager struct {
-	config    *config.Config
-	mu        sync.RWMutex
-	filesPath string
-	mountsDir string
-	poller    *Poller
+	config      *config.Config
+	mu          sync.RWMutex
+	filesPath   string
+	mountsDir   string
+	poller      *Poller
+	statsPoller *StatsPoller
 }
 
 // NewManager creates a new mount manager
@@ -39,12 +40,53 @@ func NewManager(cfg *config.Config) (*Manager, error) {
 		return nil, fmt.Errorf("failed to create mount directories: %w", err)
 	}
 
+	// One-shot migration for legacy NFS entries — disable rather than fail to
+	// start, so operators can fix their config at their own pace.
+	if err := m.migrateLegacyMounts(); err != nil {
+		log.Printf("[Mounts] legacy migration warning: %v", err)
+	}
+
 	return m, nil
+}
+
+// migrateLegacyMounts disables any mount entries with type="nfs". The native
+// NFS handler was removed when the project consolidated on rclone; an NFS
+// entry left enabled would loop the watcher with mount errors.
+func (m *Manager) migrateLegacyMounts() error {
+	mountsFile, err := m.readConfig()
+	if err != nil {
+		return err
+	}
+
+	dirty := false
+	for i := range mountsFile.Mounts {
+		mnt := &mountsFile.Mounts[i]
+		if string(mnt.Type) == "nfs" {
+			if mnt.Enabled || mnt.DesiredMounted {
+				log.Printf("[Mounts] WARNING: disabling legacy NFS mount %q (%s) — NFS support was removed; please re-add via SMB or a pre-configured rclone remote", mnt.Name, mnt.ID)
+				mnt.Enabled = false
+				mnt.DesiredMounted = false
+				dirty = true
+			}
+		}
+	}
+
+	if dirty {
+		return m.writeConfig(mountsFile)
+	}
+	return nil
 }
 
 // SetPoller sets the poller for the manager
 func (m *Manager) SetPoller(poller *Poller) {
 	m.poller = poller
+}
+
+// SetStatsPoller sets the IO stats poller for the manager. ListMounts and
+// GetMount will merge the latest sampled stats into MountStatus.IOStats when
+// set; remains nil-safe when stats are disabled.
+func (m *Manager) SetStatsPoller(sp *StatsPoller) {
+	m.statsPoller = sp
 }
 
 // ensureDirs creates required directories
@@ -197,6 +239,15 @@ func (m *Manager) ListMounts() ([]MountStatus, error) {
 			pollingStatus := m.poller.GetPollingStatus(statuses[i].ID)
 			statuses[i].PollingActive = pollingStatus.Active
 			statuses[i].LastPolledScan = pollingStatus.LastScan
+			statuses[i].Scanning = pollingStatus.Scanning
+			statuses[i].CurrentScanStartedAt = pollingStatus.CurrentScanStartedAt
+			statuses[i].LastScanDurationMs = pollingStatus.LastScanDurationMs
+			statuses[i].NextScanAt = pollingStatus.NextScanAt
+		}
+	}
+	if m.statsPoller != nil {
+		for i := range statuses {
+			statuses[i].IOStats = m.statsPoller.GetStats(statuses[i].ID)
 		}
 	}
 
@@ -251,6 +302,13 @@ func (m *Manager) GetMount(id string) (*MountStatus, error) {
 				pollingStatus := m.poller.GetPollingStatus(mount.ID)
 				status.PollingActive = pollingStatus.Active
 				status.LastPolledScan = pollingStatus.LastScan
+				status.Scanning = pollingStatus.Scanning
+				status.CurrentScanStartedAt = pollingStatus.CurrentScanStartedAt
+				status.LastScanDurationMs = pollingStatus.LastScanDurationMs
+				status.NextScanAt = pollingStatus.NextScanAt
+			}
+			if m.statsPoller != nil {
+				status.IOStats = m.statsPoller.GetStats(mount.ID)
 			}
 
 			return status, nil
@@ -266,16 +324,19 @@ func (m *Manager) CreateMount(req *CreateMountRequest) (*MountStatus, error) {
 		return nil, fmt.Errorf("mount name is required")
 	}
 
-	if req.Type != MountTypeNFS && req.Type != MountTypeSMB && req.Type != MountTypeRclone {
-		return nil, fmt.Errorf("valid mount type (nfs, smb, rclone) is required")
+	// "nfs" used to be valid; the native handler is gone. Reject loudly so the
+	// caller knows their integration needs to migrate to a Samba re-export or
+	// switch to a supported protocol.
+	if req.Type == MountType("nfs") {
+		return nil, fmt.Errorf("NFS mounts are no longer supported — please use SMB or a pre-configured rclone remote")
+	}
+
+	if req.Type != MountTypeSMB && req.Type != MountTypeRclone {
+		return nil, fmt.Errorf("valid mount type (smb, rclone) is required")
 	}
 
 	// Validate type-specific fields
 	switch req.Type {
-	case MountTypeNFS:
-		if req.NFSServer == "" || req.NFSPath == "" {
-			return nil, fmt.Errorf("NFS server and path are required")
-		}
 	case MountTypeSMB:
 		if req.SMBServer == "" || req.SMBShare == "" {
 			return nil, fmt.Errorf("SMB server and share are required")
@@ -309,8 +370,11 @@ func (m *Manager) CreateMount(req *CreateMountRequest) (*MountStatus, error) {
 		enabled = *req.Enabled
 	}
 
-	// Default polling settings
-	pollingEnabled := false
+	// Polling defaults on for both supported types — neither SMB-via-rclone nor
+	// generic rclone delivers kernel inotify, so a periodic re-scan is the only
+	// way to pick up upstream changes. Explicit PollingEnabled in the request
+	// wins.
+	pollingEnabled := true
 	if req.PollingEnabled != nil {
 		pollingEnabled = *req.PollingEnabled
 	}
@@ -326,16 +390,15 @@ func (m *Manager) CreateMount(req *CreateMountRequest) (*MountStatus, error) {
 		Enabled:           enabled,
 		DesiredMounted:    enabled, // Auto-mount if enabled
 		MountPath:         mountPath,
-		Options:           req.Options,
+		CacheMaxSize:      req.CacheMaxSize,
+		CacheMaxAge:       req.CacheMaxAge,
+		DirCacheTime:      req.DirCacheTime,
 		PollingEnabled:    pollingEnabled,
 		PollingIntervalMs: pollingIntervalMs,
 	}
 
 	// Type-specific fields
 	switch req.Type {
-	case MountTypeNFS:
-		mount.NFSServer = req.NFSServer
-		mount.NFSPath = req.NFSPath
 	case MountTypeSMB:
 		mount.SMBServer = req.SMBServer
 		mount.SMBShare = req.SMBShare
@@ -411,6 +474,24 @@ func (m *Manager) UpdateMount(id string, updates map[string]interface{}) (*Mount
 			if int(v) >= MinPollingIntervalMs {
 				mount.PollingIntervalMs = int(v)
 			}
+		}
+	}
+
+	// VFS cache knobs — strings round-tripped to rclone unchanged, so we
+	// don't validate format here; rclone rejects bad values at mount time.
+	if val, ok := updates["cacheMaxSize"]; ok {
+		if s, ok := val.(string); ok {
+			mount.CacheMaxSize = s
+		}
+	}
+	if val, ok := updates["cacheMaxAge"]; ok {
+		if s, ok := val.(string); ok {
+			mount.CacheMaxAge = s
+		}
+	}
+	if val, ok := updates["dirCacheTime"]; ok {
+		if s, ok := val.(string); ok {
+			mount.DirCacheTime = s
 		}
 	}
 

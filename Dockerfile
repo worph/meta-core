@@ -7,7 +7,7 @@
 # - meta-core Go binary (HTTP API, Mount API, Watcher)
 # - nginx (dashboard, WebDAV, API proxy)
 # - Redis (managed by supervisord on leader)
-# - rclone (remote mount daemon)
+# - rclone (single mount executor — SMB goes through rclone's :smb: backend)
 # - supervisord (process management - runs on leader only)
 #
 # Architecture:
@@ -67,26 +67,35 @@ LABEL org.opencontainers.image.source=https://github.com/worph/meta-core
 LABEL org.opencontainers.image.description="MetaMesh meta-core - centralized data layer with leader election, Redis, WebDAV, mounts"
 LABEL org.opencontainers.image.licenses=MIT
 
-# Install runtime dependencies
+# Pinned rclone release. Alpine's package can lag the latest by several
+# minor versions and we depend on VFS cache fixes shipped post-1.65.
+ARG RCLONE_VERSION=1.73.5
+
+# Install runtime dependencies. Native NFS/CIFS clients intentionally absent —
+# all remote mounts go through rclone now.
 RUN apk add --no-cache \
-    # Core services
     redis \
     nginx \
     nginx-mod-http-dav-ext \
     supervisor \
-    rclone \
     fuse3 \
-    # Mount utilities
-    nfs-utils \
-    cifs-utils \
-    # Tools
     bash \
     curl \
     python3 \
     ca-certificates \
     apache2-utils \
-    # Process utilities
     procps
+
+# Install rclone from the official binary release (pinned).
+RUN set -eux; \
+    apk add --no-cache --virtual .rclone-deps unzip; \
+    cd /tmp; \
+    curl -fsSL "https://downloads.rclone.org/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-linux-amd64.zip" -o rclone.zip; \
+    unzip -q rclone.zip; \
+    install -m 0755 "rclone-v${RCLONE_VERSION}-linux-amd64/rclone" /usr/local/bin/rclone; \
+    rm -rf rclone.zip "rclone-v${RCLONE_VERSION}-linux-amd64"; \
+    apk del .rclone-deps; \
+    /usr/local/bin/rclone version | head -2
 
 # Copy Go binary from builder
 COPY --from=go-builder /build/meta-core /usr/local/bin/meta-core

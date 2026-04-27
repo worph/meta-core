@@ -29,6 +29,7 @@ type Server struct {
 	mountsManager     *mounts.Manager
 	mountsHandlers    *mounts.Handlers
 	mountPoller       *mounts.Poller
+	mountStatsPoller  *mounts.StatsPoller
 	watcherDispatcher *watcher.Dispatcher
 	fileWatcher       *watcher.Watcher
 	watcherHandlers   *watcher.Handlers
@@ -71,6 +72,11 @@ func NewServer(
 			log.Printf("[API] Warning: failed to initialize file watcher: %v", err)
 		} else {
 			s.fileWatcher = fileWatcher
+			// Wire storage so the watcher can persist (path,size,mtime,cid)
+			// tuples to Redis as it computes midhashes.
+			if stor != nil {
+				fileWatcher.SetStorageClient(stor)
+			}
 			s.watcherHandlers = watcher.NewHandlers(fileWatcher, s.watcherDispatcher)
 			// Create scan function from watcher for mounts
 			scanFunc = fileWatcher.ScanMountPath
@@ -88,6 +94,20 @@ func NewServer(
 				s.watchersPoller = watchers.NewPoller(watchersManager, s.fileWatcher, s.watcherDispatcher)
 				// Pass republish callback to handlers (handles nil metaPublisher case)
 				s.watchersHandlers = watchers.NewHandlers(watchersManager, s.watchersPoller, s.RepublishMetadata)
+
+				// Hydrate the in-memory state registry from Redis tuples so
+				// the first scan tick after boot can skip ComputeMidHash256
+				// for files whose (size, mtime) match.
+				configs := watchersManager.List()
+				roots := make([]watcher.WatcherRoot, 0, len(configs))
+				for _, c := range configs {
+					roots = append(roots, watcher.WatcherRoot{ID: c.ID, Root: c.Path})
+				}
+				if loaded, skipped, err := s.fileWatcher.HydrateStateFromStorage(roots); err != nil {
+					log.Printf("[API] Warning: failed to hydrate watcher state: %v", err)
+				} else {
+					log.Printf("[API] Hydrated watcher state from Redis: %d files loaded, %d skipped (no matching watcher root)", loaded, skipped)
+				}
 			}
 		}
 	}
@@ -103,6 +123,12 @@ func NewServer(
 		// Create and configure mount poller
 		s.mountPoller = mounts.NewPoller(mountsManager, scanFunc)
 		mountsManager.SetPoller(s.mountPoller)
+
+		// IO stats poller — queries the local rclone RC API every few seconds
+		// and exposes live throughput per mount via the same status JSON.
+		// Stats are daemon-global (rclone limitation); see stats_poller.go.
+		s.mountStatsPoller = mounts.NewStatsPoller(mountsManager)
+		mountsManager.SetStatsPoller(s.mountStatsPoller)
 	}
 
 	// Initialize WebDAV handler (caching is handled by nginx proxy_cache)
@@ -126,6 +152,11 @@ func (s *Server) setupRoutes() {
 	s.router.HandleFunc("/api/metadata/search", s.handleSearchMetadata).Methods("POST")
 	s.router.HandleFunc("/api/metadata/batch", s.handleBatchUpdate).Methods("POST")
 	s.router.HandleFunc("/api/metadata/clear", s.handleClearMetadata).Methods("POST")
+
+	// Snapshot (export / import / wipe)
+	s.router.HandleFunc("/api/snapshot/export", s.handleSnapshotExport).Methods("GET")
+	s.router.HandleFunc("/api/snapshot/import", s.handleSnapshotImport).Methods("POST")
+	s.router.HandleFunc("/api/snapshot/wipe", s.handleSnapshotWipe).Methods("POST")
 	s.router.HandleFunc("/api/metadata/{hashId}/property", s.handleMetadataGetProperty).Methods("GET")
 	s.router.HandleFunc("/api/metadata/{hashId}/property", s.handleMetadataUpdateProperty).Methods("PUT")
 	s.router.HandleFunc("/api/metadata/{hashId}", s.handleGetMetadataByHashId).Methods("GET")
@@ -240,6 +271,13 @@ func (s *Server) Start() error {
 		}
 	}
 
+	// Start IO stats poller alongside the mount poller. Cheap (one /proc read
+	// per CIFS/NFS mount per cycle, plus one RC call shared by all rclone
+	// mounts), so always-on rather than gated by config.
+	if s.mountStatsPoller != nil {
+		s.mountStatsPoller.Start()
+	}
+
 	// Start meta publisher (if storage is connected)
 	// Publishes keyspace notifications to meta:events stream
 	if s.storage != nil && s.storage.IsConnected() {
@@ -276,6 +314,11 @@ func (s *Server) Stop() error {
 		if err := s.mountPoller.Stop(); err != nil {
 			log.Printf("[API] Warning: failed to stop mount poller: %v", err)
 		}
+	}
+
+	// Stop IO stats poller
+	if s.mountStatsPoller != nil {
+		s.mountStatsPoller.Stop()
 	}
 
 	// Stop meta publisher

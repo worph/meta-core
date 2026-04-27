@@ -3,6 +3,8 @@ package watcher
 import (
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/metazla/meta-core/internal/storage"
@@ -106,6 +108,85 @@ func (d *Dispatcher) EmitReset(watcherID string) error {
 	d.dispatchToStream(event)
 
 	return nil
+}
+
+// GetRecentEvents reads recent events from the Redis stream, newest first.
+// If sinceMS > 0, only events strictly newer than that timestamp are returned.
+// limit caps the number of returned events (defaults to 100 when <= 0).
+func (d *Dispatcher) GetRecentEvents(sinceMS int64, limit int) ([]FileEvent, error) {
+	d.mu.RLock()
+	client := d.storageClient
+	d.mu.RUnlock()
+
+	if client == nil || !client.IsConnected() {
+		return []FileEvent{}, nil
+	}
+
+	if limit <= 0 {
+		limit = 100
+	}
+
+	start := "+"
+	stop := "-"
+	if sinceMS > 0 {
+		// Exclusive lower bound: skip entries at or before sinceMS.
+		stop = fmt.Sprintf("(%d-0", sinceMS)
+	}
+
+	entries, err := client.XRevRange(EventsStream, start, stop, int64(limit))
+	if err != nil {
+		return nil, err
+	}
+
+	events := make([]FileEvent, 0, len(entries))
+	for _, entry := range entries {
+		events = append(events, parseStreamEntry(entry))
+	}
+	return events, nil
+}
+
+// parseStreamEntry converts a Redis stream entry back into a FileEvent.
+// All fields are stored as strings by XADD, so numerics need parsing.
+func parseStreamEntry(entry storage.StreamEntry) FileEvent {
+	event := FileEvent{}
+
+	if v, ok := entry.Values["type"].(string); ok {
+		event.Type = FileEventType(v)
+	}
+	if v, ok := entry.Values["path"].(string); ok {
+		event.Path = v
+	}
+	if v, ok := entry.Values["timestamp"].(string); ok {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			event.Timestamp = n
+		}
+	}
+	if v, ok := entry.Values["size"].(string); ok {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			event.Size = n
+		}
+	}
+	if v, ok := entry.Values["midhash256"].(string); ok {
+		event.MidHash256 = v
+	}
+	if v, ok := entry.Values["oldPath"].(string); ok {
+		event.OldPath = v
+	}
+	if v, ok := entry.Values["watcherId"].(string); ok {
+		event.WatcherID = v
+	}
+
+	// Fall back to the stream ID's millisecond prefix if the timestamp
+	// field is missing or unparseable — every Redis stream ID starts with ms.
+	if event.Timestamp == 0 && entry.ID != "" {
+		if dash := strings.IndexByte(entry.ID, '-'); dash > 0 {
+			if n, err := strconv.ParseInt(entry.ID[:dash], 10, 64); err == nil {
+				event.Timestamp = n
+			}
+		}
+	}
+
+	return event
 }
 
 // GetStreamLength returns the current stream length

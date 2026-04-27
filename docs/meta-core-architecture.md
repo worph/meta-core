@@ -330,28 +330,39 @@ Events are published to the `meta:events` Redis stream.
 
 ### Mount Management
 
-Meta-core manages SMB/rclone mount configurations:
+Meta-core manages remote mounts via a single rclone backend. Two user-facing
+mount types are supported: `smb` (synthesised on-the-fly into rclone's `:smb:`
+backend) and `rclone` (references a pre-defined remote in `rclone.conf`).
+Native `mount.cifs` and `mount.nfs` were removed in favour of one code path.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                     Mount Manager                                │
 │                                                                  │
 │  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────┐ │
-│  │ Config       │─►│ Validator    │─►│ Health Monitor         │ │
+│  │ Config       │─►│ Validator    │─►│ Mount Watcher          │ │
 │  │ (mounts.json)│  │              │  │                        │ │
-│  │              │  │ - SMB params │  │ - Accessibility check  │ │
-│  │ - id         │  │ - rclone cfg │  │ - Error tracking       │ │
-│  │ - type       │  │ - paths      │  │ - Status reporting     │ │
-│  │ - path       │  │              │  │                        │ │
+│  │              │  │ - SMB params │  │ - Calls rclone RC      │ │
+│  │ - id         │  │ - rclone cfg │  │   /mount/mount         │ │
+│  │ - type       │  │ - cache size │  │ - ReadOnly: true       │ │
+│  │ - path       │  │              │  │ - Polls every 5s       │ │
+│  │ - cache*     │  │              │  │ - Error tracking       │ │
 │  └──────────────┘  └──────────────┘  └────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 Features:
 - **Configuration**: Mount configs stored in `/meta-core/mounts/mounts.json`
-- **Validation**: Validates mount commands and parameters
-- **Health Monitoring**: Polls mount points for accessibility
-- **Error Handling**: Tracks mount errors in separate error files
+- **Read-only**: All mounts are mounted read-only by construction (no API knob)
+- **VFS cache**: Per-mount `cacheMaxSize` (default `50G`), `cacheMaxAge`
+  (default `24h`), `dirCacheTime` (default `5m`) propagate to rclone's
+  `vfsOpt`. The cache directory itself is daemon-global — rclone keeps
+  per-remote subdirectories beneath it.
+- **Health Monitoring**: Polls `/proc/mounts` every 5s for accessibility
+- **Error Handling**: Tracks mount errors in `/meta-core/mounts/errors/{id}.error`
+- **Stats**: `/api/mounts` returns daemon-global rclone counters (bytes/sec,
+  transfers/sec) — same numbers across all mounts since rclone tracks per-
+  daemon, not per-mount.
 
 ---
 

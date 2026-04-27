@@ -4,11 +4,15 @@ import { FileList } from './components/FileList';
 import { MetadataEditor } from './components/MetadataEditor';
 import { BulkMetadataEditor } from './components/BulkMetadataEditor';
 import { KVTreeView } from './components/KVTreeView';
+import { SnapshotPanel } from './components/SnapshotPanel';
 import { MetadataAPI } from './api/metadataApi';
 import { SearchResult } from './types';
 import './App.css';
 
+type View = 'edit' | 'snapshot';
+
 function App() {
+  const [view, setView] = useState<View>('edit');
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [selectedHashId, setSelectedHashId] = useState<string | undefined>();
   const [selectedHashIds, setSelectedHashIds] = useState<Set<string>>(new Set());
@@ -167,8 +171,27 @@ function App() {
         <p className="app-description">
           Search and edit metadata for your media files
         </p>
+        <nav className="app-nav">
+          <button
+            className={view === 'edit' ? 'active' : ''}
+            onClick={() => setView('edit')}
+          >
+            Edit
+          </button>
+          <button
+            className={view === 'snapshot' ? 'active' : ''}
+            onClick={() => setView('snapshot')}
+          >
+            Snapshot
+          </button>
+        </nav>
       </header>
 
+      {view === 'snapshot' ? (
+        <main className="app-main">
+          <SnapshotPanel />
+        </main>
+      ) : (
       <main className="app-main">
         <SearchBar onSearch={handleSearch} isLoading={isSearching} />
 
@@ -230,6 +253,7 @@ function App() {
           </div>
         )}
       </main>
+      )}
 
       <footer className="app-footer">
         <p>

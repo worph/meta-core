@@ -7,6 +7,7 @@ import { KVBranchEditor } from './KVBranchEditor';
 import { SearchFieldChips } from './SearchFieldChips';
 import { ToastStack, makeToast } from './Toast';
 import { ToastEntry } from './types';
+import { SnapshotPanel } from '../components/SnapshotPanel';
 import './KVApp.css';
 
 const SEARCH_FIELDS_LS_KEY = 'kv-editor.searchFields.v1';
@@ -28,6 +29,7 @@ function loadSearchFields(): string[] {
 //
 // A sticky header carries the search bar, the breadcrumb, and basic stats.
 export default function KVApp() {
+  const [snapshotOpen, setSnapshotOpen] = useState(false);
   // Selected node. branchPath is set when a branch is selected; selectedKey
   // when a leaf is. Mutually exclusive.
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
@@ -149,6 +151,14 @@ export default function KVApp() {
             onClick={() => setReloadToken((n) => n + 1)}
             title="refresh tree"
           >Refresh</button>
+          <button
+            className="kv-btn-icon kv-app-gear"
+            onClick={() => setSnapshotOpen(true)}
+            title="Snapshot — export / import / wipe"
+            aria-label="Open snapshot settings"
+          >
+            ⚙
+          </button>
         </div>
         <SearchFieldChips fields={searchFields} onChange={setSearchFields} />
         {breadcrumb && breadcrumb.length > 0 && (
@@ -236,6 +246,28 @@ export default function KVApp() {
           )}
         </main>
       </div>
+
+      {snapshotOpen && (
+        <div
+          className="kv-modal-backdrop"
+          onClick={() => setSnapshotOpen(false)}
+        >
+          <div
+            className="kv-modal"
+            onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+          >
+            <button
+              className="kv-modal-close"
+              onClick={() => setSnapshotOpen(false)}
+              aria-label="Close"
+              title="Close"
+            >×</button>
+            <SnapshotPanel />
+          </div>
+        </div>
+      )}
 
       <ToastStack toasts={toasts} onDismiss={dismissToast} />
     </div>
