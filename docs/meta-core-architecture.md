@@ -145,20 +145,13 @@ Meta-core runs as a **standalone container**. Other services connect to it via H
                     └──────────────────────────────┘
 ```
 
-For high availability, multiple meta-core instances can run with flock-based failover:
-
-```
-┌─────────────────────┐      ┌─────────────────────┐
-│  meta-core          │      │  meta-core-2        │
-│  ★ LEADER           │      │  follower           │
-│                     │      │                     │
-│  [Redis] ───────────┼──────┼─► Connects to       │
-│                     │      │   leader's Redis    │
-└─────────────────────┘      └─────────────────────┘
-          │
-          ▼
-   /meta-core/locks/kv-leader.lock (flock held by leader)
-```
+The flock-based leader election primitive is described below. Multi-instance
+meta-core deployments (with a sibling failover instance) were used in earlier
+dev stacks but are deprecated; the dev compose now runs a single
+`metacore-app`. The election primitive itself is retained — it is what gates
+which process owns Redis and the writeable `/meta-core` state, and it remains
+correct under a single-instance deployment (the lock is held by that one
+process for its lifetime).
 
 ---
 
