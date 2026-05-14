@@ -8,15 +8,6 @@ for (const lang of iso6393) {
   languagesByCode.set(lang.iso6393, lang);
 }
 
-// Get display name for a language code
-export function getLanguageName(code: string): string {
-  const lang = languagesByCode.get(code);
-  if (lang) {
-    return lang.name;
-  }
-  return code.toUpperCase();
-}
-
 // Format for display: "English (eng)" or "eng" for unknown
 export function formatLanguageOption(code: string): string {
   const lang = languagesByCode.get(code);

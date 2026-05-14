@@ -1,5 +1,56 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { KVAPI } from '../api/kvApi';
+
+const FILE_BRANCH_RE = /^file:[^/]+\/$/;
+const fileNameCache = new Map<string, string | null>();
+const fileNamePromises = new Map<string, Promise<void>>();
+const fileNameSubscribers = new Set<() => void>();
+
+function notifyFileNameSubscribers() {
+  for (const cb of fileNameSubscribers) cb();
+}
+
+function ensureFileName(branchPath: string): void {
+  if (fileNameCache.has(branchPath) || fileNamePromises.has(branchPath)) return;
+  const p = KVAPI.get(branchPath + 'fileName')
+    .then((r) => {
+      fileNameCache.set(branchPath, r.exists && r.value ? r.value : null);
+    })
+    .catch(() => {
+      fileNameCache.set(branchPath, null);
+    })
+    .finally(() => {
+      fileNamePromises.delete(branchPath);
+      notifyFileNameSubscribers();
+    });
+  fileNamePromises.set(branchPath, p);
+}
+
+function useFileName(branchPath: string | null): string | null {
+  const [, force] = useState(0);
+  useEffect(() => {
+    if (!branchPath || !FILE_BRANCH_RE.test(branchPath)) return;
+    ensureFileName(branchPath);
+    const cb = () => force((n) => n + 1);
+    fileNameSubscribers.add(cb);
+    return () => {
+      fileNameSubscribers.delete(cb);
+    };
+  }, [branchPath]);
+  if (!branchPath || !FILE_BRANCH_RE.test(branchPath)) return null;
+  return fileNameCache.get(branchPath) ?? null;
+}
+
+function isFileBranch(path: string): boolean {
+  return FILE_BRANCH_RE.test(path);
+}
+
+function shortHashFromFileBranch(path: string): string {
+  // path = "file:<hash>/"  →  last 6 chars of hash
+  const hash = path.slice('file:'.length, -1);
+  if (hash.length <= 12) return hash;
+  return `…${hash.slice(-6)}`;
+}
 
 // A node in the lazy tree. branch-typed nodes have an associated path that
 // ends with the delimiter and lazy-load their children on first expand.
@@ -174,17 +225,15 @@ function Branch({
           const childState = branches[node.path];
           return (
             <li key={node.path}>
-              <div
-                className={`kv-tree-row kv-tree-branch${open ? ' open' : ''}`}
-                style={{ paddingLeft: depth * 14 + 4 }}
-                onClick={() => {
+              <BranchRow
+                node={node}
+                open={open}
+                depth={depth}
+                onToggle={() => {
                   onToggleBranch(node.path, !open);
                   onSelectBranch(node.path);
                 }}
-              >
-                <span className="kv-tree-toggle">{open ? '▾' : '▸'}</span>
-                <span className="kv-tree-label">{node.label}</span>
-              </div>
+              />
               {open && (
                 <Branch
                   path={node.path}
@@ -219,6 +268,38 @@ function Branch({
   );
 }
 
+interface BranchRowProps {
+  node: TreeNode;
+  open: boolean;
+  depth: number;
+  onToggle: () => void;
+}
+
+function BranchRow({ node, open, depth, onToggle }: BranchRowProps) {
+  // Surface the actual filename next to file:<hash>/ branches so the tree
+  // reads like a file list at that level instead of a wall of hashes.
+  const fileName = useFileName(isFileBranch(node.path) ? node.path : null);
+
+  return (
+    <div
+      className={`kv-tree-row kv-tree-branch${open ? ' open' : ''}`}
+      style={{ paddingLeft: depth * 14 + 4 }}
+      onClick={onToggle}
+      title={isFileBranch(node.path) ? node.path : undefined}
+    >
+      <span className="kv-tree-toggle">{open ? '▾' : '▸'}</span>
+      {fileName ? (
+        <>
+          <span className="kv-tree-label kv-tree-filename">{fileName}</span>
+          <span className="kv-tree-hash-pill">{shortHashFromFileBranch(node.path)}</span>
+        </>
+      ) : (
+        <span className="kv-tree-label">{node.label}</span>
+      )}
+    </div>
+  );
+}
+
 // Helper: given a key path with both ":" and "/" separators, return the list
 // of ancestor branch paths that need to be expanded to reveal it.
 export function ancestorBranches(key: string): string[] {
@@ -240,15 +321,6 @@ function nextSep(s: string, from: number): number {
     if (idx >= 0 && (best < 0 || idx < best)) best = idx;
   }
   return best;
-}
-
-// Memoize the ancestor calculation across renders (used by the search-hit
-// auto-expand).
-export function useAncestorBranches(key: string | null): Set<string> {
-  return useMemo(() => {
-    if (!key) return new Set();
-    return new Set(ancestorBranches(key));
-  }, [key]);
 }
 
 // Re-export for convenience in the shell

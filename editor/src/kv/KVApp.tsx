@@ -4,6 +4,9 @@ import { ancestorBranches, KVTree } from './KVTree';
 import { FilteredKVTree } from './FilteredKVTree';
 import { KVLeafEditor } from './KVLeafEditor';
 import { KVBranchEditor } from './KVBranchEditor';
+import { KVFileEditor } from './KVFileEditor';
+
+const FILE_BRANCH_RE = /^file:[^/]+\/$/;
 import { SearchFieldChips } from './SearchFieldChips';
 import { ToastStack, makeToast } from './Toast';
 import { ToastEntry } from './types';
@@ -44,6 +47,28 @@ export default function KVApp() {
   const [reloadToken, setReloadToken] = useState(0);
   const [toasts, setToasts] = useState<ToastEntry[]>([]);
   const searchTimerRef = useRef<number | null>(null);
+  // When the right pane is a file-detail view and the user clicks a leaf
+  // under the same file branch in the tree, we route the click as a
+  // scroll-anchor inside the file detail instead of a leaf-editor switch.
+  // The token bumps each click so identical anchors still trigger a scroll.
+  const [anchor, setAnchor] = useState<{ field: string; token: number } | null>(null);
+  const isFileBranch = (p: string | null) => !!p && /^file:[^/]+\/$/.test(p);
+
+  const handleLeafClick = (key: string) => {
+    if (isFileBranch(branchPath) && key.startsWith(branchPath!)) {
+      setAnchor({ field: key.slice(branchPath!.length), token: (anchor?.token ?? 0) + 1 });
+      return;
+    }
+    setSelectedKey(key);
+    setBranchPath(null);
+    setAnchor(null);
+  };
+
+  const handleBranchClick = (path: string) => {
+    setBranchPath(path);
+    setSelectedKey(null);
+    setAnchor(null);
+  };
 
   const pushToast = (t: ToastEntry) => setToasts((cur) => [...cur, t]);
   const dismissToast = (id: number) => setToasts((cur) => cur.filter((t) => t.id !== id));
@@ -184,8 +209,8 @@ export default function KVApp() {
               searching={searching}
               selectedKey={selectedKey}
               expandedPaths={expandedPaths}
-              onSelectLeaf={(k) => { setSelectedKey(k); setBranchPath(null); }}
-              onSelectBranch={(p) => { setBranchPath(p); setSelectedKey(null); }}
+              onSelectLeaf={handleLeafClick}
+              onSelectBranch={handleBranchClick}
               onToggleBranch={(p, willOpen) => {
                 setExpandedPaths((cur) => {
                   const next = new Set(cur);
@@ -199,8 +224,8 @@ export default function KVApp() {
               selectedKey={selectedKey}
               expandedPaths={expandedPaths}
               reloadToken={reloadToken}
-              onSelectLeaf={(k) => { setSelectedKey(k); setBranchPath(null); }}
-              onSelectBranch={(p) => { setBranchPath(p); setSelectedKey(null); }}
+              onSelectLeaf={handleLeafClick}
+              onSelectBranch={handleBranchClick}
               onToggleBranch={(p, willOpen) => {
                 setExpandedPaths((cur) => {
                   const next = new Set(cur);
@@ -226,6 +251,18 @@ export default function KVApp() {
                 setReloadToken((n) => n + 1);
               }}
               onError={(msg) => pushToast(makeToast('error', msg))}
+            />
+          ) : branchPath && FILE_BRANCH_RE.test(branchPath) ? (
+            <KVFileEditor
+              key={branchPath}
+              branchPath={branchPath}
+              reloadToken={reloadToken}
+              scrollToField={anchor}
+              onChanged={(info, errors) => {
+                pushToast(makeToast(errors && errors.length > 0 ? 'error' : 'success', info, errors));
+                setReloadToken((n) => n + 1);
+              }}
+              onSelectLeaf={(k) => { setSelectedKey(k); setBranchPath(null); setAnchor(null); }}
             />
           ) : branchPath ? (
             <KVBranchEditor

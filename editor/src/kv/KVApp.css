@@ -137,6 +137,26 @@
   font-weight: 500;
 }
 
+.kv-tree-branch .kv-tree-filename {
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Courier New', monospace;
+  font-size: 0.85em;
+  color: #1e3a8a;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  overflow: hidden;
+}
+
+.kv-tree-hash-pill {
+  margin-left: 0.5rem;
+  padding: 0.05rem 0.4rem;
+  background: rgba(100, 108, 255, 0.12);
+  color: #4a50c8;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Courier New', monospace;
+  font-size: 0.7em;
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+
 .kv-tree-leaf .kv-tree-label {
   color: #4a5170;
 }
@@ -249,6 +269,307 @@
 .kv-leaf-actions {
   display: flex;
   gap: 8px;
+}
+
+/* ── CID leaf ─────────────────────────────────────────────────────────── */
+.kv-leaf-cid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.kv-leaf-cid-controls {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.kv-leaf-cid-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.kv-leaf-cid-meta {
+  font-size: 12px;
+  color: #6b7280;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.kv-leaf-cid-preview {
+  max-width: 100%;
+  max-height: 320px;
+  border-radius: 6px;
+  border: 1px solid #e2e6ee;
+  background: #f5f6fa;
+  object-fit: contain;
+  align-self: flex-start;
+}
+.kv-leaf-cid-preview-media {
+  width: 100%;
+  max-width: 560px;
+}
+
+/* ── File-detail view ─────────────────────────────────────────────────── */
+.kv-file {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.kv-file-header {
+  padding: 14px 16px;
+  background: #fff;
+  border: 1px solid #e2e6ee;
+  border-radius: 8px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas:
+    "name actions"
+    "meta actions";
+  gap: 6px 16px;
+  align-items: center;
+}
+.kv-file-name {
+  grid-area: name;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Courier New', monospace;
+  font-weight: 600;
+  font-size: 14px;
+  color: #1e3a8a;
+  word-break: break-all;
+}
+.kv-file-name-fallback {
+  color: #9ca3af;
+  font-style: italic;
+}
+.kv-file-meta {
+  grid-area: meta;
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  font-size: 12px;
+  color: #6b7280;
+  min-width: 0;
+}
+.kv-file-hash {
+  background: rgba(100, 122, 250, 0.1);
+  color: #4a50c8;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Courier New', monospace;
+  flex-shrink: 0;
+}
+.kv-file-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Courier New', monospace;
+  font-size: 11px;
+}
+.kv-file-actions {
+  grid-area: actions;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.kv-file-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.kv-file-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 220px) 1fr auto;
+  gap: 12px;
+  padding: 8px 12px;
+  background: #fff;
+  border: 1px solid #e2e6ee;
+  border-left: 3px solid #d6deed;
+  border-radius: 6px;
+  align-items: start;
+}
+.kv-file-row.pending-delete {
+  border-left-color: #dc2626;
+  background: #fef2f2;
+}
+.kv-file-row.pending-delete .kv-file-row-label {
+  text-decoration: line-through;
+  color: #9ca3af;
+}
+.kv-file-row-deleted-note {
+  color: #b91c1c;
+  font-style: italic;
+  font-size: 12px;
+  padding: 6px 0;
+}
+.kv-file-row-delete {
+  width: 24px;
+  height: 24px;
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: #dc2626;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.4;
+  transition: opacity 0.15s, background 0.15s, border-color 0.15s;
+}
+.kv-file-row:hover .kv-file-row-delete,
+.kv-file-row.pending-delete .kv-file-row-delete {
+  opacity: 1;
+}
+.kv-file-row-delete:hover {
+  background: rgba(220, 38, 38, 0.1);
+  border-color: rgba(220, 38, 38, 0.3);
+}
+
+.kv-file-add {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 10px 12px;
+  background: rgba(100, 122, 250, 0.05);
+  border: 1px dashed rgba(100, 122, 250, 0.3);
+  border-radius: 6px;
+}
+.kv-file-add-prefix {
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Courier New', monospace;
+  font-size: 11px;
+  color: #6b7280;
+  white-space: nowrap;
+  flex-shrink: 0;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.kv-file-add > input {
+  flex: 1;
+}
+.kv-file-add > input:first-of-type {
+  flex: 0 0 200px;
+}
+.kv-file-row.dirty {
+  border-left-color: #fbbf24;
+  background: #fffbeb;
+}
+.kv-file-row.pulsed {
+  animation: kv-row-pulse 1.4s ease-out;
+}
+@keyframes kv-row-pulse {
+  0%   { background: rgba(100, 122, 250, 0.35); border-left-color: #4a50c8; }
+  100% { background: transparent; }
+}
+.kv-file-row-label,
+.kv-file-row-label-static {
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Courier New', monospace;
+  font-size: 12px;
+  color: #2a3050;
+  background: none;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+  padding: 6px 0;
+  word-break: break-all;
+}
+.kv-file-row-label-static {
+  cursor: default;
+}
+.kv-file-row-label:hover {
+  color: #4a50c8;
+  text-decoration: underline;
+}
+.kv-file-row-value {
+  display: flex;
+  min-width: 0;
+}
+.kv-file-row-value > * {
+  flex: 1;
+  min-width: 0;
+}
+
+.kv-file-group {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid #e2e6ee;
+  border-radius: 8px;
+  background: rgba(100, 122, 250, 0.03);
+  overflow: hidden;
+}
+.kv-file-group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border: none;
+  background: rgba(100, 122, 250, 0.1);
+  cursor: pointer;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Courier New', monospace;
+  font-size: 12px;
+  color: #2a3050;
+}
+.kv-file-group-header:hover {
+  background: rgba(100, 122, 250, 0.2);
+}
+.kv-file-group-chevron {
+  font-size: 10px;
+  color: #6b7280;
+}
+.kv-file-group-name {
+  font-weight: 600;
+  color: #1e3a8a;
+}
+.kv-file-group-count {
+  margin-left: auto;
+  padding: 1px 8px;
+  background: rgba(100, 122, 250, 0.2);
+  color: #4a50c8;
+  border-radius: 999px;
+  font-size: 11px;
+}
+.kv-file-group-body {
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.kv-file-row-lang .kv-file-lang-entries {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.kv-file-lang-entry {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.kv-file-lang-entry > .kv-leaf-input {
+  flex: 1;
+}
+.kv-file-lang-remove {
+  color: #dc2626;
+}
+.kv-file-lang-add {
+  align-self: flex-start;
+  background: rgba(100, 122, 250, 0.1);
+}
+
+/* ── DateTime leaf ────────────────────────────────────────────────────── */
+.kv-leaf-datetime {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.kv-leaf-datetime-shape {
+  font-size: 11px;
+  color: #6b7280;
+  background: rgba(100, 122, 250, 0.1);
+  padding: 2px 6px;
+  border-radius: 999px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: nowrap;
 }
 
 /* ── Branch ───────────────────────────────────────────────────────────── */

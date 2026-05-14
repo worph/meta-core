@@ -1,7 +1,9 @@
 import { useEffect, useState } from 'react';
 import { KVAPI } from '../api/kvApi';
-import { LanguageCombobox } from '../components/LanguageCombobox';
+import { useSchema } from '../api/schemaApi';
 import { ALL_TYPES, describeType, detectType } from './typeHeuristics';
+import { lookupSchemaForKey } from './schemaLookup';
+import { LeafValueEditor } from './leafRenderers';
 import { FieldType } from './types';
 
 interface Props {
@@ -22,9 +24,12 @@ export function KVLeafEditor({ selectedKey, reloadToken, onSaved, onDeleted, onE
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
-  // Manual override for the inferred type. "auto" defers to detectType.
+  // Manual override for the inferred type. "auto" defers to schema → heuristic.
   const [typeOverride, setTypeOverride] = useState<FieldType>('auto');
-  const detected = detectType(selectedKey, original);
+  const { schema } = useSchema();
+  const schemaLookup = lookupSchemaForKey(schema, selectedKey);
+  // Schema is authoritative when it has an opinion; heuristics fill the gap.
+  const detected = schemaLookup.fieldType ?? detectType(selectedKey, original);
   const effectiveType = typeOverride === 'auto' ? detected : typeOverride;
 
   // Reset override when the selected key changes — the previous override
@@ -113,7 +118,7 @@ export function KVLeafEditor({ selectedKey, reloadToken, onSaved, onDeleted, onE
         {!exists && <span className="kv-leaf-hint">new key — save to create</span>}
       </div>
 
-      <ValueEditor type={effectiveType} value={draft} onChange={setDraft} />
+      <LeafValueEditor type={effectiveType} value={draft} onChange={setDraft} />
 
       <div className="kv-leaf-actions">
         <button
@@ -151,107 +156,5 @@ function KeyHeader({ keyPath }: { keyPath: string }) {
   );
 }
 
-interface ValueProps {
-  type: FieldType;
-  value: string;
-  onChange: (v: string) => void;
-}
-
-function ValueEditor({ type, value, onChange }: ValueProps) {
-  switch (type) {
-    case 'bool':
-      return (
-        <select
-          className="kv-leaf-input"
-          value={value === 'true' ? 'true' : value === 'false' ? 'false' : ''}
-          onChange={(e) => onChange(e.target.value)}
-        >
-          <option value="">(unset)</option>
-          <option value="true">true</option>
-          <option value="false">false</option>
-        </select>
-      );
-    case 'number':
-      return (
-        <input
-          type="number"
-          className="kv-leaf-input"
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-        />
-      );
-    case 'datetime':
-      return (
-        <input
-          type="datetime-local"
-          className="kv-leaf-input"
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-        />
-      );
-    case 'lang':
-      return (
-        <LanguageCombobox value={value} onChange={onChange} />
-      );
-    case 'url':
-      return (
-        <div className="kv-leaf-url">
-          <input
-            type="url"
-            className="kv-leaf-input"
-            value={value}
-            onChange={(e) => onChange(e.target.value)}
-          />
-          {value && (
-            <a className="kv-leaf-url-open" href={value} target="_blank" rel="noreferrer">open ↗</a>
-          )}
-        </div>
-      );
-    case 'json':
-      return (
-        <textarea
-          className="kv-leaf-textarea kv-leaf-mono"
-          rows={12}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          spellCheck={false}
-        />
-      );
-    case 'text':
-      return (
-        <textarea
-          className="kv-leaf-textarea"
-          rows={8}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-        />
-      );
-    case 'hash':
-      return (
-        <div className="kv-leaf-url">
-          <input
-            type="text"
-            className="kv-leaf-input kv-leaf-mono"
-            value={value}
-            onChange={(e) => onChange(e.target.value)}
-            spellCheck={false}
-          />
-          <button
-            className="kv-btn-icon"
-            onClick={() => navigator.clipboard.writeText(value)}
-            title="copy"
-          >⧉</button>
-        </div>
-      );
-    case 'string':
-    default:
-      return (
-        <input
-          type="text"
-          className="kv-leaf-input"
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-        />
-      );
-  }
-}
+// Leaf value rendering moved to leafRenderers.tsx (LeafValueEditor)
+// so the file-detail view can reuse it per row.

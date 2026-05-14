@@ -321,8 +321,15 @@ func (c *Client) CountFiles() (int, error) {
 	return len(hashIDs), nil
 }
 
-// LookupPathByCID searches all file metadata for a matching CID
-// Returns the file path if found in poster/posterPath or backdrop/backdropPath
+// LookupPathByCID resolves a CID to its file path on disk.
+//
+// Resolution covers three cases:
+//   - midhash256 hashID itself: the CID identifies a file's content, return its filePath.
+//   - poster/backdrop fields: the CID is for the image asset, return posterPath/backdropPath.
+//   - any cid_* field: the CID is another digest of the same file, return its filePath.
+//
+// Walks every indexed hash; acceptable for admin/UI use, but would benefit from
+// a reverse index (cid → hashID/field) if call volume grows.
 func (c *Client) LookupPathByCID(cid string) (string, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -338,36 +345,91 @@ func (c *Client) LookupPathByCID(cid string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Get all hash IDs first
 	hashIDs, err := c.getAllHashIDsInternal(ctx)
 	if err != nil {
 		return "", err
 	}
 
-	// For each hash, check poster and backdrop CIDs using flat keys
 	for _, hashID := range hashIDs {
-		prefix := c.buildKeyPrefix(hashID)
+		meta, err := c.getMetadataFlatInternal(ctx, hashID)
+		if err != nil || len(meta) == 0 {
+			continue
+		}
 
-		// Check poster
-		posterCID, err := c.client.Get(ctx, prefix+"poster").Result()
-		if err == nil && posterCID == cid {
-			posterPath, err := c.client.Get(ctx, prefix+"posterPath").Result()
-			if err == nil && posterPath != "" {
-				return posterPath, nil
+		// midhash256 == hashID: the file itself.
+		if hashID == cid {
+			if fp := meta["filePath"]; fp != "" {
+				return normalizeFilesRelativePath(fp), nil
 			}
 		}
 
-		// Check backdrop
-		backdropCID, err := c.client.Get(ctx, prefix+"backdrop").Result()
-		if err == nil && backdropCID == cid {
-			backdropPath, err := c.client.Get(ctx, prefix+"backdropPath").Result()
-			if err == nil && backdropPath != "" {
-				return backdropPath, nil
+		// Poster / backdrop refer to a sidecar image asset.
+		if meta["poster"] == cid {
+			if p := meta["posterPath"]; p != "" {
+				return normalizeFilesRelativePath(p), nil
+			}
+		}
+		if meta["backdrop"] == cid {
+			if p := meta["backdropPath"]; p != "" {
+				return normalizeFilesRelativePath(p), nil
+			}
+		}
+
+		// Any other cid_* field is an additional digest of the file itself.
+		for field, value := range meta {
+			if value != cid {
+				continue
+			}
+			if strings.HasPrefix(field, "cid_") {
+				if fp := meta["filePath"]; fp != "" {
+					return normalizeFilesRelativePath(fp), nil
+				}
 			}
 		}
 	}
 
 	return "", nil
+}
+
+// normalizeFilesRelativePath strips a leading "/files/" prefix so handlers can
+// safely filepath.Join(FilesPath, …) without double-prefixing. Different
+// plugins store paths inconsistently — poster/backdrop use FilesPath-relative
+// ("/plugin/…") while filePath is FilesPath-absolute ("/files/watch/…").
+func normalizeFilesRelativePath(p string) string {
+	return strings.TrimPrefix(p, "/files")
+}
+
+// getMetadataFlatInternal mirrors GetMetadataFlat without re-acquiring the lock.
+// Callers must already hold c.mu.
+func (c *Client) getMetadataFlatInternal(ctx context.Context, hashID string) (map[string]string, error) {
+	prefix := c.buildKeyPrefix(hashID)
+	result := make(map[string]string)
+
+	var cursor uint64
+	for {
+		keys, nextCursor, err := c.client.Scan(ctx, cursor, prefix+"*", 1000).Result()
+		if err != nil {
+			return nil, fmt.Errorf("scan failed: %w", err)
+		}
+		if len(keys) > 0 {
+			values, err := c.client.MGet(ctx, keys...).Result()
+			if err != nil {
+				return nil, fmt.Errorf("mget failed: %w", err)
+			}
+			for i, key := range keys {
+				if values[i] == nil {
+					continue
+				}
+				field := strings.TrimPrefix(key, prefix)
+				result[field] = values[i].(string)
+			}
+		}
+		cursor = nextCursor
+		if cursor == 0 {
+			break
+		}
+	}
+	return result, nil
 }
 
 // getAllHashIDsInternal is an internal version that doesn't acquire locks

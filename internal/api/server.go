@@ -13,6 +13,7 @@ import (
 	"github.com/metazla/meta-core/internal/events"
 	"github.com/metazla/meta-core/internal/leader"
 	"github.com/metazla/meta-core/internal/mounts"
+	"github.com/metazla/meta-core/internal/schema"
 	"github.com/metazla/meta-core/internal/storage"
 	"github.com/metazla/meta-core/internal/watcher"
 	"github.com/metazla/meta-core/internal/watchers"
@@ -37,6 +38,7 @@ type Server struct {
 	watchersPoller    *watchers.Poller
 	watchersHandlers  *watchers.Handlers
 	metaPublisher     *events.MetaPublisher
+	schemaIndexer     *schema.Indexer
 	webdavHandler     *webdav.Handler
 	router            *mux.Router
 	server            *http.Server
@@ -163,6 +165,10 @@ func (s *Server) setupRoutes() {
 	s.router.HandleFunc("/api/metadata/{hashId}", s.handleUpdateMetadataByHashId).Methods("PUT")
 	s.router.HandleFunc("/api/metadata/{hashId}", s.handleDeleteMetadataByHashId).Methods("DELETE")
 
+	// Schema inference
+	s.router.HandleFunc("/api/schema", s.handleSchemaGet).Methods("GET")
+	s.router.HandleFunc("/api/schema/rescan", s.handleSchemaRescan).Methods("POST")
+
 	// KV Browser API routes
 	s.router.HandleFunc("/api/kv/info", s.handleKVInfo).Methods("GET")
 	s.router.HandleFunc("/api/kv/keys", s.handleKVKeys).Methods("GET")
@@ -194,6 +200,7 @@ func (s *Server) setupRoutes() {
 	s.router.HandleFunc("/data/{hash}", s.handleHeadData).Methods("HEAD")
 
 	// File operations (by CID)
+	s.router.HandleFunc("/api/file/{cid}/info", s.handleGetFileByCIDInfo).Methods("GET")
 	s.router.HandleFunc("/file/{cid}", s.handleGetFileByCID).Methods("GET")
 	s.router.HandleFunc("/file/cid", s.handleComputeFileCID).Methods("POST")
 
@@ -285,6 +292,15 @@ func (s *Server) Start() error {
 		if err := s.metaPublisher.Start(); err != nil {
 			log.Printf("[API] Warning: failed to start meta publisher: %v", err)
 		} else {
+			// Schema indexer consumes the same stream to derive a live
+			// per-field schema (type/hint/breakdown). Start it before the
+			// republish flood so it captures the bootstrap events.
+			s.schemaIndexer = schema.NewIndexer(s.storage.GetRedisClient(), s.storage.GetPrefix())
+			if err := s.schemaIndexer.Start(); err != nil {
+				log.Printf("[API] Warning: failed to start schema indexer: %v", err)
+				s.schemaIndexer = nil
+			}
+
 			// Republish events for all existing metadata
 			go func() {
 				count, err := s.RepublishMetadata()
@@ -319,6 +335,13 @@ func (s *Server) Stop() error {
 	// Stop IO stats poller
 	if s.mountStatsPoller != nil {
 		s.mountStatsPoller.Stop()
+	}
+
+	// Stop schema indexer before the publisher so the consumer drains cleanly
+	if s.schemaIndexer != nil {
+		if err := s.schemaIndexer.Stop(); err != nil {
+			log.Printf("[API] Warning: failed to stop schema indexer: %v", err)
+		}
 	}
 
 	// Stop meta publisher

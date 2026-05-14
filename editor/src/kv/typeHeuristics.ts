@@ -12,14 +12,14 @@ const PATH_PATTERNS: Array<[RegExp, FieldType]> = [
   [/(^|\/)(description|overview|notes?|comment|summary|nfo)$/i, 'text'],
 ];
 
-export function detectFromPath(path: string): FieldType | null {
+function detectFromPath(path: string): FieldType | null {
   for (const [re, t] of PATH_PATTERNS) {
     if (re.test(path)) return t;
   }
   return null;
 }
 
-export function detectFromValue(v: string): FieldType {
+function detectFromValue(v: string): FieldType {
   if (v === '') return 'string';
   if (v === 'true' || v === 'false') return 'bool';
   if (/^-?\d+$/.test(v)) return 'number';

@@ -340,6 +340,63 @@ func (s *Server) handleHeadData(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// handleGetFileByCIDInfo handles GET /api/file/{cid}/info.
+// Returns lightweight metadata for the file (existence, content type, size,
+// relative path) without streaming any bytes. Used by the editor to decide
+// whether to render a preview (image/video) or a download-only button.
+func (s *Server) handleGetFileByCIDInfo(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	cid := vars["cid"]
+
+	type infoResp struct {
+		Exists      bool   `json:"exists"`
+		ContentType string `json:"contentType,omitempty"`
+		Size        int64  `json:"size,omitempty"`
+		FilePath    string `json:"filePath,omitempty"`
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	if cid == "" {
+		_ = json.NewEncoder(w).Encode(infoResp{Exists: false})
+		return
+	}
+	if !s.storage.IsConnected() {
+		writeError(w, http.StatusServiceUnavailable, "storage not connected")
+		return
+	}
+
+	relPath, err := s.storage.LookupPathByCID(cid)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if relPath == "" {
+		_ = json.NewEncoder(w).Encode(infoResp{Exists: false})
+		return
+	}
+
+	fullPath := filepath.Join(s.config.FilesPath, relPath)
+	fi, err := os.Stat(fullPath)
+	if err != nil {
+		_ = json.NewEncoder(w).Encode(infoResp{Exists: false, FilePath: relPath})
+		return
+	}
+
+	ext := strings.ToLower(filepath.Ext(fullPath))
+	contentType, ok := contentTypeByExt[ext]
+	if !ok {
+		contentType = "application/octet-stream"
+	}
+
+	_ = json.NewEncoder(w).Encode(infoResp{
+		Exists:      true,
+		ContentType: contentType,
+		Size:        fi.Size(),
+		FilePath:    relPath,
+	})
+}
+
 // handleGetFileByCID handles GET /file/{cid}
 // Serves a file by looking up its CID in poster/backdrop metadata
 func (s *Server) handleGetFileByCID(w http.ResponseWriter, r *http.Request) {
