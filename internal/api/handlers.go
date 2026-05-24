@@ -63,10 +63,48 @@ type DataPathResponse struct {
 	Exists bool   `json:"exists"`
 }
 
-// ErrorResponse is the response for errors
+// ErrorResponse is the typed error envelope returned on every 4xx/5xx.
+//
+// Shape and slug vocabulary documented in docs/api-mediated-access.md
+// ("Error envelope"). Stable slug strings let clients switch on the failure
+// category without parsing the message; `retryable` tells callers whether
+// a backoff-and-retry has any chance of succeeding.
 type ErrorResponse struct {
-	Error   string `json:"error"`
-	Message string `json:"message,omitempty"`
+	Error     string `json:"error"`
+	Message   string `json:"message,omitempty"`
+	Retryable bool   `json:"retryable"`
+}
+
+// Stable error-slug strings. Pinned in the doc; consumers may match on
+// these. Do not rename without a deprecation cycle.
+const (
+	ErrAliasCollision    = "alias_collision"
+	ErrUnknownRoot       = "unknown_root"
+	ErrUnknownCID        = "unknown_cid"
+	ErrSchemaViolation   = "schema_violation"
+	ErrStorageUnavailable = "storage_unavailable"
+	ErrInternal          = "internal"
+)
+
+// defaultSlugFor maps an HTTP status code to the most likely error slug.
+// Handlers that want to override (e.g. /api/meta/{cid} → "unknown_cid"
+// instead of "unknown_root" on 404) call writeErrorSlug directly.
+func defaultSlugFor(status int) (slug string, retryable bool) {
+	switch status {
+	case http.StatusConflict:
+		return ErrAliasCollision, false
+	case http.StatusNotFound:
+		return ErrUnknownRoot, false
+	case http.StatusBadRequest:
+		return ErrSchemaViolation, false
+	case http.StatusServiceUnavailable:
+		return ErrStorageUnavailable, true
+	case http.StatusInternalServerError:
+		return ErrInternal, true
+	default:
+		// 4xx → not retryable, 5xx → retryable. Conservative default.
+		return ErrInternal, status >= 500
+	}
 }
 
 var startTime = time.Now()
@@ -169,6 +207,10 @@ func (s *Server) handleGetMeta(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolve CID → UUID via the reverse index so reads find data wherever
+	// the watcher minted the root, regardless of which CID the caller knows.
+	hashID = s.storage.ResolveRoot(hashID)
+
 	metadata, err := s.storage.GetMetadataFlat(hashID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -203,6 +245,10 @@ func (s *Server) handlePutMeta(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// CID → UUID resolution so writes land on the canonical root, not on
+	// a parallel midhash-rooted entry the watcher's UUID never sees.
+	hashID = s.storage.ResolveRoot(hashID)
+
 	var metadata map[string]string
 	if err := json.NewDecoder(r.Body).Decode(&metadata); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
@@ -234,6 +280,8 @@ func (s *Server) handleDeleteMeta(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "storage not connected")
 		return
 	}
+
+	hashID = s.storage.ResolveRoot(hashID)
 
 	deleted, err := s.storage.DeleteMetadata(hashID)
 	if err != nil {
@@ -421,7 +469,7 @@ func (s *Server) handleGetFileByCID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if relPath == "" {
-		writeError(w, http.StatusNotFound, "file not found for CID")
+		writeErrorSlug(w, http.StatusNotFound, ErrUnknownCID, "file not found for CID", false)
 		return
 	}
 
@@ -431,7 +479,7 @@ func (s *Server) handleGetFileByCID(w http.ResponseWriter, r *http.Request) {
 	// Check if file exists
 	fileInfo, err := os.Stat(fullPath)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "file does not exist on disk")
+		writeErrorSlug(w, http.StatusNotFound, ErrUnknownCID, "file does not exist on disk", false)
 		return
 	}
 
@@ -522,11 +570,26 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	json.NewEncoder(w).Encode(data)
 }
 
-// writeError writes an error response
+// writeError writes the typed error envelope. The slug + retryable bit
+// are inferred from the status (see defaultSlugFor); call writeErrorSlug
+// directly when a more specific slug applies.
 func writeError(w http.ResponseWriter, status int, message string) {
+	slug, retryable := defaultSlugFor(status)
 	writeJSON(w, status, ErrorResponse{
-		Error:   http.StatusText(status),
-		Message: message,
+		Error:     slug,
+		Message:   message,
+		Retryable: retryable,
+	})
+}
+
+// writeErrorSlug writes the typed envelope with an explicit slug and
+// retryable bit. Use this for endpoint-specific slugs (alias_collision,
+// unknown_cid) where the default mapping from HTTP status would be wrong.
+func writeErrorSlug(w http.ResponseWriter, status int, slug, message string, retryable bool) {
+	writeJSON(w, status, ErrorResponse{
+		Error:     slug,
+		Message:   message,
+		Retryable: retryable,
 	})
 }
 
@@ -545,6 +608,11 @@ func (s *Server) handlePatchMeta(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "storage not connected")
 		return
 	}
+
+	// PATCH is the hot write path for meta-sort. Resolve so plugin output
+	// merges into the watcher's UUID root rather than minting a parallel
+	// midhash-rooted entry.
+	hashID = s.storage.ResolveRoot(hashID)
 
 	var metadata map[string]string
 	if err := json.NewDecoder(r.Body).Decode(&metadata); err != nil {
@@ -586,6 +654,8 @@ func (s *Server) handleGetProperty(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "storage not connected")
 		return
 	}
+
+	hashID = s.storage.ResolveRoot(hashID)
 
 	value, err := s.storage.GetProperty(hashID, key)
 	if err != nil {
@@ -631,6 +701,8 @@ func (s *Server) handlePutProperty(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "storage not connected")
 		return
 	}
+
+	hashID = s.storage.ResolveRoot(hashID)
 
 	// Read body
 	buf := make([]byte, 1024*1024) // 1MB max
@@ -686,6 +758,8 @@ func (s *Server) handleDeleteProperty(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	hashID = s.storage.ResolveRoot(hashID)
+
 	if err := s.storage.DeleteProperty(hashID, key); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -720,6 +794,8 @@ func (s *Server) handleAddToSet(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "storage not connected")
 		return
 	}
+
+	hashID = s.storage.ResolveRoot(hashID)
 
 	// Read body
 	buf := make([]byte, 1024*1024) // 1MB max

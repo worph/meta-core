@@ -193,9 +193,10 @@ func (i *Indexer) processEvent(values map[string]any) {
 	}
 }
 
-// parseFieldPath turns "file:<hashID>/<propertyPath>" into the logical field
-// path used as the map key. hashID may itself contain ':' (e.g.
-// "midhash256:abc123"); the split is on the first '/'.
+// parseFieldPath turns "file:<rootID>/<propertyPath>" into the logical field
+// path used as the map key. rootID is opaque to the indexer — currently a
+// UUIDv7, historically a midhash256:abc token; both shapes parse identically
+// because the split is on the first '/' after "file:".
 //
 // When the last segment of propertyPath matches ^[a-z]{2,3}$ it is treated as
 // a language code: the field name collapses to the prefix and key_hint is set.

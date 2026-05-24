@@ -192,6 +192,10 @@ func (c *Client) SetMetadataFlat(hashID string, metadata map[string]string) erro
 		return fmt.Errorf("sadd index failed: %w", err)
 	}
 
+	// Auto-register reverse-index aliases for any cid_* or midhash256 fields
+	// in the payload. See cid_resolution.go for the rules.
+	c.maybeAddAliasesFromMetadataLocked(ctx, hashID, metadata)
+
 	return nil
 }
 
@@ -263,11 +267,17 @@ func (c *Client) SetProperty(hashID, property, value string) error {
 		return fmt.Errorf("sadd index failed: %w", err)
 	}
 
+	// Auto-register reverse-index alias if this is a CID field.
+	_ = c.maybeAddAliasFromFieldLocked(ctx, hashID, property, value)
+
 	return nil
 }
 
 // DeleteMetadata deletes all metadata for a file
 // Uses SCAN + DEL for flat keys: file:{hashId}/*
+// Also unmaps every reverse-index entry registered for this root, so a
+// subsequent GET /api/meta/<old-cid> correctly returns 404 instead of
+// pointing at a UUID with no keys.
 func (c *Client) DeleteMetadata(hashID string) (int64, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -280,6 +290,22 @@ func (c *Client) DeleteMetadata(hashID string) (int64, error) {
 	defer cancel()
 
 	prefix := c.buildKeyPrefix(hashID)
+
+	// Read the cids set first — once file:<uuid>/* is gone we've lost the
+	// list of reverse-index keys that need cleanup.
+	tokens, err := c.client.SMembers(ctx, prefix+CIDsField).Result()
+	if err != nil && err != redis.Nil {
+		return 0, fmt.Errorf("smembers cids: %w", err)
+	}
+	if len(tokens) > 0 {
+		idxKeys := make([]string, 0, len(tokens))
+		for _, t := range tokens {
+			idxKeys = append(idxKeys, c.buildCIDIndexKey(t))
+		}
+		if err := c.client.Del(ctx, idxKeys...).Err(); err != nil {
+			return 0, fmt.Errorf("del cid index: %w", err)
+		}
+	}
 
 	// Scan and delete all keys with this prefix
 	var deletedCount int64
@@ -323,72 +349,31 @@ func (c *Client) CountFiles() (int, error) {
 
 // LookupPathByCID resolves a CID to its file path on disk.
 //
-// Resolution covers three cases:
-//   - midhash256 hashID itself: the CID identifies a file's content, return its filePath.
-//   - poster/backdrop fields: the CID is for the image asset, return posterPath/backdropPath.
-//   - any cid_* field: the CID is another digest of the same file, return its filePath.
+// Primary path: the reverse index (cid:<token> → uuid). O(1) lookup followed
+// by a single GET of file:<uuid>/filePath.
 //
-// Walks every indexed hash; acceptable for admin/UI use, but would benefit from
-// a reverse index (cid → hashID/field) if call volume grows.
-func (c *Client) LookupPathByCID(cid string) (string, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	if c.client == nil {
-		return "", fmt.Errorf("not connected")
-	}
-
-	if cid == "" {
-		return "", nil
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	hashIDs, err := c.getAllHashIDsInternal(ctx)
+// Fallback path: poster/backdrop CIDs aren't registered as aliases (they
+// refer to sidecar images, not the main file content), so unknown tokens
+// fall through to a scan of poster/backdrop fields. O(n) but rare in
+// practice — sidecar lookups are infrequent compared to file CID lookups.
+//
+// Accepts CID tokens in prefixed form ("midhash256:bafk…", "sha256:…",
+// "ipfs:bafy…"). Bare CIDs without an algorithm prefix won't resolve via
+// the reverse index — callers should pass the prefixed form.
+func (c *Client) LookupPathByCID(token string) (string, error) {
+	uuid, err := c.GetByCID(token)
 	if err != nil {
 		return "", err
 	}
-
-	for _, hashID := range hashIDs {
-		meta, err := c.getMetadataFlatInternal(ctx, hashID)
-		if err != nil || len(meta) == 0 {
-			continue
+	if uuid != "" {
+		fp, err := c.GetProperty(uuid, "filePath")
+		if err != nil {
+			return "", err
 		}
-
-		// midhash256 == hashID: the file itself.
-		if hashID == cid {
-			if fp := meta["filePath"]; fp != "" {
-				return normalizeFilesRelativePath(fp), nil
-			}
-		}
-
-		// Poster / backdrop refer to a sidecar image asset.
-		if meta["poster"] == cid {
-			if p := meta["posterPath"]; p != "" {
-				return normalizeFilesRelativePath(p), nil
-			}
-		}
-		if meta["backdrop"] == cid {
-			if p := meta["backdropPath"]; p != "" {
-				return normalizeFilesRelativePath(p), nil
-			}
-		}
-
-		// Any other cid_* field is an additional digest of the file itself.
-		for field, value := range meta {
-			if value != cid {
-				continue
-			}
-			if strings.HasPrefix(field, "cid_") {
-				if fp := meta["filePath"]; fp != "" {
-					return normalizeFilesRelativePath(fp), nil
-				}
-			}
-		}
+		return normalizeFilesRelativePath(fp), nil
 	}
-
-	return "", nil
+	// Not a file alias — try poster/backdrop sidecars.
+	return c.lookupSidecarPathByCID(token)
 }
 
 // normalizeFilesRelativePath strips a leading "/files/" prefix so handlers can
@@ -476,6 +461,10 @@ func (c *Client) MergeMetadataFlat(hashID string, metadata map[string]string) (i
 	if err := c.client.SAdd(ctx, c.buildIndexKey(), hashID).Err(); err != nil {
 		return len(metadata), fmt.Errorf("sadd index failed: %w", err)
 	}
+
+	// Auto-register reverse-index aliases for any cid_* or midhash256 fields
+	// in the payload. See cid_resolution.go for the rules.
+	c.maybeAddAliasesFromMetadataLocked(ctx, hashID, metadata)
 
 	return len(metadata), nil
 }
@@ -599,19 +588,27 @@ func (c *Client) RemoveFromSet(hashID, property, value string) (bool, error) {
 	return true, c.client.Set(ctx, key, newValue, 0).Err()
 }
 
-// FileTuple holds the (path, size, mtime) record for one file. Used by the
-// watcher hydrator at startup to avoid re-mid-hashing files whose tuple
-// matches what's already in Redis.
+// FileTuple holds the (uuid, path, size, mtime, midhash) record for one
+// file. Used by the watcher hydrator at startup to avoid re-mid-hashing
+// files whose tuple matches what's already in Redis.
+//
+// HashID is the root identifier (UUIDv7 in the current model); MidHash256
+// is the actual midhash CID for the file, present iff the watcher already
+// computed and stored it. Hydration uses HashID for the state-registry
+// key and MidHash256 for the in-memory "I already know this hash" flag.
 type FileTuple struct {
-	HashID    string
-	FilePath  string
-	Size      int64
-	MtimeNano int64
+	HashID     string
+	FilePath   string
+	Size       int64
+	MtimeNano  int64
+	MidHash256 string
 }
 
-// GetTuplesForAllFiles returns one FileTuple per indexed CID, fetched in
-// batched MGETs (no SCAN per CID). Skips files missing any of the three
-// fields. Sub-second on local Redis for ~10K files.
+// GetTuplesForAllFiles returns one FileTuple per indexed root, fetched in
+// batched MGETs (no SCAN per root). Skips files missing any of filePath,
+// sizeByte, or mtimeNano. midhash256 is optional — files that haven't
+// been hashed yet still appear in the result with an empty MidHash256.
+// Sub-second on local Redis for ~10K files.
 func (c *Client) GetTuplesForAllFiles() ([]FileTuple, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -631,11 +628,11 @@ func (c *Client) GetTuplesForAllFiles() ([]FileTuple, error) {
 		return nil, nil
 	}
 
-	// Build the key list: 3 keys per CID, in a fixed order so we can decode
+	// Build the key list: 4 keys per root, in a fixed order so we can decode
 	// the MGET response by position. fields[i] for hashIDs[j] sits at
-	// keys[j*3+i].
-	const fieldsPerFile = 3
-	fields := [fieldsPerFile]string{"filePath", "sizeByte", "mtimeNano"}
+	// keys[j*4+i].
+	const fieldsPerFile = 4
+	fields := [fieldsPerFile]string{"filePath", "sizeByte", "mtimeNano", "midhash256"}
 	keys := make([]string, 0, len(hashIDs)*fieldsPerFile)
 	for _, h := range hashIDs {
 		prefix := c.buildKeyPrefix(h)
@@ -665,6 +662,7 @@ func (c *Client) GetTuplesForAllFiles() ([]FileTuple, error) {
 		filePath, _ := values[base].(string)
 		sizeStr, _ := values[base+1].(string)
 		mtimeStr, _ := values[base+2].(string)
+		midhash, _ := values[base+3].(string)
 		if filePath == "" || sizeStr == "" || mtimeStr == "" {
 			continue
 		}
@@ -677,10 +675,11 @@ func (c *Client) GetTuplesForAllFiles() ([]FileTuple, error) {
 			continue
 		}
 		out = append(out, FileTuple{
-			HashID:    h,
-			FilePath:  filePath,
-			Size:      size,
-			MtimeNano: mtime,
+			HashID:     h,
+			FilePath:   filePath,
+			Size:       size,
+			MtimeNano:  mtime,
+			MidHash256: midhash,
 		})
 	}
 	return out, nil

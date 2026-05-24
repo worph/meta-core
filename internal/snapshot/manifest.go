@@ -1,15 +1,26 @@
 // Package snapshot implements export/import/wipe of MetaMesh metadata.
 //
 // The on-disk format is a ZIP archive containing one nested-JSON file per
-// known CID (cid_midhash256). Schema is defined by ManifestSchemaVersion;
-// readers must reject archives whose schemaVersion exceeds what they know.
+// indexed root. Schema is defined by ManifestSchemaVersion; readers must
+// reject archives whose schemaVersion exceeds what they know.
+//
+// v2 (current): root identifiers are UUIDv7 (Crockford Base32). Entries
+// under metadata/<root>.json carry the flat string properties; the cids
+// and duplicates Redis SETs are NOT serialized yet — they are rebuilt
+// transparently on import because SetMetadataFlat / MergeMetadataFlat
+// auto-register reverse-index aliases for any cid_*/midhash256 field they
+// see (see internal/storage/cid_resolution.go).
+//
+// v1 (legacy): roots were content-hash-typed tokens like "midhash256:abc".
+// v1 archives can no longer be imported — they would resurrect the
+// privileged-hashID schema this layer was built to retire.
 package snapshot
 
 import "time"
 
 // ManifestSchemaVersion is the on-disk format version. Bump when the layout
-// of metadata/{cid}.json or the manifest changes in a non-additive way.
-const ManifestSchemaVersion = 1
+// of metadata/{root}.json or the manifest changes in a non-additive way.
+const ManifestSchemaVersion = 2
 
 // MetadataDir is the path inside the ZIP that holds per-CID JSON files.
 const MetadataDir = "metadata/"

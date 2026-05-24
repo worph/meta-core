@@ -13,6 +13,11 @@ import (
 const (
 	// EventsStream is the Redis Stream name for file events
 	EventsStream = "file:events"
+
+	// EventsStreamMaxLen is the approximate cap on stream length. Bounded
+	// retention is a contract requirement for the SSE wire — see
+	// docs/api-mediated-access.md "Backing-store retention and lifecycle".
+	EventsStreamMaxLen = 100_000
 )
 
 // Dispatcher sends file events to Redis Stream
@@ -70,8 +75,10 @@ func (d *Dispatcher) dispatchToStream(event FileEvent) {
 		fields["watcherId"] = event.WatcherID
 	}
 
-	// Publish to stream (no MaxLen - stream is cleared on reset)
-	_, err := client.XAdd(EventsStream, 0, fields)
+	// Approximate MAXLEN trim keeps the stream bounded. The deliberate
+	// `EmitReset → ClearStream` path is still the only way the stream gets
+	// truncated to zero (signalled to consumers via the `reset` event).
+	_, err := client.XAdd(EventsStream, EventsStreamMaxLen, fields)
 	if err != nil {
 		log.Printf("[Dispatcher] Failed to publish to stream: %v", err)
 	}

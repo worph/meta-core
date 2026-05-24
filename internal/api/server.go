@@ -204,6 +204,23 @@ func (s *Server) setupRoutes() {
 	s.router.HandleFunc("/file/{cid}", s.handleGetFileByCID).Methods("GET")
 	s.router.HandleFunc("/file/cid", s.handleComputeFileCID).Methods("POST")
 
+	// Public metadata-by-CID resolver. Reverse-index lookup → full document.
+	// Auth-bypassed alongside /api/file/{cid} so meta-share peers can query
+	// without going through Authelia.
+	s.router.HandleFunc("/api/meta/{cid}", s.handleGetMetaByCID).Methods("GET")
+
+	// Admin: reunify stranded midhash-rooted entries into their UUID roots
+	// (the dual-root pattern caused by historical writes that bypassed CID
+	// resolution).
+	s.router.HandleFunc("/api/admin/migrate-dual-roots", s.handleMigrateDualRoots).Methods("POST")
+
+	// SSE event streams. Mediated mirror of the Redis Streams; consumers
+	// reach them over HTTP instead of touching Redis directly. Auth-bypass
+	// applies but exposure should be inside-only (do NOT proxy through
+	// Caddy publicly). See docs/api-mediated-access.md "Auth".
+	s.router.HandleFunc("/api/events/files", s.handleEventsFiles).Methods("GET")
+	s.router.HandleFunc("/api/events/meta", s.handleEventsMeta).Methods("GET")
+
 	// Service discovery
 	// Both /services and /api/services are supported for consistency with other services
 	s.router.HandleFunc("/services", s.handleListServices).Methods("GET")

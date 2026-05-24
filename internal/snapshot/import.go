@@ -108,6 +108,10 @@ func (i *Importer) Import(r io.ReaderAt, size int64, opts ImportOptions) (*Impor
 		return nil, fmt.Errorf("snapshot schemaVersion %d exceeds supported %d",
 			manifest.SchemaVersion, ManifestSchemaVersion)
 	}
+	if manifest.SchemaVersion < ManifestSchemaVersion {
+		return nil, fmt.Errorf("snapshot schemaVersion %d is no longer supported (current: %d); v1 used content-hash root keys which are incompatible with the UUID-rooted schema",
+			manifest.SchemaVersion, ManifestSchemaVersion)
+	}
 
 	result := &ImportResult{
 		Mode:     opts.Mode,

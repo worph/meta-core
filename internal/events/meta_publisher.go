@@ -14,6 +14,12 @@ import (
 const (
 	// MetaEventsStream is the Redis stream name for metadata events
 	MetaEventsStream = "meta:events"
+
+	// MetaEventsMaxLen is the approximate cap on stream length. Bounded
+	// retention is a contract requirement for the SSE wire — see
+	// docs/api-mediated-access.md "Backing-store retention and lifecycle".
+	// Cheap (~) trim keeps growth bounded without serialising writes.
+	MetaEventsMaxLen = 100_000
 )
 
 // MetaPublisher subscribes to Redis keyspace notifications
@@ -37,7 +43,12 @@ func NewMetaPublisher(client *redis.Client) *MetaPublisher {
 	}
 }
 
-// Start begins subscribing to keyspace notifications
+// Start begins subscribing to keyspace notifications.
+//
+// The stream is NOT truncated on startup — the SSE wire contract requires
+// Last-Event-ID resumption to survive a meta-core restart, which means
+// entries must persist across restart. Growth is bounded instead by
+// MAXLEN ~ MetaEventsMaxLen on every XAdd (see publishEvent).
 func (p *MetaPublisher) Start() error {
 	p.mu.Lock()
 	if p.running {
@@ -46,16 +57,6 @@ func (p *MetaPublisher) Start() error {
 	}
 	p.running = true
 	p.mu.Unlock()
-
-	// Clear the stream on startup - consumers will re-bootstrap from Redis keys
-	// This ensures the stream only contains events from the current session
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := p.client.Del(ctx, MetaEventsStream).Err(); err != nil {
-		log.Printf("[MetaPublisher] Warning: failed to clear stream on startup: %v", err)
-	} else {
-		log.Printf("[MetaPublisher] Cleared %s stream for fresh start", MetaEventsStream)
-	}
 
 	p.wg.Add(1)
 	go p.subscribeLoop()
@@ -133,9 +134,13 @@ func (p *MetaPublisher) publishEvent(channel, operation string) {
 		"ts":   fmt.Sprintf("%d", time.Now().UnixMilli()),
 	}
 
-	// Add to stream (no MaxLen - stream is cleared on meta-core restart)
+	// Approximate MAXLEN trim keeps the stream bounded across restarts
+	// (see Start). Cap is intentionally generous; most consumers reconnect
+	// well within retention.
 	_, err := p.client.XAdd(p.ctx, &redis.XAddArgs{
 		Stream: MetaEventsStream,
+		MaxLen: MetaEventsMaxLen,
+		Approx: true,
 		Values: fields,
 	}).Result()
 
@@ -154,6 +159,8 @@ func (p *MetaPublisher) publishEventDirect(operation, key string) {
 
 	_, err := p.client.XAdd(p.ctx, &redis.XAddArgs{
 		Stream: MetaEventsStream,
+		MaxLen: MetaEventsMaxLen,
+		Approx: true,
 		Values: fields,
 	}).Result()
 

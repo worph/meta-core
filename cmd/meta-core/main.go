@@ -51,6 +51,15 @@ func main() {
 	}
 	log.Println("[meta-core] Connected to Redis")
 
+	// Schema-version sentinel: alpha clean-wipe gate. Refuses to boot when
+	// the existing Redis store predates the UUID-rooted schema, so legacy
+	// data can't silently leak into the new code paths. See
+	// docs/uuid-rooted-metadata.md.
+	if err := storageClient.EnsureSchemaVersion(storage.SchemaVersion); err != nil {
+		log.Fatalf("[meta-core] %v", err)
+	}
+	log.Printf("[meta-core] Redis schema version OK (v%d)", storage.SchemaVersion)
+
 	// Create and start service discovery
 	disc := discovery.NewService(cfg)
 	if err := disc.Start(); err != nil {

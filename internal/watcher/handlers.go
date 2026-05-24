@@ -33,8 +33,16 @@ func (h *Handlers) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/scan/status", h.handleScanStatusDeprecated).Methods("GET")
 }
 
-// handlePoll handles GET /api/events/poll
+// handlePoll handles GET /api/events/poll.
+//
+// DEPRECATED. The long-poll variant over file:events has been superseded by
+// the SSE endpoint at /api/events/files. New consumers should use SSE. This
+// handler stays for one release with a Deprecation header before removal —
+// see docs/api-mediated-access.md PR A scope.
 func (h *Handlers) handlePoll(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Deprecation", "true")
+	w.Header().Set("Link", `</api/events/files>; rel="successor-version"`)
+	w.Header().Set("Sunset", "after next release")
 	// Get since parameter
 	sinceStr := r.URL.Query().Get("since")
 	sinceMS := int64(0)

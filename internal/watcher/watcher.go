@@ -36,20 +36,60 @@ func (w *Watcher) SetStorageClient(s *storage.Client) {
 
 // writeFileTuple persists path/size/mtime/midhash for a freshly-hashed file.
 // Caller already has all four values from its existing os.Stat / FileInfo —
-// no extra IO is performed here beyond the Redis write itself.
+// no extra IO is performed here beyond the Redis writes themselves.
 //
-// This is the inverse-index that lets a fresh meta-core boot skip
-// re-mid-hashing files whose (path, size, mtime) match what's in Redis.
+// Flow (see docs/uuid-rooted-metadata.md):
+//   - Look up the midhash in the reverse index (cid:midhash256:… → uuid)
+//   - If unknown, Mint a fresh UUID root and write the midhash256 field
+//     (the SetProperty hook auto-registers the alias)
+//   - If known, this is a duplicate physical file for the same content —
+//     record the new path in the duplicates set and refresh size/mtime
+//
+// This is also the inverse-index that lets a fresh meta-core boot skip
+// re-mid-hashing files whose (path, size, mtime) match what's in Redis,
+// via HydrateStateFromStorage below.
 func (w *Watcher) writeFileTuple(absPath string, size, mtimeNano int64, midhash string) {
 	if w.storage == nil || midhash == "" {
 		return
 	}
-	if _, err := w.storage.MergeMetadataFlat(midhash, map[string]string{
-		"filePath":  absPath,
+	token := "midhash256:" + midhash
+
+	uuid, err := w.storage.GetByCID(token)
+	if err != nil {
+		log.Printf("[Watcher] GetByCID(%s): %v", token, err)
+		return
+	}
+
+	if uuid == "" {
+		// New content. Mint sets filePath/sizeByte/mtimeNano; SetProperty
+		// then writes midhash256 — and the cid_resolution.go hook on
+		// SetProperty registers the reverse-index alias for us.
+		uuid, err = w.storage.Mint(absPath, size, mtimeNano)
+		if err != nil {
+			log.Printf("[Watcher] Mint(%s): %v", absPath, err)
+			return
+		}
+		if err := w.storage.SetProperty(uuid, "midhash256", midhash); err != nil {
+			log.Printf("[Watcher] SetProperty midhash256 for %s: %v", uuid, err)
+		}
+		return
+	}
+
+	// Known content. If this is a new physical path for the same content,
+	// record it as a duplicate. Otherwise refresh size/mtime — same content,
+	// same path, but the file may have been rewritten with a fresh mtime.
+	existing, _ := w.storage.GetProperty(uuid, "filePath")
+	if existing != absPath {
+		if _, err := w.storage.AddDuplicatePath(uuid, absPath); err != nil {
+			log.Printf("[Watcher] AddDuplicatePath %s @ %s: %v", uuid, absPath, err)
+		}
+		return
+	}
+	if _, err := w.storage.MergeMetadataFlat(uuid, map[string]string{
 		"sizeByte":  strconv.FormatInt(size, 10),
 		"mtimeNano": strconv.FormatInt(mtimeNano, 10),
 	}); err != nil {
-		log.Printf("[Watcher] failed to write tuple for %s: %v", midhash, err)
+		log.Printf("[Watcher] refresh tuple for %s: %v", uuid, err)
 	}
 }
 
@@ -319,7 +359,7 @@ func (w *Watcher) HydrateStateFromStorage(roots []WatcherRoot) (loaded, skipped 
 				ws.Set(rel, &FileState{
 					Size:      t.Size,
 					MtimeNano: t.MtimeNano,
-					MidHash:   t.HashID,
+					MidHash:   t.MidHash256,
 				})
 				loaded++
 				matched = true

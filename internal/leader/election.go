@@ -75,7 +75,11 @@ func (p *LeaderInfoProvider) buildLeaderInfo() *LeaderLockInfo {
 		Hostname:          hostname,
 		BaseUrl:           baseUrl,
 		ApiUrl:            fmt.Sprintf("http://%s:%d", ip, p.config.HTTPPort),
-		RedisUrl:          fmt.Sprintf("redis://%s:%d", ip, p.config.RedisPort),
+		// RedisUrl deliberately empty — api-mediated-access PR D removes
+		// direct Redis exposure. Consumers route metadata I/O through
+		// meta-core's HTTP API (/meta/{hash}*) and event streams through
+		// SSE (/api/events/{files,meta}).
+		RedisUrl:          "",
 		WebdavUrl:         webdavUrl,
 		WebdavUrlInternal: webdavUrlInternal,
 		Timestamp:         time.Now().UnixMilli(),
