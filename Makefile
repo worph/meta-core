@@ -64,10 +64,24 @@ clean:
 	rm -f coverage.out coverage.html
 
 # Build Docker image
+#
+# We tag THREE names:
+#   - meta-core:$(VERSION) — the canonical versioned tag
+#   - meta-core:latest     — convenience for `docker run meta-core`
+#   - meta-core:local      — the tag every sub-stack docker-compose.yml uses
+#                            (meta-share federation, meta-gateway dev stacks).
+#                            Without this, `make docker` produces an image
+#                            the dev stacks can't see by name, and previously
+#                            -tagged stale `:local` images linger, silently
+#                            breaking downstream API fields (e.g. /urls
+#                            missing webdavUrlInternal → meta-gateway's
+#                            poster auto-store fails). See README.md →
+#                            Quick start → Build for the audit recipe.
 docker:
 	@echo "Building Docker image..."
 	docker build -t $(DOCKER_IMAGE):$(VERSION) .
 	docker tag $(DOCKER_IMAGE):$(VERSION) $(DOCKER_IMAGE):latest
+	docker tag $(DOCKER_IMAGE):$(VERSION) $(DOCKER_IMAGE):local
 
 # Run locally (for development)
 run: build

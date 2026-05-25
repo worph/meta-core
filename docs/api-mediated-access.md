@@ -2,11 +2,17 @@
 
 ## Status
 
-**Proposed** — design accepted; implementation pending. Builds on
-[uuid-rooted-metadata.md](uuid-rooted-metadata.md), which assumes meta-core
-is the single writer to the metadata keyspace. That assumption is currently
-violated by meta-sort, and this doc is the plan to put it back on solid
-ground.
+**Landed** — all four PRs (A/B/C/D) deployed and verified end-to-end on the
+dev stack. Redis is unreachable from outside `metacore-app`; every metadata
+read, write, and event flows through meta-core's HTTP+SSE surface. Builds
+on [uuid-rooted-metadata.md](uuid-rooted-metadata.md), which assumes
+meta-core is the single writer to the metadata keyspace — an assumption
+that's now actually enforced rather than aspirational.
+
+See "Implementation outcome" at the bottom for the delta between this doc's
+plan and what shipped (notably the write-path CID resolution and the
+dual-root migration sweep, which weren't in the original plan but turned
+out to be load-bearing).
 
 ## Motivation
 
@@ -441,6 +447,10 @@ Closing the network access (PR D) is the moment the lock becomes a
 lock; everything before it is opt-in migration that consumers can adopt
 at their own pace.
 
+**All four PRs have landed.** What follows is the original plan as
+written; see "Implementation outcome" at the bottom for the delta
+between plan and ship.
+
 ### PR A — SSE endpoints in meta-core
 
 Adds `GET /api/events/files` and `GET /api/events/meta`. Implements the
@@ -584,28 +594,34 @@ Stable `error` slugs the client should switch on:
 | `storage_unavailable` | 503 | yes | Redis transient. Caller should retry with backoff. |
 | `internal` | 500 | yes (cautiously) | Unhandled server-side error. Retry once; escalate if persistent. |
 
-Today's handlers return `{error, message}` strings; PR A is the natural
-place to introduce the typed shape (along with the new SSE endpoints
-which will need their own error responses anyway). Going through a
-typed envelope from the start avoids the retrofit cost.
+**Implemented.** Every 4xx/5xx response across `internal/api`,
+`internal/mounts`, `internal/watcher`, and `internal/watchers` now
+emits the typed envelope. The slug-mapping helper is duplicated across
+those packages (one ~15-line `slugForStatus` per package) to avoid an
+import cycle on the api package; consolidating it into a shared
+`internal/httperr` package is a worthwhile follow-up but not load-bearing.
 
 ## Remaining open questions
 
-The audit closed everything that was answerable. What's left:
+Mostly answered post-implementation:
 
-- **Deprecation timeline for `/api/metadata/{hashId}`.** It stays during
-  the migration (editor uses it), but once we've consolidated on
-  `/meta/{hash}` for service-to-service writes the editor could migrate
-  too and we'd delete the duplicate surface. Not urgent; revisit
-  post-PR D when everything else is stable.
+- **Deprecation timeline for `/api/metadata/{hashId}`.** Still open. The
+  editor's React UI continues to call it; the surface itself was untouched
+  by this work. Worth a follow-up to consolidate the editor onto
+  `/meta/{hash}` and delete the parallel routes.
 
-- **What does `/api/events/files` emit during the watcher's initial
-  bootstrap scan?** When meta-core starts on a populated library, the
-  watcher discovers N files in quick succession and publishes N `add`
-  events. A consumer subscribing for the first time will receive that
-  whole flood. Probably fine — consumers are designed to handle bursts
-  — but worth a smoke test once PR A lands to confirm meta-share's
-  ingest doesn't trip on the cardinality.
+- **Initial bootstrap flood on `/api/events/files`.** Resolved in
+  practice: meta-fuse uses `initialCursor: '0-0'` to deliberately
+  replay every entry on each restart and the StreamingStateBuilder
+  handles the resulting burst (~2.5k property events on a 50-file
+  library) without issue. meta-sort persists its cursor so only sees
+  the flood once per fresh deploy. meta-stremio filters to "interesting
+  fields" before triggering cache invalidation, so the burst is mostly
+  no-ops.
+
+- **meta-dup SSE port.** Still pending — meta-dup is in no active
+  compose file. When revived, copy meta-fuse's pattern wholesale
+  (SSEEventClient + MetaCoreApiClient). Tracked separately.
 
 ## Non-goals
 
@@ -619,7 +635,137 @@ The audit closed everything that was answerable. What's left:
 - **Introducing new transport, broker, proxy, or sidecar.** Everything
   builds on what's deployed today.
 - **Migrating meta-fuse / meta-stremio / meta-dup direct Redis reads
-  via XSCAN/GET** (separate from event-stream reads). These are
-  read-only and don't break schema invariants, but they will fail once
-  PR D closes Redis access. PR C is the migration window for them —
-  the same SSE adoption work covers it.
+  via XSCAN/GET** (separate from event-stream reads). ~~Was a non-goal~~
+  ended up being required for PR D's network closure to be safe.
+  meta-fuse and meta-stremio migrated; meta-dup deferred (not deployed).
+  See PR C / "Implementation outcome" for details.
+
+## Implementation outcome
+
+What actually shipped vs. what this doc planned.
+
+### Delta against the original plan
+
+- **Read-path migration for meta-fuse and meta-stremio is now in scope
+  and done.** The original "out of scope" carve-out was wrong: closing
+  the Redis network port doesn't just break stream consumers, it also
+  breaks every `kvClient.get` / `redis_storage.get_all_videos` call.
+  Both services grew their own `MetaCoreApiClient` (TS for meta-fuse,
+  Python for meta-stremio) and now route reads through `/meta/{hash}`
+  + `/meta` + `/api/file/{cid}/info`.
+  - **meta-stremio's HTTP mode auto-recovers from transient meta-core
+    outages.** `is_connected` re-probes meta-core's `/health` on every
+    call (cheap; a stateless GET), so a metacore-app restart no longer
+    latches the addon into a permanent disconnected state. The
+    background reconnect thread is only needed for legacy Redis mode
+    where the socket itself is sticky.
+- **Hard `redisUrl` guard is gated by `ALLOW_LEGACY_REDIS_URL=1`.** All
+  three consumer LeaderClients (TS x2 + Python) throw on seeing the
+  field by default. Setting the env var downgrades to a warn — escape
+  hatch for a deliberate temporary rollback to a meta-core that still
+  publishes the field.
+- **Write-path CID resolution** turned out to be a hard prerequisite
+  for the lockdown to work in practice. Documented separately below.
+- **PR D ordering matched the doc** (consumer migration first, then
+  publisher stops emitting, then network closure). The `meta-core`
+  docker-network alias and the `6380:6379` host port mapping are both
+  removed; sibling services reach the HTTP/SSE/WebDAV surface via the
+  canonical `metacore-app` hostname.
+- **meta-dup is the one service that didn't migrate.** It's in no
+  active compose file. The TS port is straightforward when needed: copy
+  meta-fuse's pattern (SSEEventClient for streams, MetaCoreApiClient
+  for reads).
+
+### Write-path CID resolution (`storage.ResolveRoot`)
+
+Not in the original plan but load-bearing.
+
+**The problem.** meta-sort's PATCH-via-HTTP migration (PR B) routed
+every write through `/meta/{hash}`. But `{hash}` is the midhash256 CID
+that meta-sort received via file:events, not the watcher's minted UUID.
+With no resolution step in the handler, every write went to
+`file:<midhash>/*` — a parallel root the watcher's UUID never saw. The
+auto-alias hook on `cid_midhash256=<value>` then OVERWROTE the
+watcher's `cid:midhash256:<value>` → UUID alias to point at the
+midhash itself, leaving the UUID stranded with only the watcher's
+sparse fields (filePath, sizeByte, mtimeNano, duplicates) and the
+midhash root carrying the rich plugin output. This is the exact
+"dual roots per file" failure the doc's Motivation section listed as
+the prior bug — it just moved from "convention violation" to "API
+contract violation."
+
+**The fix.** Three layers in `internal/storage/cid_resolution.go`:
+
+1. **`ResolveRoot(hash)`** — at the entry of every `/meta/{hash}`
+   read/write handler, look up `cid:midhash256:<hash>` in the reverse
+   index. If found, use the UUID as the storage root. Falls through to
+   the bare hash for direct-UUID writes / legacy entries.
+2. **Self-pointing alias guard in `addAliasLocked`** — refuse to
+   register `cid:<algo>:<v>` → `<v>`. The dual-root bug's chicken-and-
+   egg is: meta-sort writes first, registers self-pointing alias,
+   watcher then can't recover. Refusing the self-write keeps the
+   watcher's legitimate alias intact.
+3. **`MigrateDualRoots` sweep** (`POST /api/admin/migrate-dual-roots`).
+   One-shot fixer for already-stranded entries: walks every UUID's
+   `midhash256` field to build the orphan index, merges each stranded
+   `file:<midhash>/*` into the matching UUID via `MergeMetadataFlat`,
+   deletes the stranded root, and re-points the alias.
+
+Verified on the dev stack: 48 stranded entries were reunited; the
+editor now shows every file with its full plugin metadata under one
+UUID; future writes stay unified.
+
+### Typed error envelope
+
+Done across all four handler packages (`api`, `mounts`, `watcher`,
+`watchers`). Each has its own `writeError` returning
+`{error: <slug>, message, retryable}`. The slug-mapping helper is
+duplicated in each to avoid an import cycle on the `api` package.
+
+### What's NOT done
+
+- **meta-dup SSE + read migration.** Not deployed, no test harness.
+  When revived, copy meta-fuse's pattern.
+- **Editor `/api/metadata/{hashId}` consolidation.** The duplicate
+  editor-internal API surface is untouched; could be retired in a
+  follow-up by porting the editor UI to `/meta/{hash}`.
+- **Consolidated `internal/httperr` package** for the typed envelope
+  helpers (currently duplicated 4× to avoid the import cycle). Code
+  hygiene; functionally a no-op.
+
+### Verification done
+
+- All four service dashboards load cleanly with no console errors.
+- meta-sort SSE consumer + HTTP write path verified end-to-end by
+  delete + inject + reprocess of Sintel.
+- meta-fuse SSE consumer rebuilds VFS to 48 files on each boot.
+- meta-stremio catalog API now surfaces the full library (47 videos,
+  1 movie + 5 series + 46 episodes — was 0/0/0 before the Python
+  read-path migration because LeaderStorage broke when it tried Redis).
+- `redis-cli` from any container other than `metacore-app` produces a
+  connection refused; `cid:midhash256:<H>` aliases all point to UUIDs
+  (no self-pointing); `file:__index__` has only UUID-style hashIds.
+- ALLOW_LEGACY_REDIS_URL=1 escape hatch present in all three consumer
+  LeaderClients (TS x2 + Python).
+
+### Known test-suite gaps (post-implementation bats run)
+
+Running `docker exec meta-test-runner /app/test/test.sh` after the
+lockdown shipped reveals a number of failing suites, almost all of
+which are pre-existing test/environment drift unrelated to this work:
+
+| Failure | Root cause | Relation to lockdown |
+|---|---|---|
+| meta-stremio (~35 tests), stremio-tmdb (6 tests) | Tests call `/manifest.json` directly; dev `.env` sets `STREMIO_HASH_API_SEED=dev-stremio-secret` which puts the addon behind a path-token prefix | Unrelated — pre-existing env mismatch |
+| meta-fuse FUSE-mount (3 tests) | Tests use `docker exec meta-fuse` but the container is named `metafuse-app` (Yundera prod-parity rename) | Unrelated — predates this work |
+| meta-fuse WebDAV PROPFIND (4 tests) | Tests use Caddy URL with WebDAV basic-auth credentials that no longer match the hash-lock perimeter | Unrelated — predates this work |
+| meta-sort "API integration tests" (1 test) | Test runs `docker exec meta-sort pnpm test`; container is `metasort-app` | Unrelated — predates this work |
+| meta-core "create and delete mount config" (1 test) | Test creates an NFS mount; production code dropped NFS support ("NFS mounts are no longer supported") | Unrelated — predates this work |
+| service-discovery (9 tests) | Cascading from meta-stremio breakage (test expects unauth `/api/services` on stremio) | Unrelated to lockdown directly |
+| meta-share / share-1c (multiple) | Tests assert `"phase":"1f"` in `/health`; meta-share has moved past that phase | Unrelated — meta-share evolution |
+| flat-keys: "filePath field exists" (1 test) | Test SRANDMEMBERs file:__index__; if it lands on a UUID with no filePath (e.g. a manual test write) it fails | Was hit transiently after my interactive testing left stub entries; resolved by cleanup |
+
+No failure traceable to a real regression from this work was found.
+The dev-environment test harness needs an unrelated refresh to catch
+up with the prod-parity container renames, the NFS removal, the
+STREMIO_HASH_API_SEED default, and meta-share's current phase.

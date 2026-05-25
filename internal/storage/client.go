@@ -347,33 +347,40 @@ func (c *Client) CountFiles() (int, error) {
 	return len(hashIDs), nil
 }
 
-// LookupPathByCID resolves a CID to its file path on disk.
+// LookupPathByCID resolves a CID to its file path on disk via the reverse
+// index. O(1) lookup followed by a single GET of file:<uuid>/filePath.
 //
-// Primary path: the reverse index (cid:<token> → uuid). O(1) lookup followed
-// by a single GET of file:<uuid>/filePath.
+// Accepts both prefixed tokens ("midhash256:bafk…", "sha256:…",
+// "ipfs:bafy…") and bare midhash256 CIDs — the bare form is what the
+// editor passes to /api/file/{cid}/info because that's how plugins
+// write the value (e.g. `backdrop=<bare-cid>`). For bare tokens we
+// try the midhash256 prefix as a fallback.
 //
-// Fallback path: poster/backdrop CIDs aren't registered as aliases (they
-// refer to sidecar images, not the main file content), so unknown tokens
-// fall through to a scan of poster/backdrop fields. O(n) but rare in
-// practice — sidecar lookups are infrequent compared to file CID lookups.
-//
-// Accepts CID tokens in prefixed form ("midhash256:bafk…", "sha256:…",
-// "ipfs:bafy…"). Bare CIDs without an algorithm prefix won't resolve via
-// the reverse index — callers should pass the prefixed form.
+// Plugin output (TMDB posters/backdrops, extracted subtitles, etc.) is
+// resolved through this same path: the plugin output directory is a
+// watcher root (see config.DefaultWatcherPaths), so every plugin
+// artefact gets a midhash256 alias and resolves through the reverse
+// index like any other file. There is no path-companion sidecar field.
 func (c *Client) LookupPathByCID(token string) (string, error) {
 	uuid, err := c.GetByCID(token)
 	if err != nil {
 		return "", err
 	}
-	if uuid != "" {
-		fp, err := c.GetProperty(uuid, "filePath")
+	if uuid == "" && !strings.Contains(token, ":") {
+		// Bare CID — most likely a midhash256 written by a plugin.
+		uuid, err = c.GetByCID("midhash256:" + token)
 		if err != nil {
 			return "", err
 		}
-		return normalizeFilesRelativePath(fp), nil
 	}
-	// Not a file alias — try poster/backdrop sidecars.
-	return c.lookupSidecarPathByCID(token)
+	if uuid == "" {
+		return "", nil
+	}
+	fp, err := c.GetProperty(uuid, "filePath")
+	if err != nil {
+		return "", err
+	}
+	return normalizeFilesRelativePath(fp), nil
 }
 
 // normalizeFilesRelativePath strips a leading "/files/" prefix so handlers can

@@ -1,520 +1,374 @@
 # meta-core
 
-A Go-based sidecar binary that provides unified leader election, Redis management, and HTTP API for MetaMesh services.
+Standalone Go service that owns Redis, the leader-info file, the HTTP+SSE
+metadata surface, and a WebDAV file server for the MetaMesh dev/prod stack.
 
 ## Overview
 
-meta-core runs alongside each MetaMesh service (meta-sort, meta-fuse, meta-stremio) as a sidecar process managed by supervisord. It provides the foundational infrastructure that enables MetaMesh's distributed architecture without requiring external coordination services like etcd or Consul.
+meta-core runs as its own container (`metacore-app`). Other MetaMesh services
+(meta-sort, meta-fuse, meta-stremio, meta-dup, meta-share) discover it by
+reading `/meta-core/locks/kv-leader.info` and then call its HTTP API. Redis
+is not exposed outside the container — all metadata I/O is mediated by the
+HTTP API.
 
-### Key Capabilities
+### Key capabilities
 
 | Feature | Description |
 |---------|-------------|
-| **Leader Election** | flock-based leader election (Go binary only runs as leader) |
-| **Redis Management** | Leader spawns Redis with AOF+RDB persistence, auto-restart on crash |
-| **HTTP API** | Language-agnostic REST interface for metadata and service discovery |
-| **Service Discovery** | File-based registry with heartbeats and stale detection |
-| **Metadata Storage** | Flat key-value schema with connection pooling and batch operations |
-| **File Watching** | Directory scanning, MidHash256 computation, event dispatch |
-| **Mount Management** | SMB/rclone configuration, health monitoring |
-| **WebDAV Server** | File access with nginx proxy_cache |
-| **Event Publishing** | Redis keyspace notifications to meta:events stream |
+| **Leader gate** | Bash `flock` loop in `docker/leader-election.sh` only `exec`s supervisord on the winner. The Go binary therefore only ever runs as leader. |
+| **Redis owner** | Supervisord starts Redis with AOF + RDB persistence inside the container; meta-core connects to it on localhost. |
+| **HTTP API** | Typed REST surface (gorilla/mux) for metadata, KV browsing, snapshots, schema inference, mounts, watchers, services, and file access by CID. |
+| **SSE event streams** | `/api/events/files` and `/api/events/meta` mirror the underlying Redis Streams so external services never speak Redis. |
+| **WebDAV server** | `/webdav/*` exposes the `/files` volume (read+write) for cross-service file access. nginx in front of meta-core handles caching. |
+| **Service discovery** | File-based registry under `/meta-core/services/*.json` with heartbeat + dead-service cleanup. |
+| **File watcher / scanner** | Recursive scan + MidHash256 computation; emits events on `file:events`. |
+| **Mount management** | rclone-only mount manager (SMB rendered into `:smb:`, plus pre-defined remotes). Read-only by construction. |
+| **UUID-rooted storage** | Roots are UUIDv7 (Crockford Base32, ULID layout); CIDs are reverse-index aliases. Schema-version sentinel refuses to boot against stale data. |
 
-### Design Characteristics
+### Design characteristics
 
-- **No external dependencies** - Uses filesystem locks (works on NFS/CIFS shared volumes)
-- **Automatic failover** - Lock releases on process death, followers detect and re-elect
-- **Thread-safe** - RWMutex protection on all shared state
-- **Graceful shutdown** - Signal handling with reverse startup order
-- **Static binary** - CGO disabled, single binary deployment
+- **Single-leader** — flock on a shared volume; no external consensus.
+- **HTTP-only externally** — Redis is bound to the container, never published.
+- **Schema-gated boot** — `EnsureSchemaVersion` aborts startup when the
+  on-disk Redis layout predates the current build (alpha clean-wipe policy;
+  see `docs/uuid-rooted-metadata.md`).
+- **Static binary** — CGO disabled, single Go binary plus a thin Alpine
+  image with `redis-server`, `rclone`, nginx, and supervisord.
 
 ## Architecture
 
-meta-core runs as a **standalone container** that other services connect to via HTTP API:
-
 ```
-┌───────────────────────────────────────────────────────────────────────┐
-│                    meta-core container (standalone)                    │
-│                                                                        │
-│  ┌──────────────┐  ┌─────────┐  ┌──────────┐  ┌────────────────────┐  │
-│  │ Role         │  │ Redis   │  │ WebDAV   │  │ HTTP API (:9000)   │  │
-│  │ Provider     │  │ Server  │  │ Server   │  │ /meta, /urls,      │  │
-│  │              │  │         │  │          │  │ /health, /services │  │
-│  └──────────────┘  └─────────┘  └──────────┘  └────────────────────┘  │
-│                                                                        │
-│  Writes: /meta-core/locks/kv-leader.info (URLs for all services)      │
-└──────────────────────────────────────────────┬────────────────────────┘
-                                               │
-        ┌──────────────────────────────────────┴──────────────────────────┐
-        │                    /meta-core (shared volume)                    │
-        │  ├── locks/kv-leader.info  (leader URLs)                        │
-        │  ├── db/redis/             (Redis data)                         │
-        │  ├── services/             (hostname-based .json)               │
-        │  └── mounts/               (mount configurations)               │
-        └─────────────────────────────────────────────────────────────────┘
-                 ▲                    ▲                    ▲
-    ┌────────────┘                    │                    └────────────┐
-    │                                 │                                 │
-┌───────────────┐          ┌───────────────┐          ┌───────────────┐
-│  meta-sort    │          │  meta-fuse    │          │ meta-stremio  │
-│  (reads info, │          │  (reads info, │          │  (reads info, │
-│  calls HTTP)  │          │  calls HTTP)  │          │  calls HTTP)  │
-└───────────────┘          └───────────────┘          └───────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                    metacore-app  (standalone container)                  │
+│                                                                          │
+│  supervisord                                                             │
+│   ├─ leader-election.sh  (flock /meta-core/locks/kv-leader.lock,         │
+│   │                       writes kv-leader.info, exec supervisord)      │
+│   ├─ redis-server        (AOF + RDB on /meta-core/db/redis)              │
+│   ├─ nginx               (TLS termination, proxy_cache for /webdav)      │
+│   ├─ rclone rcd          (mount daemon, RC API)                          │
+│   ├─ mount-watcher.sh    (rclone mount lifecycle)                        │
+│   └─ meta-core (Go)      ─►  HTTP API + SSE + WebDAV on :9000            │
+└──────────────────────────────────────────────────────────────────────────┘
+                                       │
+                ┌──────────────────────┴──────────────────────┐
+                │  /meta-core (shared volume)                 │
+                │   locks/kv-leader.{lock,info}               │
+                │   db/redis/                                 │
+                │   services/*.json                           │
+                │   mounts/{mounts.json, errors/}             │
+                │   watchers.json                             │
+                │   cache/ (nginx proxy_cache)                │
+                └─────────────────────────────────────────────┘
+                                       ▲
+        ┌──────────────────────────────┼────────────────────────────────┐
+        │                              │                                │
+┌─────────────┐               ┌─────────────┐                ┌─────────────┐
+│  meta-sort  │               │  meta-fuse  │                │ meta-stremio│
+│             │               │             │                │             │
+│  reads      │  HTTP+SSE     │  reads      │  HTTP+SSE      │  reads      │
+│  leader.info├──────────────►│  leader.info├───────────────►│  leader.info│
+└─────────────┘               └─────────────┘                └─────────────┘
 ```
 
-## Quick Start
+## Quick start
 
 ### Build
 
 ```bash
-# Build binary
-make build
-
-# Build Docker image
-make docker
-
-# Run tests
-make test
+make build           # build static binary to bin/meta-core
+make docker          # build container image as meta-core:1.0.0 + :latest + :local
+make test            # run Go unit tests
 ```
 
-### Run
+`make docker` tags the image as `:1.0.0`, `:latest`, **and** `:local`. The
+`:local` tag is the one every sub-stack docker-compose.yml references
+(meta-share 10-peer federation, meta-gateway dev stacks); without it the
+sub-stacks can't see a freshly-built image by name.
+
+> **Source-change → recreate.** `make docker` rebuilds and re-tags the
+> image, but **already-running containers stay on the old image SHA** —
+> `docker compose up -d` won't recreate them unless the compose file
+> itself changed. After a meta-core source change, force-recreate the
+> downstream containers so they pick up the new binary:
+>
+> ```bash
+> make docker
+> docker compose -f packages/meta-gateway/dev/docker-compose.yml \
+>   up -d --force-recreate metagateway-generic-core
+> docker compose -f packages/meta-gateway/dev/docker-compose.torznab.yml \
+>   up -d --force-recreate metagateway-torznab-core
+> docker compose -f packages/meta-share/dev/docker-compose.yml \
+>   --profile share-10node up -d --force-recreate metashare-core metashare-core-test
+> ```
+>
+> The symptom of a missed recreate is missing API fields on `/urls`
+> (e.g. `webdavUrlInternal` absent → meta-gateway's
+> `store_poster_for_record` silently fails and torznab posters never
+> land). Audit recipe:
+>
+> ```bash
+> docker inspect meta-core:local --format '{{.Id}}'                # fresh SHA
+> docker ps --filter ancestor=meta-core:local --format '{{.Names}}'
+> # any container whose Image SHA doesn't match the fresh SHA needs --force-recreate.
+> ```
+
+### Dev container
+
+In the MetaMesh dev stack, the container is brought up by `dev/docker-compose.yml`:
 
 ```bash
-# With environment variables
-META_CORE_PATH=/meta-core \
-FILES_PATH=/files \
-SERVICE_NAME=meta-sort \
-META_CORE_HTTP_PORT=9000 \
-./bin/meta-core
+cd dev && ./scripts/start.sh
 ```
 
-### Docker
-
-```bash
-docker build -t meta-core .
-docker run -v meta-core:/meta-core -v files:/files meta-core
-```
+The user-facing URL is `https://metacore-dev.localhost:8083`; the direct-backend
+HTTP port (no auth, bypasses Caddy) is `http://localhost:18083`.
 
 ## Configuration
 
-| Environment Variable | Default | Description |
-|---------------------|---------|-------------|
-| `META_CORE_PATH` | `/meta-core` | Shared volume for locks/db |
-| `FILES_PATH` | `/files` | Shared volume for media files |
-| `SERVICE_NAME` | `meta-core` | Service identifier |
-| `SERVICE_VERSION` | `1.0.0` | Service version |
-| `API_PORT` | `8180` | Main service HTTP port |
-| `BASE_URL` | - | Stable service URL |
-| `REDIS_PORT` | `6379` | Redis port (leader only) |
-| `META_CORE_HTTP_PORT` | `9000` | HTTP API port |
-| `META_CORE_HTTP_HOST` | `127.0.0.1` | HTTP API bind address |
-| `HEALTH_CHECK_INTERVAL_MS` | `5000` | Health check interval |
-| `HEARTBEAT_INTERVAL_MS` | `30000` | Service heartbeat interval |
-| `STALE_THRESHOLD_MS` | `60000` | Stale service threshold |
-| `ENABLE_FILE_WATCHER` | `true` | Enable file scanning |
+Environment variables consumed by `internal/config/config.go`:
 
-## API Reference
+| Variable | Default | Description |
+|---|---|---|
+| `META_CORE_PATH` | `/meta-core` | Shared volume root (locks, db, services, mounts, cache). |
+| `FILES_PATH` | `/files` | Files volume root. |
+| `SERVICE_NAME` | `meta-core` | Identity in the service registry. |
+| `SERVICE_VERSION` | `1.0.0` | Reported via `/status` and registry. |
+| `API_PORT` | `8180` | External port baked into the leader-info `baseUrl`. |
+| `BASE_URL` | _empty_ | Overrides the constructed `baseUrl` if set (used for HTTPS perimeter). |
+| `REDIS_PORT` | `6379` | Local Redis port. |
+| `META_CORE_HTTP_PORT` | `9000` | Go HTTP+SSE+WebDAV port. |
+| `META_CORE_HTTP_HOST` | `127.0.0.1` | HTTP bind. |
+| `HEALTH_CHECK_INTERVAL_MS` | `5000` | Internal health-loop cadence. |
+| `HEARTBEAT_INTERVAL_MS` | `30000` | Service registry heartbeat. |
+| `STALE_THRESHOLD_MS` | `60000` | Age past which a registry entry is marked stale. |
+| `CLEANUP_INTERVAL_MS` | `600000` | Dead-service cleaner cadence. |
+| `DEAD_SERVICE_THRESHOLD_MS` | `600000` | Age past which a stale entry is deleted. |
+| `WATCH_INTERVAL_MS` | `1000` | Watcher poll cadence. |
+| `DEBOUNCE_MS` | `30000` | File-event debounce window. |
+| `ENABLE_FILE_WATCHER` | `true` | Disable to suppress the in-process watcher entirely. |
 
-### Health & Status
+Note: there is no `META_CORE_REDIS_PORT`, no `META_CORE_SERVICE_NAME`, and
+no `META_CORE_LEADER_TIMEOUT`. The Redis URL is discovered locally; service
+identity uses `SERVICE_NAME`; leader timeout is governed by the bash flock
+retry interval (`ELECTION_RETRY_SECS`, default `5`).
 
-```bash
-# Health check
-curl http://localhost:9000/health
-# {"status":"ok","redis":true,"timestamp":"..."}
+## API reference
 
-# Detailed status
-curl http://localhost:9000/status
-# {"status":"ok","serviceName":"meta-core","version":"1.0.0",...}
+All endpoints below are served by `internal/api/server.go`. Examples assume
+the in-container Go port `:9000`; from the host use
+`https://metacore-dev.localhost:8083` (Caddy) or `http://localhost:18083`
+(debug-direct).
 
-# Current leader
-curl http://localhost:9000/leader
-# {"host":"meta-sort-dev","api":"redis://10.0.1.50:6379","http":"http://10.0.1.50:8180",...}
-```
-
-### Metadata Operations
-
-```bash
-# List all file hashes
-curl http://localhost:9000/meta
-# {"hashIds":["midhash256:abc123",...],"count":42}
-
-# Get metadata for a file
-curl http://localhost:9000/meta/{hash}
-# {"hashId":"midhash256:abc123","metadata":{"title":"Movie","year":"2024",...}}
-
-# Update metadata
-curl -X PUT http://localhost:9000/meta/{hash} \
-  -H "Content-Type: application/json" \
-  -d '{"title":"New Title"}'
-
-# Delete metadata
-curl -X DELETE http://localhost:9000/meta/{hash}
-```
-
-### Data Operations
+### Health, leader, URLs
 
 ```bash
-# Get file path
-curl http://localhost:9000/data/{hash}/path
-# {"hashId":"midhash256:abc123","path":"/files/movies/Movie.mkv","exists":true}
-
-# Check if file exists
-curl -I http://localhost:9000/data/{hash}
-# HTTP/1.1 200 OK (or 404)
+GET  /health           # storage + role
+GET  /status           # version, uptime, etc.
+GET  /leader           # current leader info (hostname, PID, timestamps)
+GET  /urls             # baseUrl, apiUrl, webdavUrl, webdavUrlInternal (redisUrl is intentionally empty)
+GET  /services         # registered services + heartbeats
+GET  /api/services     # alias for /services
+GET  /services/{name}  # one service
+GET  /services/cleanup/stats
 ```
 
-### File Operations (by CID)
+### Metadata — primary surface
+
+These are the routes other services use. `{hash}` may be a UUID root or
+any registered CID alias; CID aliases resolve to the underlying UUID
+before reads/writes (`internal/storage/cid_resolution.go`).
 
 ```bash
-# Serve file by CID (looks up poster/backdrop CIDs in metadata)
-curl http://localhost:9000/file/{cid} --output poster.jpg
-# Returns raw file bytes with appropriate Content-Type header
-
-# Example: fetch a poster image
-curl -v http://localhost:9000/file/bafkreih5aznjvttude6c3wbvqeebb6rlx5wkbzyppv7garber7ndsuxku4
-# Content-Type: image/jpeg
-# [binary image data]
+GET    /meta                          # list of root IDs
+GET    /meta/{hash}                   # full document (flat keys → nested JSON)
+PUT    /meta/{hash}                   # replace document
+PATCH  /meta/{hash}                   # merge into document
+DELETE /meta/{hash}                   # delete root + all CID aliases
+GET    /meta/{hash}/{key...}          # single property (key may contain "/")
+PUT    /meta/{hash}/{key...}          # set single property
+DELETE /meta/{hash}/{key...}          # delete single property
+POST   /meta/{hash}/_add/{key...}     # add value to set-valued property
 ```
 
-The `/file/{cid}` endpoint searches all file metadata for matching `poster` or `backdrop` CIDs and serves the corresponding file from disk. Supports range requests for partial content retrieval.
-
-### Service Discovery
+CID-addressed access (public; auth-bypassed in the Caddy perimeter):
 
 ```bash
-# List all services
-curl http://localhost:9000/services
-# {"services":[{"name":"meta-sort",...}],"count":3}
-
-# Get specific service
-curl http://localhost:9000/services/meta-sort
-# {"name":"meta-sort","version":"2.0.0","api":"http://...","status":"running",...}
+GET    /api/meta/{cid}                # resolve CID → metadata document
+GET    /api/file/{cid}/info           # CID resolution metadata
+GET    /file/{cid}                    # serve file bytes (range-aware)
+POST   /file/cid                      # compute CID for an uploaded file
+HEAD   /data/{hash}                   # existence + size
+GET    /data/{hash}/path              # absolute path on /files
 ```
 
-### Mount Management
+(There is no `/data/{hash}/stream`; bulk reads go through `/webdav/*` or
+the `/file/{cid}` reverse-lookup path.)
+
+### Editor / KV browser surface
 
 ```bash
-# List all mounts
-curl http://localhost:9000/api/mounts/list
-# {"mounts":[{"id":"smb-nas","type":"smb","path":"/files/corn/nas",...}]}
+GET    /api/metadata/hash-ids
+GET    /api/metadata/list
+POST   /api/metadata/search
+POST   /api/metadata/batch
+POST   /api/metadata/clear
+GET    /api/metadata/{hashId}
+PUT    /api/metadata/{hashId}
+DELETE /api/metadata/{hashId}
+GET    /api/metadata/{hashId}/property
+PUT    /api/metadata/{hashId}/property
 
-# Add a new mount
-curl -X POST http://localhost:9000/api/mounts/add \
-  -H "Content-Type: application/json" \
-  -d '{"type":"smb","path":"/files/corn/nas","config":{...}}'
+GET    /api/kv/info
+GET    /api/kv/keys
+GET    /api/kv/tree
+GET    /api/kv/search
+GET    /api/kv/find
+GET    /api/kv/value
+PUT    /api/kv/value
+DELETE /api/kv/value
+GET    /api/kv/key/{key...}
 
-# Remove a mount
-curl -X DELETE http://localhost:9000/api/mounts/smb-nas
+GET    /api/schema
+POST   /api/schema/rescan
+
+GET    /api/snapshot/export
+POST   /api/snapshot/import
+POST   /api/snapshot/wipe
 ```
 
-### File Watching
+### SSE event streams
+
+The HTTP-mirror of the Redis Streams. External services never read Redis
+directly — they subscribe here with `Last-Event-ID` for resume. See
+[`docs/api-mediated-access.md`](docs/api-mediated-access.md) for the wire
+contract (one event per stream entry, opaque IDs, heartbeats, gap
+signalling).
 
 ```bash
-# Get scan status
-curl http://localhost:9000/api/scan/status
-# {"scanning":false,"lastScan":"2024-01-15T10:30:00Z","filesFound":12847}
-
-# Trigger rescan
-curl -X POST http://localhost:9000/api/scan/trigger
-
-# Stream file events (SSE)
-curl http://localhost:9000/api/events/stream
-# data: {"type":"add","path":"movies/Movie.mkv","midhash256":"bafkr..."}
+GET /api/events/files     # file:events stream (watcher events)
+GET /api/events/meta      # meta:events stream (metadata mutations)
 ```
 
-### KV Browser
+### Mounts
 
 ```bash
-# Storage statistics
-curl http://localhost:9000/api/kv/info
-# {"totalKeys":50000,"memoryUsed":"256MB",...}
-
-# List keys with cursor pagination
-curl "http://localhost:9000/api/kv/keys?cursor=0&count=100"
-
-# Get specific key value
-curl http://localhost:9000/api/kv/key/file:bafkr.../title
+GET    /api/mounts
+POST   /api/mounts
+GET    /api/mounts/{id}
+PUT    /api/mounts/{id}       # also PATCH
+DELETE /api/mounts/{id}
+POST   /api/mounts/{id}/mount
+POST   /api/mounts/{id}/unmount
+POST   /api/mounts/{id}/safe-unmount
+POST   /api/mounts/{id}/scan
+GET    /api/mounts/rclone/remotes
 ```
 
-### Metadata Editor
+### Watchers
 
 ```bash
-# Get all hash IDs
-curl http://localhost:9000/api/metadata/hash-ids
-# {"hashIds":["bafkr...","bafks..."]}
-
-# Paginated metadata listing
-curl "http://localhost:9000/api/metadata/list?page=0&pageSize=50"
-
-# Search metadata
-curl -X POST http://localhost:9000/api/metadata/search \
-  -H "Content-Type: application/json" \
-  -d '{"query":"inception","fields":["title"]}'
-
-# Batch update
-curl -X POST http://localhost:9000/api/metadata/batch \
-  -H "Content-Type: application/json" \
-  -d '{"operations":[{"hashId":"bafkr...","updates":{"title":"New Title"}}]}'
-
-# Clear all metadata
-curl -X POST http://localhost:9000/api/metadata/clear
+GET    /api/watchers
+POST   /api/watchers
+GET    /api/watchers/{id}
+PUT    /api/watchers/{id}
+DELETE /api/watchers/{id}
+POST   /api/watchers/{id}/scan
+POST   /api/watchers/{id}/reset
+POST   /api/watchers/scan-all
+POST   /api/watchers/reset-all
 ```
 
-### WebDAV Access
+The legacy `/api/scan/trigger` and `/api/scan/status` still respond but
+return a deprecation pointer at the `/api/watchers/*` routes
+(`internal/watcher/handlers.go:32-33`).
+
+### Admin / WebDAV
 
 ```bash
-# List directory (returns JSON)
-curl http://localhost:9000/webdav/
-# [{"name":"watch","isDir":true},{"name":"plugin","isDir":true}]
-
-# Get file
-curl http://localhost:9000/webdav/watch/movie.mkv --output movie.mkv
-
-# Upload file
-curl -X PUT http://localhost:9000/webdav/plugin/output.txt \
-  -H "Content-Type: application/octet-stream" \
-  --data-binary @output.txt
-
-# Create directory
-curl -X MKCOL http://localhost:9000/webdav/newdir/
-
-# Delete file/directory
-curl -X DELETE http://localhost:9000/webdav/oldfile.txt
+POST   /api/admin/migrate-dual-roots  # reunify stranded midhash-rooted entries
+GET/PUT/DELETE /webdav/...            # mounted on /files
 ```
 
-## Leader Election
+No `/metrics` endpoint is exposed; observability is via container logs and
+the `/health` / `/status` JSON.
 
-meta-core uses POSIX file locking (flock) for distributed leader election:
+## Leader gate
 
-1. Each instance tries to acquire exclusive lock on `/meta-core/locks/kv-leader.lock`
-2. Winner becomes **leader**, spawns Redis, writes info to `/meta-core/locks/kv-leader.info`
-3. Losers become **followers**, read leader info, connect to leader's Redis
-4. Lock automatically releases when process dies (no stale locks)
+Leader election is a bash flock loop in `docker/leader-election.sh`, not a
+Go-level state machine. When `flock` succeeds on `kv-leader.lock`, the
+script writes the leader API URL to `kv-leader.info` and `exec`s
+supervisord. When the process tree dies, the kernel releases the lock and
+any standby instance can take over. There is no follower path inside the
+Go binary — there is no `OnBecomeLeader` / `OnBecomeFollower` callback API.
 
-### Election Flow
-
-```
-Instance 1              Instance 2              Instance 3
-     │                       │                       │
-     ├── Try flock ──────────┼───────────────────────┤
-     │                       │                       │
-   [WIN]                  [LOSE]                  [LOSE]
-   LEADER                 FOLLOWER                FOLLOWER
-     │                       │                       │
-  Start Redis          Read leader.info       Read leader.info
-     │                       │                       │
-  Write leader.info    Connect to Redis      Connect to Redis
-     │                       │                       │
-  [Health loop 5s]     [Health loop 5s]      [Health loop 5s]
-  - Update timestamp   - Re-read leader      - Re-read leader
-  - Check Redis alive  - Detect changes      - Detect changes
-```
-
-### Role Callbacks
-
-The election system provides callbacks for role transitions:
-
-```go
-election.OnBecomeLeader(func(info LeaderLockInfo) {
-    // Start Redis, initialize resources
-})
-election.OnBecomeFollower(func(info LeaderLockInfo) {
-    // Connect to leader's Redis
-})
-election.OnLeaderLost(func() {
-    // Handle leader failure, attempt re-election
-})
-```
-
-### Lock Info Format
-
-The `kv-leader.info` file contains a plain text API URL:
+`kv-leader.info` is a single plaintext line containing the API base URL:
 
 ```
 http://10.0.1.50:9000
 ```
 
-Services read this file to discover the leader, then call the `/urls` API endpoint to get full connection details (Redis URL, WebDAV URL, base URL, etc.).
+Other services read this file, then call `GET /urls` for full discovery.
 
-## Redis Management
+The dev compose runs a single `metacore-app`; the flock primitive is
+retained as a correctness anchor (one process owns Redis and the
+writable state under `/meta-core`), not as live failover.
 
-The leader is responsible for spawning and managing the Redis server.
+## Metadata storage shape (one-line summary)
 
-### Redis Configuration
+Roots are opaque UUIDv7 strings; every property is a separate Redis
+STRING at `file:<uuid>/<property>`; every known CID for a file is a
+reverse-index entry `cid:<algorithm>:<value> → <uuid>`. Full details in
+[`docs/metadata-storage-structure.md`](docs/metadata-storage-structure.md)
+and design rationale in [`docs/uuid-rooted-metadata.md`](docs/uuid-rooted-metadata.md).
+The authoritative registry of field semantics and value formats lives in
+the repo-root [`METADATA_KEYS.md`](../../METADATA_KEYS.md).
 
-```bash
-redis-server --port 6379 --bind 0.0.0.0 \
-  --dir /meta-core/db/redis \
-  --appendonly yes --appendfilename appendonly.aof \
-  --dbfilename dump.rdb --save 60 1 \
-  --loglevel warning
-```
-
-### Persistence Strategy
-
-| Method | Configuration | Purpose |
-|--------|--------------|---------|
-| **AOF** | `appendonly yes` | Write-ahead log for durability |
-| **RDB** | `save 60 1` | Snapshot after 60s if ≥1 key changed |
-
-### Failure Handling
-
-- **Redis crash**: Auto-detected via health check, automatically restarted
-- **Leader crash**: Lock released, followers detect via stale timestamp, re-election occurs
-- **Graceful shutdown**: SIGTERM sent to Redis (10s timeout), then SIGKILL if needed
-
-## Metadata Storage
-
-meta-core uses a flat key-value schema in Redis for storing file metadata.
-
-### Storage Format
-
-```
-Key: /file/{hashId}/{property}
-Value: string
-
-Examples:
-/file/midhash256:abc123/title     → "Movie Title"
-/file/midhash256:abc123/year      → "2024"
-/file/midhash256:abc123/genres    → "action,drama"
-/file/midhash256:abc123/filePath  → "movies/Movie.mkv"
-```
-
-### Storage Client Features
-
-| Feature | Details |
-|---------|---------|
-| Connection Pool | 10 connections |
-| Timeouts | 5s dial, 30s read/write |
-| Batch Operations | Pipelined writes for performance |
-| Key Scanning | SCAN-based iteration (non-blocking) |
-| CID Lookup | Find file paths by poster/backdrop CID |
-
-## Service Discovery
-
-Services register by writing JSON to `/meta-core/services/{name}.json`.
-
-### Registration Format
-
-```json
-{
-  "name": "meta-sort",
-  "version": "2.0.0",
-  "api": "http://10.0.1.50:8180",
-  "status": "running",
-  "pid": 12345,
-  "hostname": "meta-sort-dev",
-  "startedAt": "2024-01-01T00:00:00Z",
-  "lastHeartbeat": "2024-01-01T00:01:00Z",
-  "capabilities": ["meta-core"],
-  "endpoints": {
-    "health": "http://10.0.1.50:9000/health",
-    "meta": "http://10.0.1.50:9000/meta"
-  }
-}
-```
-
-### Heartbeat & Stale Detection
-
-| Parameter | Default | Purpose |
-|-----------|---------|---------|
-| `HEARTBEAT_INTERVAL_MS` | 30000 | How often services update `lastHeartbeat` |
-| `STALE_THRESHOLD_MS` | 60000 | Mark service "stale" if heartbeat older than this |
-
-Services are automatically marked as `stale` when discovered if their `lastHeartbeat` exceeds the threshold. On graceful shutdown, services remove their registration file.
-
-## Development
-
-```bash
-# Format code
-make fmt
-
-# Run linter
-make lint
-
-# Run tests with coverage
-make test-cover
-
-# Clean build artifacts
-make clean
-```
-
-## Internal Packages
+## Internal packages
 
 | Package | Purpose |
 |---------|---------|
-| `cmd/meta-core` | Main entry point, startup/shutdown orchestration |
-| `internal/config` | Environment-based configuration with defaults |
-| `internal/leader` | Election system (`election.go`) and Redis manager (`redis.go`) |
-| `internal/storage` | Redis client wrapper with flat key-value operations |
-| `internal/discovery` | Service registration, heartbeat loop, discovery |
-| `internal/api` | HTTP server, router, and all endpoint handlers |
-| `internal/events` | Redis keyspace notification publisher to meta:events |
-| `internal/watcher` | File system scanning, MidHash256 computation, event dispatch |
-| `internal/watchers` | Polling-based watcher configuration management |
-| `internal/mounts` | SMB/rclone mount configuration and health monitoring |
-| `internal/webdav` | WebDAV protocol handler with caching integration |
+| `cmd/meta-core` | Entry point; Redis connect + schema sentinel + service wiring. |
+| `internal/config` | Env-driven configuration, path helpers. |
+| `internal/leader` | `LeaderInfoProvider` (builds the leader info from local hostname/IP/config; no election logic). |
+| `internal/storage` | Redis wrapper (`client.go`), UUIDv7 minting (`uuid.go`), CID reverse index (`cid_resolution.go`), schema sentinel (`schema_version.go`), dual-root migration (`dual_root_migration.go`). |
+| `internal/cid` | CID parsing + algorithm ranking for canonical-CID selection. |
+| `internal/discovery` | Service registry + dead-service cleaner. |
+| `internal/events` | Keyspace-notification → `meta:events` stream publisher (`meta_publisher.go`). |
+| `internal/api` | HTTP server + all handlers + SSE event endpoints. |
+| `internal/schema` | Live per-field schema indexer (consumes `meta:events`). |
+| `internal/snapshot` | Snapshot export / import / wipe. |
+| `internal/watcher` | File system scanner, MidHash256 computation, dispatcher, state registry. |
+| `internal/watchers` | Polling-based watcher configurations (manager + poller + handlers). |
+| `internal/mounts` | rclone mount manager, lifecycle handlers, stats poller. |
+| `internal/webdav` | WebDAV handler (mounted at `/webdav/*`; nginx handles caching upstream). |
 
-### Startup Sequence
+### Startup sequence
 
 ```
 1. Load configuration from environment
-2. Create storage client (Redis wrapper)
-3. Initialize leader election
-4. Register role transition callbacks
-5. Start election (acquire lock or become follower)
-6. Start service discovery (register + heartbeat loop)
-7. Initialize dead service cleaner
-8. Initialize file watcher (if enabled)
-9. Initialize mount manager
-10. Start HTTP API server (WebDAV caching handled by nginx)
-11. Wait for SIGINT/SIGTERM
-12. Shutdown in reverse order
-```
-
-## Integration
-
-### As Sidecar in Docker
-
-Add to existing service's supervisord config:
-
-```ini
-[program:meta-core]
-command=/usr/local/bin/meta-core
-priority=10
-autostart=true
-autorestart=true
-```
-
-### Client Usage (TypeScript)
-
-```typescript
-const response = await fetch('http://localhost:9000/meta/' + hashId);
-const { metadata } = await response.json();
-```
-
-### Client Usage (Python)
-
-```python
-import requests
-response = requests.get(f'http://localhost:9000/meta/{hash_id}')
-metadata = response.json()['metadata']
+2. Build LeaderInfoProvider (no election — the bash gate already won)
+3. Connect to local Redis (retry up to 30× / 1s)
+4. EnsureSchemaVersion — abort if the existing Redis layout is stale
+5. Start service discovery + dead-service cleaner
+6. Construct API server (initialises watcher, mounts, WebDAV)
+7. Start API server; on first connect, start MetaPublisher + schema Indexer
+   and republish existing metadata onto meta:events
+8. Wait for SIGINT/SIGTERM, shutdown in reverse order
 ```
 
 ## Dependencies
 
-| Dependency | Version | Purpose |
-|------------|---------|---------|
-| `github.com/gorilla/mux` | v1.8.1 | HTTP router |
-| `github.com/redis/go-redis/v9` | v9.4.0 | Redis client |
-| `golang.org/x/net` | v0.20.0 | WebDAV support |
-| `github.com/google/uuid` | v1.6.0 | UUID generation |
-| Go stdlib | - | context, encoding/json, net, os, sync, syscall |
+| Dependency | Purpose |
+|------------|---------|
+| `github.com/gorilla/mux` | HTTP router |
+| `github.com/redis/go-redis/v9` | Redis client |
+| `github.com/google/uuid` | UUIDv7 minting |
+| `golang.org/x/net` | WebDAV support |
+| Go stdlib | context, net/http, os, sync, syscall |
 
-### Runtime Requirements
-
-- **Go 1.21+** for building
-- **Redis** binary available in PATH (leader spawns it)
-- **Shared filesystem** accessible by all instances (for flock)
+Runtime requirements: Go 1.21+ at build time; the container ships Redis,
+rclone, nginx, and supervisord alongside the binary.
 
 ## License
 

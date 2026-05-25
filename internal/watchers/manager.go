@@ -55,47 +55,86 @@ func (m *Manager) SetOnChanged(cb func()) {
 	m.onChanged = cb
 }
 
-// loadOrCreateDefault loads existing config or creates default watcher
+// loadOrCreateDefault loads existing config or creates default watchers.
+// Also reconciles after load: any path in DefaultWatcherPaths that isn't
+// yet present gets added. This catches deployments whose watchers.json
+// pre-dates the addition of a new default (e.g. /files/plugin), without
+// requiring operators to manually edit JSON.
 func (m *Manager) loadOrCreateDefault() error {
-	// Try to load existing file
 	if _, err := os.Stat(m.watchersFile); err == nil {
-		return m.load()
+		if err := m.load(); err != nil {
+			return err
+		}
+		return m.ensureDefaultWatchers()
 	}
 
-	// File doesn't exist, create default watcher for /files/watch
-	log.Printf("[Watchers] No existing config, creating default watcher for %s", m.config.DefaultWatchPath())
-	return m.createDefaultWatcher()
+	log.Printf("[Watchers] No existing config, creating defaults")
+	return m.createDefaultWatchers()
 }
 
-// createDefaultWatcher creates the default /files/watch watcher and folder
-func (m *Manager) createDefaultWatcher() error {
+// ensureDefaultWatchers makes sure every path in DefaultWatcherPaths has a
+// corresponding watcher entry. Existing entries (matched by path) are left
+// untouched — only missing ones are added.
+func (m *Manager) ensureDefaultWatchers() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	defaultPath := m.config.DefaultWatchPath()
-
-	// Create the watch folder if it doesn't exist
-	if err := os.MkdirAll(defaultPath, 0755); err != nil {
-		log.Printf("[Watchers] Warning: failed to create default watch folder %s: %v", defaultPath, err)
-		// Continue anyway - folder might be created later or mounted
-	} else {
-		log.Printf("[Watchers] Created default watch folder: %s", defaultPath)
+	existing := make(map[string]bool, len(m.watchers))
+	for _, w := range m.watchers {
+		existing[w.Path] = true
 	}
 
-	// Create default watcher
+	added := false
+	for _, p := range m.config.DefaultWatcherPaths() {
+		if existing[p] {
+			continue
+		}
+		if err := m.addDefaultWatcherUnsafe(p); err != nil {
+			log.Printf("[Watchers] Warning: failed to add default watcher %s: %v", p, err)
+			continue
+		}
+		added = true
+	}
+	if !added {
+		return nil
+	}
+	return m.saveUnsafe()
+}
+
+// createDefaultWatchers seeds the watcher config with every entry in
+// DefaultWatcherPaths. Used on first start when no config file exists.
+func (m *Manager) createDefaultWatchers() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, p := range m.config.DefaultWatcherPaths() {
+		if err := m.addDefaultWatcherUnsafe(p); err != nil {
+			log.Printf("[Watchers] Warning: failed to seed default watcher %s: %v", p, err)
+		}
+	}
+	return m.saveUnsafe()
+}
+
+// addDefaultWatcherUnsafe creates the on-disk folder (if missing) and adds
+// a watcher entry. Caller must hold m.mu.
+func (m *Manager) addDefaultWatcherUnsafe(path string) error {
+	if err := os.MkdirAll(path, 0755); err != nil {
+		log.Printf("[Watchers] Warning: failed to create folder %s: %v", path, err)
+		// Continue — folder might be mounted later
+	} else {
+		log.Printf("[Watchers] Created folder: %s", path)
+	}
+
 	id := uuid.New().String()[:8]
-	watcher := &WatcherConfig{
+	m.watchers[id] = &WatcherConfig{
 		ID:         id,
-		Path:       defaultPath,
+		Path:       path,
 		IntervalMs: DefaultIntervalMs,
 		Enabled:    true,
 		CreatedAt:  NowMS(),
 	}
-	m.watchers[id] = watcher
-	log.Printf("[Watchers] Created default watcher: %s -> %s", id, defaultPath)
-
-	// Save config
-	return m.saveUnsafe()
+	log.Printf("[Watchers] Created default watcher: %s -> %s", id, path)
+	return nil
 }
 
 // load loads watchers from file

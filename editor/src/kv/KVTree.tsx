@@ -79,12 +79,24 @@ function labelOf(path: string, parentPath: string): string {
   return rest.replace(/[/:]+$/, '');
 }
 
-// Hide internal Redis structures from the tree:
-//   - the `meta:` namespace (event streams, internal state)
-//   - bare top-level leaves under a colon-namespace like file:__index__ and
-//     file:events (Redis sets / streams that aren't user data).
+// Hide internal Redis structures from the tree. The editor is for managing
+// file metadata; everything else is meta-core's own bookkeeping and noise
+// for the user. Hidden:
+//   - `meta:`       — event streams (file:events, meta:events, etc.)
+//   - `cid:`        — reverse index (cid:<algo>:<value> → uuid), derived
+//                     from each file's cid_* fields; the editor surfaces
+//                     these per-file under their parent root
+//   - `meta-core:`  — internal service state (mounts, watcher config,
+//                     leader info), edited via dedicated UI pages, not
+//                     the KV tree
+//   - bare top-level leaves under a colon-namespace like file:__index__
+//     and file:events (Redis sets / streams that aren't user data).
 function isHiddenNode(node: TreeNode): boolean {
-  if (node.kind === 'branch' && node.path === 'meta:') return true;
+  if (node.kind === 'branch') {
+    if (node.path === 'meta:' || node.path === 'cid:' || node.path === 'meta-core:') {
+      return true;
+    }
+  }
   if (node.kind === 'leaf' && /^[^/]+:[^/]+$/.test(node.path)) return true;
   return false;
 }

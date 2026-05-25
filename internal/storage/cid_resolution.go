@@ -462,39 +462,15 @@ func (c *Client) GetMetadataDocument(uuid string) (*MetadataDocument, error) {
 	}, nil
 }
 
-// lookupSidecarPathByCID is the fallback that LookupPathByCID falls into
-// when the token isn't a known root alias. Used to resolve poster/backdrop
-// CIDs, which are stored as values pointing at sidecar files (posterPath /
-// backdropPath) rather than registered as aliases of the file itself.
+// lookupSidecarPathByCID — REMOVED.
 //
-// O(n) — walks every root. Acceptable because (a) sidecar lookups are rare
-// vs. file CID lookups and (b) the alternative is registering sidecars in
-// the reverse index, which conflates "this CID is the file" with "this CID
-// is an image associated with the file."
-func (c *Client) lookupSidecarPathByCID(token string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	hashIDs, err := c.getAllHashIDsInternal(ctx)
-	if err != nil {
-		return "", err
-	}
-
-	for _, hashID := range hashIDs {
-		meta, err := c.getMetadataFlatInternal(ctx, hashID)
-		if err != nil || len(meta) == 0 {
-			continue
-		}
-		if meta["poster"] == token {
-			if p := meta["posterPath"]; p != "" {
-				return normalizeFilesRelativePath(p), nil
-			}
-		}
-		if meta["backdrop"] == token {
-			if p := meta["backdropPath"]; p != "" {
-				return normalizeFilesRelativePath(p), nil
-			}
-		}
-	}
-	return "", nil
-}
+// This function used to walk every metadata entry looking for poster/backdrop
+// matches and return their `posterPath`/`backdropPath` companion fields. It
+// was a workaround for plugin output (TMDB images, etc.) not being indexed
+// by the watcher.
+//
+// Now that the plugin output directory is a first-class watcher root
+// (see config.DefaultWatcherPaths), every plugin artefact has its own
+// midhash256 alias and resolves through the standard reverse index. Storing
+// paths in metadata broke the CID-as-identity contract; the watcher
+// indexing fixes the root cause.

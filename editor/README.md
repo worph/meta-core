@@ -1,140 +1,76 @@
-# @metazla/meta-editor
+# @meta-core/editor
 
-User-friendly metadata editor for MetaMesh. Search and edit file metadata directly through a web interface.
+React + Vite metadata browser/editor that ships inside the meta-core
+container. Walks the UUID-rooted Redis keyspace, edits leaf values,
+imports/exports snapshots, and consults the live schema indexer.
 
-## Features
+## What it talks to
 
-- **Search**: Find files by title, filename, or hash ID
-- **Edit**: Modify all metadata fields including title, season, episode, year, Jellyfin metadata, and more
-- **Batch Operations**: Update multiple files simultaneously
-- **Real-time**: Direct integration with etcd via REST API
-- **User-friendly**: Clean, intuitive interface with form validation
+The editor is a pure SPA — it has no server of its own. It calls the
+meta-core HTTP API directly under three prefixes (see `src/api/`):
 
-## Development
+- `/api/kv/*` — slash-tree KV browser (`info`, `tree`, `search`, `find`,
+  `value`, `key/{key...}`). This is the UUID-exposing surface — keys look
+  like `file:<uuid>/<property>` and `cid:<algo>:<value>`.
+- `/api/schema` — live per-field schema (type hints, value breakdowns),
+  produced by meta-core's schema indexer that consumes `meta:events`.
+- `/api/snapshot/*` — snapshot export / import / wipe.
 
-### Prerequisites
+In production the editor is served by meta-core's nginx (the Vite build
+output is copied into the image at the same path) under
+`https://metacore-dev.localhost:8083/editor/`. The Vite `base` is set to
+`/editor/` accordingly.
 
-- Node.js 21.6.2+
-- pnpm 10.19.0+
-- Meta-mesh API server running (provides the `/api/metadata/*` endpoints)
-
-### Running Locally
-
-```bash
-# From the root directory
-pnpm run start:editor
-
-# Or from the package directory
-cd packages/meta-editor
-pnpm run dev
-```
-
-The editor will be available at `http://localhost:5173` with API proxying to `http://localhost:3000`.
-
-### Building
-
-```bash
-# From the root directory
-pnpm run build:editor
-
-# Or from the package directory
-cd packages/meta-editor
-pnpm run build
-```
-
-The built files will be in `dist/` directory.
-
-## Docker Deployment
-
-In the Docker development environment, the editor is automatically available at:
+## Project layout
 
 ```
-http://localhost/editor
-```
-
-The nginx configuration serves the built files from `/app/packages/meta-editor/dist/`.
-
-## API Integration
-
-The editor communicates with the UnifiedAPIServer (meta-mesh) via REST API:
-
-- `POST /api/metadata/search` - Search for files
-- `GET /api/metadata/:hashId` - Get file metadata
-- `PUT /api/metadata/:hashId` - Update complete metadata
-- `PUT /api/metadata/:hashId/property` - Update specific property
-- `POST /api/metadata/batch` - Batch update multiple files
-
-See `src/api/metadataApi.ts` for the API client implementation.
-
-## Usage
-
-### Searching for Files
-
-1. Select search type: "Search by Title/Filename" or "Search by Hash ID"
-2. Enter your search query
-3. Click "Search"
-4. Results will appear in the left sidebar
-
-### Editing Metadata
-
-1. Select a file from the search results
-2. Modify any fields in the editor form
-3. Click "Save Changes" to persist updates
-4. Use "Reset" to discard changes
-
-### Supported Metadata Fields
-
-**Basic Information:**
-- Title, Original Title, Show Title
-- Video Type (Movie, TV, Anime, Other)
-- Year, Season, Episode
-
-**Jellyfin Metadata:**
-- Plot, IMDb ID, TMDb ID, AniDB ID
-- Director, Studio, Rating, Runtime
-- Genres, Premiered Date, Release Date
-
-**File Information:**
-- Filename, File Size, MIME Type
-- Hash values (SHA-256, MD5, etc.) - read-only
-
-## Project Structure
-
-```
-packages/meta-editor/
-├── src/
-│   ├── api/           # API client for metadata operations
-│   ├── components/    # React components
-│   │   ├── SearchBar.tsx        # Search interface
-│   │   ├── FileList.tsx         # Search results list
-│   │   └── MetadataEditor.tsx   # Main editing form
-│   ├── types/         # TypeScript type definitions
-│   ├── utils/         # Utility functions
-│   ├── App.tsx        # Main application component
-│   ├── main.tsx       # Entry point
-│   └── index.css      # Global styles
+packages/meta-core/editor/
 ├── index.html
 ├── vite.config.ts
 ├── tsconfig.json
-└── package.json
+├── package.json                @meta-core/editor
+└── src/
+    ├── main.tsx                entry
+    ├── api/
+    │   ├── kvApi.ts            /api/kv client
+    │   ├── schemaApi.ts        /api/schema client + cache
+    │   └── snapshotApi.ts      /api/snapshot client
+    ├── kv/                     KV browser + leaf/branch editors
+    ├── components/             shared widgets (language combobox, snapshot panel, ...)
+    └── index.css
 ```
 
-## Technology Stack
+## Local development
 
-- **React 18** - UI framework
-- **TypeScript 5.7** - Type safety
-- **Vite 6** - Build tool and dev server
-- **Native CSS** - Styling (no CSS framework)
+Prerequisites: Node 21.6.2+, pnpm pinned in the root `package.json`.
 
-## Contributing
+```bash
+cd packages/meta-core/editor
+pnpm install
+pnpm dev          # vite dev server on http://localhost:5173
+```
 
-When adding new features:
+The Vite dev server proxies `/api/*` to `http://localhost:3000` (see
+`vite.config.ts`). For local development against a running meta-core
+container, change that target to wherever meta-core is reachable on your
+host — e.g. `http://localhost:18083` for the dev compose's direct-backend
+port.
 
-1. Add type definitions to `src/types/index.ts`
-2. Update API client in `src/api/metadataApi.ts`
-3. Create/update components as needed
-4. Update this README with new features
+No root-level `start:editor` or `build:editor` scripts exist; run pnpm
+commands from this directory.
 
-## License
+## Build
 
-Part of the MetaMesh project.
+```bash
+pnpm build        # tsc -b && vite build → dist/
+```
+
+The container build copies `dist/` into the nginx web root so the editor
+is served at `/editor/`.
+
+## Tech
+
+- React 18, TypeScript 5
+- Vite 5 (`base: '/editor/'`)
+- Native CSS — no UI framework
+- `iso-639-3` for language code rendering

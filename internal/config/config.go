@@ -132,3 +132,20 @@ func getEnvBool(key string, defaultValue bool) bool {
 func (c *Config) DefaultWatchPath() string {
 	return c.FilesPath + "/watch"
 }
+
+// DefaultWatcherPaths returns every directory that should be watched out of
+// the box on a fresh install. The watcher seeds these on first start.
+//
+//   - /files/watch  — user-curated media. The main library.
+//   - /files/plugin — plugin output (TMDB posters/backdrops, extracted
+//                     subtitles, etc.). Indexed so each artefact gets a
+//                     midhash256 alias and CID-based references from
+//                     other files (e.g. `backdrop=<cid>`) resolve through
+//                     the standard reverse index instead of needing a
+//                     path companion field.
+func (c *Config) DefaultWatcherPaths() []string {
+	return []string{
+		c.FilesPath + "/watch",
+		c.FilesPath + "/plugin",
+	}
+}

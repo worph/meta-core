@@ -68,14 +68,20 @@ func (p *Poller) Start() error {
 
 	log.Println("[WatcherPoller] Starting file watcher polling service")
 
-	// Clear file:events stream on startup to prevent duplicate events from accumulating
-	// across container restarts. Since in-memory state is empty, all files will be
-	// re-emitted as "add" events - we need a fresh stream to match.
-	if p.dispatcher != nil {
-		if err := p.dispatcher.EmitReset("startup"); err != nil {
-			log.Printf("[WatcherPoller] Warning: failed to clear stream on startup: %v", err)
-		}
-	}
+	// No startup reset. The file:events stream is bounded by MAXLEN
+	// (api-mediated-access PR A) and SSE consumers resume from their
+	// persisted Last-Event-ID, so a startup wipe would only orphan
+	// consumer state without buying anything. The historical reason for
+	// wiping — "in-memory state is empty, all files re-emit as add" —
+	// stopped being true when HydrateStateFromStorage landed: state is
+	// hydrated from Redis before this runs, so a startup EmitReset would
+	// tell consumers to throw out their world without sending the
+	// re-emission they need to rebuild it.
+	//
+	// Operator-triggered resets (POST /api/watchers/{id}/reset) still
+	// work — that path goes through TriggerReset, which clears both the
+	// stream AND the watcher's in-memory state, so the next scan tick
+	// emits add events for every file.
 
 	// Initial sync with watcher configurations
 	go p.syncWithWatchers()

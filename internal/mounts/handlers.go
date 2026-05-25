@@ -292,11 +292,33 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	json.NewEncoder(w).Encode(data)
 }
 
+// writeError writes the typed error envelope (see api/handlers.go for the
+// canonical definition + slug vocabulary). Kept local to avoid an import
+// cycle with the api package.
 func writeError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, map[string]string{
-		"error":   http.StatusText(status),
-		"message": message,
+	slug, retryable := slugForStatus(status)
+	writeJSON(w, status, map[string]interface{}{
+		"error":     slug,
+		"message":   message,
+		"retryable": retryable,
 	})
+}
+
+func slugForStatus(status int) (string, bool) {
+	switch status {
+	case http.StatusConflict:
+		return "alias_collision", false
+	case http.StatusNotFound:
+		return "unknown_root", false
+	case http.StatusBadRequest:
+		return "schema_violation", false
+	case http.StatusServiceUnavailable:
+		return "storage_unavailable", true
+	case http.StatusInternalServerError:
+		return "internal", true
+	default:
+		return "internal", status >= 500
+	}
 }
 
 func parseIntOrDefault(s string, defaultVal int) (int, error) {

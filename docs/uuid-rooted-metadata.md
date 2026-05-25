@@ -2,9 +2,7 @@
 
 ## Status
 
-**Proposed** — design under discussion. Not yet implemented. Supersedes the
-"midhash256 as primary key" model currently described in
-[metadata-storage-structure.md](metadata-storage-structure.md).
+**Status:** Implemented (2026 alpha clean-wipe gate landed). Kept for design rationale.
 
 ## Motivation
 
