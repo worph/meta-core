@@ -38,10 +38,11 @@ func (w *Watcher) SetStorageClient(s *storage.Client) {
 // Caller already has all four values from its existing os.Stat / FileInfo —
 // no extra IO is performed here beyond the Redis writes themselves.
 //
-// Flow (see docs/uuid-rooted-metadata.md):
-//   - Look up the midhash in the reverse index (cid:midhash256:… → uuid)
-//   - If unknown, Mint a fresh UUID root and write the midhash256 field
-//     (the SetProperty hook auto-registers the alias)
+// Flow:
+//   - Look up the midhash CID in the reverse index (cid:<midhash> → uuid)
+//   - If unknown, Mint a fresh UUID root and write the midhash as a cids/
+//     key-set member (the SetProperty hook auto-registers the reverse-index
+//     alias). The midhash stays the file's address; it has no named field.
 //   - If known, this is a duplicate physical file for the same content —
 //     record the new path in the duplicates set and refresh size/mtime
 //
@@ -52,25 +53,24 @@ func (w *Watcher) writeFileTuple(absPath string, size, mtimeNano int64, midhash 
 	if w.storage == nil || midhash == "" {
 		return
 	}
-	token := "midhash256:" + midhash
 
-	uuid, err := w.storage.GetByCID(token)
+	uuid, err := w.storage.GetByCID(midhash)
 	if err != nil {
-		log.Printf("[Watcher] GetByCID(%s): %v", token, err)
+		log.Printf("[Watcher] GetByCID(%s): %v", midhash, err)
 		return
 	}
 
 	if uuid == "" {
 		// New content. Mint sets filePath/sizeByte/mtimeNano; SetProperty
-		// then writes midhash256 — and the cid_resolution.go hook on
-		// SetProperty registers the reverse-index alias for us.
+		// then writes the midhash as a cids/<cid> key-set member — and the
+		// cid_resolution.go hook registers the reverse-index alias for us.
 		uuid, err = w.storage.Mint(absPath, size, mtimeNano)
 		if err != nil {
 			log.Printf("[Watcher] Mint(%s): %v", absPath, err)
 			return
 		}
-		if err := w.storage.SetProperty(uuid, "midhash256", midhash); err != nil {
-			log.Printf("[Watcher] SetProperty midhash256 for %s: %v", uuid, err)
+		if err := w.storage.SetProperty(uuid, storage.CIDsKeyPrefix+midhash, "true"); err != nil {
+			log.Printf("[Watcher] SetProperty cids/%s for %s: %v", midhash, uuid, err)
 		}
 		return
 	}
@@ -359,7 +359,9 @@ func (w *Watcher) HydrateStateFromStorage(roots []WatcherRoot) (loaded, skipped 
 				ws.Set(rel, &FileState{
 					Size:      t.Size,
 					MtimeNano: t.MtimeNano,
-					MidHash:   t.MidHash256,
+					// MidHash left empty: the skip-rehash decision is
+					// size+mtime only, and the midhash is no longer a named
+					// field (it lives as a cids/<cid> member).
 				})
 				loaded++
 				matched = true

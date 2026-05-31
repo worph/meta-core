@@ -155,6 +155,15 @@ func (s *Server) setupRoutes() {
 	s.router.HandleFunc("/api/metadata/batch", s.handleBatchUpdate).Methods("POST")
 	s.router.HandleFunc("/api/metadata/clear", s.handleClearMetadata).Methods("POST")
 
+	// User Data Layer signing identity (see internal/identity). Auth-gated
+	// at the perimeter — do NOT add to nginx-hash-lock unauth bypass.
+	s.router.HandleFunc("/api/identity", s.handleIdentityGet).Methods("GET")
+	s.router.HandleFunc("/api/identity/generate", s.handleIdentityGenerate).Methods("POST")
+	s.router.HandleFunc("/api/identity/import", s.handleIdentityImport).Methods("POST")
+	s.router.HandleFunc("/api/identity", s.handleIdentityDelete).Methods("DELETE")
+	s.router.HandleFunc("/api/identity/sign", s.handleIdentitySign).Methods("POST")
+	s.router.HandleFunc("/api/identity/aead-key", s.handleIdentityAEADKey).Methods("GET")
+
 	// Snapshot (export / import / wipe)
 	s.router.HandleFunc("/api/snapshot/export", s.handleSnapshotExport).Methods("GET")
 	s.router.HandleFunc("/api/snapshot/import", s.handleSnapshotImport).Methods("POST")

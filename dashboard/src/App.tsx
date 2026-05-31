@@ -3,6 +3,7 @@ import Dashboard from './pages/Dashboard';
 import Mounts from './pages/Mounts';
 import Watchers from './pages/Watchers';
 import Files from './pages/Files';
+import Identity from './pages/Identity';
 import ServiceNav from './components/ServiceNav';
 
 const navStyle: React.CSSProperties = {
@@ -75,6 +76,12 @@ export default function App() {
           Files
         </NavLink>
         <NavLink
+          to="/identity"
+          style={({ isActive }) => (isActive ? activeLinkStyle : linkStyle)}
+        >
+          Identity
+        </NavLink>
+        <NavLink
           to="/editor"
           style={({ isActive }) => (isActive ? activeLinkStyle : linkStyle)}
         >
@@ -89,6 +96,7 @@ export default function App() {
           <Route path="/mounts" element={<Mounts />} />
           <Route path="/watchers" element={<Watchers />} />
           <Route path="/files" element={<Files />} />
+          <Route path="/identity" element={<Identity />} />
           <Route path="/editor" element={<EditorPage />} />
         </Routes>
       </div>

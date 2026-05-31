@@ -104,6 +104,18 @@ func (c *Config) WatchersFilePath() string {
 	return c.MetaCorePath + "/watchers.json"
 }
 
+// IdentityDir returns the directory holding the User Data Layer signing
+// identity (created by the dashboard's Identity menu — never auto-generated
+// at startup).
+func (c *Config) IdentityDir() string {
+	return c.MetaCorePath + "/identity"
+}
+
+// IdentityFilePath returns the path to the persisted identity JSON.
+func (c *Config) IdentityFilePath() string {
+	return c.IdentityDir() + "/identity.json"
+}
+
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value

@@ -15,10 +15,10 @@ import (
 //   - 404 if the CID isn't registered
 //   - 503 if storage is down
 //
-// CIDs in the URL must be in prefixed-token form ("midhash256:bafk…",
-// "sha256:bafk…", "ipfs:bafy…"). Bare CIDs without an algorithm prefix
-// won't resolve — callers should pass the token they got from a previous
-// metadata document, /api/file/{cid}/info, or a meta-share federated query.
+// CIDs in the URL are bare multibase CIDv1 strings ("bafk…") — the midhash,
+// a sibling sha2-256, an IPFS CID, a btih, anything registered in the
+// reverse index. A CID is self-describing (its algorithm is the multicodec),
+// so there is no <algo>: prefix.
 //
 // This endpoint is the public read API for the CID-resolution layer and
 // is auth-bypassed alongside /api/file/{cid} so that meta-share peers and
@@ -57,12 +57,14 @@ func (s *Server) handleGetMetaByCID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Response envelope mirrors GetMetadataDocument JSON tags (metadata /
-	// cids / duplicates), with cid added so the caller can correlate when
-	// they fan out N lookups.
+	// cids / canonical_cid / duplicates), with cid added so the caller can
+	// correlate when they fan out N lookups. canonical_cid is derived by
+	// rank from the cids key-set on read — it is not a stored field.
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"cid":        cid,
-		"metadata":   doc.Flat,
-		"cids":       doc.CIDs,
-		"duplicates": doc.Duplicates,
+		"cid":          cid,
+		"metadata":     doc.Flat,
+		"cids":         doc.CIDs,
+		"canonical_cid": doc.Canonical,
+		"duplicates":   doc.Duplicates,
 	})
 }

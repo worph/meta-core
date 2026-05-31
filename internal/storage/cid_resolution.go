@@ -12,37 +12,38 @@ import (
 )
 
 // This file implements the CID-resolution layer that lives on top of the
-// flat metadata storage in client.go. The shape is described in detail in
-// docs/uuid-rooted-metadata.md; the short version:
+// flat metadata storage in client.go. The short version:
 //
-//   - Roots are opaque UUIDv7s — file:<uuid>/<property> for every property
+//   - Roots are opaque UUIDv7s — file:<uuid>/<property> for every property.
+//     The UUID is an internal implementation detail; the mental model is
+//     "N CIDs → one record of keys→metadata".
 //   - Every known CID for a file is registered as a reverse-index entry:
-//       cid:<algorithm>:<value> → <uuid>     (Redis STRING)
-//     and mirrored in a per-root set for fast enumeration:
-//       file:<uuid>/cids                     (Redis SET)
-//   - A canonical_cid field tracks the best (rank-wise) CID to advertise
-//     externally; updated by reconcileCanonicalCIDLocked whenever the set
-//     changes
+//       cid:<bareCid> → <uuid>                (Redis STRING)
+//     and as a member of the per-root bare-CID key-set:
+//       file:<uuid>/cids/<bareCid> = "true"   (flat key, sentinel value)
+//   - A CID is self-describing: its algorithm is recoverable from the CIDv1
+//     multicodec (see internal/cid), so there is no per-algorithm field name
+//     and no <algo>: token prefix. The canonical externally-visible CID is
+//     *derived by rank* from the key-set on read (GetMetadataDocument), never
+//     stored.
 //
 // Auto-alias hooks in SetProperty/SetMetadataFlat/MergeMetadataFlat catch
-// any write of a cid_* or midhash256 field and register the alias, so
-// plugins that just write their result fields don't need to know about
-// the reverse index at all. The hook helpers are *Locked — they assume
-// c.mu is already held by the caller, avoiding nested RLock (which can
-// deadlock against a waiting writer).
+// any write of a cids/<cid> field and register the reverse-index entry, so
+// writers that just emit the key-set members don't need to know about the
+// reverse index at all. The hook helpers are *Locked — they assume c.mu is
+// already held by the caller, avoiding nested RLock (which can deadlock
+// against a waiting writer).
 
 // CIDIndexPrefix is the Redis key prefix for the reverse index. Combined
-// with a CID token, it forms the full key: "cid:midhash256:bafk…".
+// with a bare CID, it forms the full key: "cid:bafk…".
 const CIDIndexPrefix = "cid:"
 
-// CIDsField is the per-root SET key that mirrors all CID aliases for a file.
-// Stored at file:<uuid>/cids — read by reconcileCanonicalCIDLocked and by
-// DeleteRoot to find every reverse-index entry that needs to be cleaned up.
-const CIDsField = "cids"
-
-// CanonicalCIDField is the per-root STRING key that stores the externally
-// preferred CID for this file. Picked by cid.Better over the cids set.
-const CanonicalCIDField = "canonical_cid"
+// CIDsKeyPrefix is the field-name prefix for the bare-CID key-set. Sibling
+// CIDs live as flat keys file:<uuid>/cids/<cid> = "true"; the set IS the
+// keyset, the value is the sentinel. Read by GetMetadataDocument (hoisted
+// into the typed CIDs array) and by DeleteRoot/DeleteMetadata (to find the
+// reverse-index entries that need cleanup).
+const CIDsKeyPrefix = "cids/"
 
 // DuplicatesField is the per-root SET key holding additional file paths
 // whose content hashes to the same CIDs as this root. The watcher writes
@@ -51,9 +52,9 @@ const CanonicalCIDField = "canonical_cid"
 const DuplicatesField = "duplicates"
 
 // buildCIDIndexKey returns the absolute Redis key for a reverse-index entry.
-// token is a CID in prefixed form ("midhash256:bafk…", "sha256:…", etc.).
-func (c *Client) buildCIDIndexKey(token string) string {
-	return c.buildKey(CIDIndexPrefix + token)
+// cidStr is a bare multibase CIDv1 ("bafk…").
+func (c *Client) buildCIDIndexKey(cidStr string) string {
+	return c.buildKey(CIDIndexPrefix + cidStr)
 }
 
 // Mint creates a new root with filePath/sizeByte/mtimeNano and registers it
@@ -88,11 +89,10 @@ func (c *Client) Mint(filePath string, size, mtimeNano int64) (string, error) {
 	return uuid, nil
 }
 
-// AddAlias registers a CID token as resolving to uuid. Idempotent: writing
-// the same alias twice is a no-op. After the alias is registered, the
-// canonical_cid field is reconciled — picks the highest-ranked token in
-// the cids set and writes it to canonical_cid if it changed.
-func (c *Client) AddAlias(uuid, token string) error {
+// AddAlias registers cidStr as a sibling CID of uuid: it writes the reverse
+// index cid:<cidStr> → uuid and the key-set member cids/<cidStr> = "true".
+// Idempotent: registering the same CID twice is a no-op.
+func (c *Client) AddAlias(uuid, cidStr string) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -103,119 +103,102 @@ func (c *Client) AddAlias(uuid, token string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	return c.addAliasLocked(ctx, uuid, token)
+	return c.addAliasLocked(ctx, uuid, cidStr)
 }
 
 // addAliasLocked is the lock-free body of AddAlias. The caller must already
-// hold c.mu (read or write). Splits out so the alias-maintenance hooks
+// hold c.mu (read or write). Split out so the alias-maintenance hooks
 // invoked from SetProperty / SetMetadataFlat / MergeMetadataFlat can reuse
-// the work without re-entering the lock — nested RLock can deadlock
-// against a waiting writer.
-func (c *Client) addAliasLocked(ctx context.Context, uuid, token string) error {
-	if uuid == "" || token == "" {
-		return fmt.Errorf("uuid and token are required")
+// the work without re-entering the lock — nested RLock can deadlock against
+// a waiting writer.
+func (c *Client) addAliasLocked(ctx context.Context, uuid, cidStr string) error {
+	if uuid == "" || cidStr == "" {
+		return fmt.Errorf("uuid and cid are required")
 	}
-	if cid.AlgorithmOf(token) == "" {
-		return fmt.Errorf("token %q is not in <algorithm>:<value> form", token)
-	}
+
+	keysetKey := c.buildKeyPrefix(uuid) + CIDsKeyPrefix + cidStr
 
 	// Self-pointing alias guard. If the caller is trying to register
-	// `cid:<algo>:<value>` → `<value>` (i.e. the root IS the cid value),
-	// that's the dual-root failure mode in disguise — it means somebody
-	// wrote /meta/<value> without first resolving via ResolveRoot. Refuse
-	// the alias write; leave the existing alias (if any) alone. Still
-	// add to this root's cids set so the field-level write succeeds.
-	if uuid == cid.ValueOf(token) {
-		if _, err := c.client.SAdd(ctx, c.buildKeyPrefix(uuid)+CIDsField, token).Result(); err != nil {
-			return fmt.Errorf("sadd cids set: %w", err)
-		}
-		return c.reconcileCanonicalCIDLocked(ctx, uuid)
+	// cid:<cid> → <cid> (i.e. the root IS the cid value), that's the
+	// dual-root failure mode in disguise — it means somebody wrote
+	// /meta/<cid> without first resolving via ResolveRoot. Refuse the alias
+	// write; leave any existing alias alone. Still record the key-set
+	// membership so the field-level write succeeds.
+	if uuid == cidStr {
+		return c.client.Set(ctx, keysetKey, "true", 0).Err()
 	}
 
-	// Guard against the dual-root pattern: if `cid:<token>` already points
-	// at a DIFFERENT uuid, don't silently overwrite. The historical bug:
-	// meta-sort writing cid_midhash256=<v> to root "<v>" caused the hook
-	// to register cid:midhash256:<v> → <v>, severing the watcher's prior
-	// cid:midhash256:<v> → <real-uuid> alias. With write-path resolution
-	// now in place callers shouldn't hit this anymore, but the guard is
-	// cheap and prevents regression if a new caller bypasses ResolveRoot.
-	indexKey := c.buildCIDIndexKey(token)
+	// Guard against the dual-root pattern: if cid:<cid> already points at a
+	// DIFFERENT uuid, don't silently overwrite. Leave the existing alias and
+	// just record the key-set membership so it's still discoverable via the
+	// root → cids enumeration.
+	indexKey := c.buildCIDIndexKey(cidStr)
 	existing, err := c.client.Get(ctx, indexKey).Result()
 	if err != nil && err != redis.Nil {
 		return fmt.Errorf("read existing alias: %w", err)
 	}
 	if existing != "" && existing != uuid {
-		// Existing alias points elsewhere. Leave it alone and just add the
-		// token to this root's cids set so it's still discoverable via the
-		// root → cids enumeration.
-		if _, err := c.client.SAdd(ctx, c.buildKeyPrefix(uuid)+CIDsField, token).Result(); err != nil {
-			return fmt.Errorf("sadd cids set: %w", err)
-		}
-		return c.reconcileCanonicalCIDLocked(ctx, uuid)
+		return c.client.Set(ctx, keysetKey, "true", 0).Err()
 	}
 
-	prefix := c.buildKeyPrefix(uuid)
 	pipe := c.client.Pipeline()
 	pipe.Set(ctx, indexKey, uuid, 0)
-	pipe.SAdd(ctx, prefix+CIDsField, token)
+	pipe.Set(ctx, keysetKey, "true", 0)
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("add alias pipeline: %w", err)
 	}
-	return c.reconcileCanonicalCIDLocked(ctx, uuid)
+	return nil
 }
 
-// ResolveRoot maps a hash supplied by a caller (a meta-sort write, an
-// editor lookup, an SSE consumer) to the actual storage root key.
+// ResolveRoot maps a hash supplied by a caller (a meta-sort write, an editor
+// lookup, an SSE consumer) to the actual storage root key.
 //
-// Callers historically send a bare midhash256 value (e.g.
-// "bagacba…") because that's what the watcher publishes on file:events.
-// The UUID-rooted-metadata design (see docs/uuid-rooted-metadata.md)
-// keeps roots opaque and aliases CIDs into the reverse index:
+// Callers send a bare CID (e.g. the midhash "bafk…" the watcher publishes on
+// file:events, or any sibling CID). Roots are kept opaque and every CID is
+// aliased into the reverse index:
 //
-//	cid:midhash256:bagacba… → 01KSBHM*
+//	cid:bafk… → 01KSBHM*
 //
-// Without resolution, every /meta/<midhash> write creates a parallel
-// midhash-rooted entry that the watcher's UUID never sees. The editor
-// then shows two entries per file: the (rich) midhash root and the
-// (empty) UUID root containing only `duplicates`.
+// Without resolution, every /meta/<cid> write creates a parallel cid-rooted
+// entry that the watcher's UUID never sees.
 //
 // Behaviour:
 //   - empty hash → empty (caller's problem)
-//   - hash matches cid:midhash256:<hash> in the reverse index → return UUID
+//   - hash matches a reverse-index entry → return UUID
 //   - otherwise return hash unchanged (legacy / explicit-UUID writes)
 //
-// Errors are converted to "no resolution" — if Redis is down or the
-// lookup fails we let the caller proceed with the bare hash and surface
-// the Redis failure on the actual operation.
+// Errors are converted to "no resolution" — if Redis is down or the lookup
+// fails we let the caller proceed with the bare hash and surface the Redis
+// failure on the actual operation.
 func (c *Client) ResolveRoot(hash string) string {
 	if hash == "" {
 		return hash
 	}
-	uuid, err := c.GetByCID("midhash256:" + hash)
+	uuid, err := c.GetByCID(hash)
 	if err != nil || uuid == "" {
 		return hash
 	}
 	return uuid
 }
 
-// GetByCID resolves a CID token to the UUID of its root. Returns ("", nil)
-// when the token is unknown; the empty string is the "not found" signal
-// rather than a typed error so callers can branch without errors.As.
-func (c *Client) GetByCID(token string) (string, error) {
+// GetByCID resolves a bare CID to the UUID of its root. Returns ("", nil)
+// when the CID is unknown; the empty string is the "not found" signal rather
+// than a typed error so callers can branch without errors.As.
+func (c *Client) GetByCID(cidStr string) (string, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	if c.client == nil {
 		return "", fmt.Errorf("not connected")
 	}
-	if token == "" {
+	if cidStr == "" {
 		return "", nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	uuid, err := c.client.Get(ctx, c.buildCIDIndexKey(token)).Result()
+	uuid, err := c.client.Get(ctx, c.buildCIDIndexKey(cidStr)).Result()
 	if err == redis.Nil {
 		return "", nil
 	}
@@ -250,9 +233,32 @@ func (c *Client) AddDuplicatePath(uuid, path string) (bool, error) {
 	return added > 0, nil
 }
 
-// DeleteRoot removes everything keyed off uuid: every file:<uuid>/* property,
-// every reverse-index entry listed in the cids set, and the index membership.
-// Idempotent — a uuid with no remaining keys is a successful no-op.
+// cidsForRootLocked scans the bare-CID key-set for a root and returns its
+// members (bare CIDs, with the cids/ prefix stripped). Caller must hold c.mu.
+func (c *Client) cidsForRootLocked(ctx context.Context, uuid string) ([]string, error) {
+	prefix := c.buildKeyPrefix(uuid) + CIDsKeyPrefix
+	var out []string
+	var cursor uint64
+	for {
+		keys, next, err := c.client.Scan(ctx, cursor, prefix+"*", 1000).Result()
+		if err != nil {
+			return nil, fmt.Errorf("scan cids: %w", err)
+		}
+		for _, k := range keys {
+			out = append(out, strings.TrimPrefix(k, prefix))
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return out, nil
+}
+
+// DeleteRoot removes everything keyed off uuid: every file:<uuid>/* property
+// (including the cids/<cid> key-set), every reverse-index entry for those
+// CIDs, and the index membership. Idempotent — a uuid with no remaining keys
+// is a successful no-op.
 func (c *Client) DeleteRoot(uuid string) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -269,27 +275,25 @@ func (c *Client) DeleteRoot(uuid string) error {
 
 	prefix := c.buildKeyPrefix(uuid)
 
-	// 1. Read the cids set first — once we delete file:<uuid>/* we lose the
-	//    list of reverse-index entries to clean up. Tolerate a missing set
-	//    (empty list = nothing to unmap).
-	tokens, err := c.client.SMembers(ctx, prefix+CIDsField).Result()
-	if err != nil && err != redis.Nil {
-		return fmt.Errorf("smembers cids: %w", err)
+	// 1. Read the cids key-set first — once we delete file:<uuid>/* we lose
+	//    the list of reverse-index entries to clean up.
+	cids, err := c.cidsForRootLocked(ctx, uuid)
+	if err != nil {
+		return err
 	}
 
-	// 2. Delete every reverse-index entry. Build the keys upfront, then DEL
-	//    in one shot so we don't pay per-RTT.
-	if len(tokens) > 0 {
-		keys := make([]string, 0, len(tokens))
-		for _, t := range tokens {
-			keys = append(keys, c.buildCIDIndexKey(t))
+	// 2. Delete every reverse-index entry in one shot.
+	if len(cids) > 0 {
+		keys := make([]string, 0, len(cids))
+		for _, cidStr := range cids {
+			keys = append(keys, c.buildCIDIndexKey(cidStr))
 		}
 		if err := c.client.Del(ctx, keys...).Err(); err != nil {
 			return fmt.Errorf("del cid index: %w", err)
 		}
 	}
 
-	// 3. Scan and delete every file:<uuid>/* key.
+	// 3. Scan and delete every file:<uuid>/* key (cids/<cid> keys included).
 	var cursor uint64
 	for {
 		keys, next, err := c.client.Scan(ctx, cursor, prefix+"*", 1000).Result()
@@ -314,115 +318,59 @@ func (c *Client) DeleteRoot(uuid string) error {
 	return nil
 }
 
-// reconcileCanonicalCIDLocked reads the cids set, picks the highest-ranked
-// token, and updates the canonical_cid field if it changed. Called from
-// addAliasLocked after a new alias is registered. Caller must hold c.mu.
-func (c *Client) reconcileCanonicalCIDLocked(ctx context.Context, uuid string) error {
-	prefix := c.buildKeyPrefix(uuid)
-
-	tokens, err := c.client.SMembers(ctx, prefix+CIDsField).Result()
-	if err != nil {
-		return fmt.Errorf("smembers cids: %w", err)
-	}
-	if len(tokens) == 0 {
-		return nil
-	}
-
-	best := tokens[0]
-	for _, t := range tokens[1:] {
-		best = cid.Better(best, t)
-	}
-
-	canonicalKey := prefix + CanonicalCIDField
-	current, err := c.client.Get(ctx, canonicalKey).Result()
-	if err != nil && err != redis.Nil {
-		return fmt.Errorf("get canonical_cid: %w", err)
-	}
-	if current == best {
-		return nil
-	}
-	if err := c.client.Set(ctx, canonicalKey, best, 0).Err(); err != nil {
-		return fmt.Errorf("set canonical_cid: %w", err)
-	}
-	return nil
-}
-
-// maybeAddAliasFromFieldLocked inspects a (field, value) pair written into
-// a root. If it looks like a CID field — name is "midhash256" or starts
-// with "cid_" — it registers the implied CID token as an alias. Plugins
-// write CID fields without knowing about the reverse index; this hook
-// keeps the index in sync transparently.
+// maybeAddAliasFromFieldLocked inspects a (field, value) pair written into a
+// root. If it's a key-set member — field name starts with "cids/" — it
+// registers the implied CID in the reverse index. Writers emit cids/<cid>
+// members without knowing about the reverse index; this hook keeps it in
+// sync transparently.
 //
-// Caller must hold c.mu. Errors are intentionally swallowed at the call
-// site (logged, not returned): an out-of-sync reverse index is recoverable
-// via a sweep, while a failed property write is not.
+// Caller must hold c.mu. Errors are intentionally swallowed at the call site
+// (logged, not returned): an out-of-sync reverse index is recoverable via a
+// sweep, while a failed property write is not.
 func (c *Client) maybeAddAliasFromFieldLocked(ctx context.Context, uuid, field, value string) error {
-	token := cidTokenFromField(field, value)
-	if token == "" {
+	cidStr := cidFromKeysetField(field)
+	if cidStr == "" {
 		return nil
 	}
-	return c.addAliasLocked(ctx, uuid, token)
+	return c.addAliasLocked(ctx, uuid, cidStr)
 }
 
 // maybeAddAliasesFromMetadataLocked bulk-applies maybeAddAliasFromFieldLocked
 // over every entry in a metadata map. Used by SetMetadataFlat /
-// MergeMetadataFlat after the underlying pipeline write succeeds. Caller
-// must hold c.mu.
+// MergeMetadataFlat after the underlying pipeline write succeeds. Caller must
+// hold c.mu.
 func (c *Client) maybeAddAliasesFromMetadataLocked(ctx context.Context, uuid string, metadata map[string]string) {
-	for k, v := range metadata {
-		_ = c.maybeAddAliasFromFieldLocked(ctx, uuid, k, v)
+	for k := range metadata {
+		_ = c.maybeAddAliasFromFieldLocked(ctx, uuid, k, metadata[k])
 	}
 }
 
-// cidTokenFromField turns a (field-name, raw-value) pair into a normalized
-// CID token "<algorithm>:<value>". Returns "" for non-CID fields.
-//
-// Acceptable inputs:
-//   - field="midhash256", value="bafk…"           → "midhash256:bafk…"
-//   - field="cid_sha256",  value="bafk…"          → "sha256:bafk…"
-//   - field="cid_ipfs",    value="ipfs:bafy…"     → "ipfs:bafy…" (trusted)
-//
-// Plugins that already use the prefixed form get their value passed through;
-// plugins that store the bare CID get prefixed from the field name. The
-// detection heuristic is just "value contains a colon" — base32lower CIDs
-// never contain colons, so this is unambiguous.
-func cidTokenFromField(field, value string) string {
-	if value == "" {
+// cidFromKeysetField returns the bare CID encoded in a cids/<cid> field name,
+// or "" if the field isn't a key-set member.
+func cidFromKeysetField(field string) string {
+	if !strings.HasPrefix(field, CIDsKeyPrefix) {
 		return ""
 	}
-	var algo string
-	switch {
-	case field == "midhash256":
-		algo = "midhash256"
-	case strings.HasPrefix(field, "cid_"):
-		algo = strings.TrimPrefix(field, "cid_")
-	default:
-		return ""
-	}
-	if algo == "" {
-		return ""
-	}
-	if strings.IndexByte(value, ':') > 0 {
-		return value
-	}
-	return cid.Token(algo, value)
+	return strings.TrimPrefix(field, CIDsKeyPrefix)
 }
 
 // MetadataDocument is the complete state of one file as the public API
-// returns it: every flat string field, plus the cids and duplicates sets
-// hoisted into typed arrays. Distinct from GetMetadataFlat (which only
-// returns string keys) — clients querying /api/meta/<cid> want the SETs
-// expanded too, since "what other CIDs identify this file" and "what other
-// paths point at this content" are core to the response.
+// returns it: every flat string field (the cids/<cid> members included),
+// plus the CIDs hoisted into a typed array, the canonical CID derived by
+// rank, and the duplicates set. Distinct from GetMetadataFlat (which only
+// returns the raw string keys).
 type MetadataDocument struct {
 	Flat       map[string]string `json:"metadata"`
 	CIDs       []string          `json:"cids"`
+	Canonical  string            `json:"canonical_cid,omitempty"`
 	Duplicates []string          `json:"duplicates"`
 }
 
 // GetMetadataDocument returns the full document for a root: every string
-// property under file:<uuid>/* plus the cids and duplicates SETs. Returns
-// nil if the root has no keys at all (deleted or never existed).
+// property under file:<uuid>/* (cids/<cid> members included in Flat), the
+// CIDs hoisted into a typed array, the canonical CID computed by rank, and
+// the duplicates SET. Returns nil if the root has no keys at all (deleted or
+// never existed).
 func (c *Client) GetMetadataDocument(uuid string) (*MetadataDocument, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -443,10 +391,24 @@ func (c *Client) GetMetadataDocument(uuid string) (*MetadataDocument, error) {
 	}
 	prefix := c.buildKeyPrefix(uuid)
 
-	cids, err := c.client.SMembers(ctx, prefix+CIDsField).Result()
-	if err != nil && err != redis.Nil {
-		return nil, fmt.Errorf("smembers cids: %w", err)
+	// Hoist the cids/<cid> key-set members into a typed array and derive the
+	// canonical CID by rank. The members remain in Flat too — that's how
+	// flat-map consumers (meta-share ingest) see them.
+	cids := make([]string, 0)
+	canonical := ""
+	for k := range flat {
+		if !strings.HasPrefix(k, CIDsKeyPrefix) {
+			continue
+		}
+		cidStr := strings.TrimPrefix(k, CIDsKeyPrefix)
+		cids = append(cids, cidStr)
+		if canonical == "" {
+			canonical = cidStr
+		} else {
+			canonical = cid.Better(canonical, cidStr)
+		}
 	}
+
 	dups, err := c.client.SMembers(ctx, prefix+DuplicatesField).Result()
 	if err != nil && err != redis.Nil {
 		return nil, fmt.Errorf("smembers duplicates: %w", err)
@@ -458,19 +420,7 @@ func (c *Client) GetMetadataDocument(uuid string) (*MetadataDocument, error) {
 	return &MetadataDocument{
 		Flat:       flat,
 		CIDs:       cids,
+		Canonical:  canonical,
 		Duplicates: dups,
 	}, nil
 }
-
-// lookupSidecarPathByCID — REMOVED.
-//
-// This function used to walk every metadata entry looking for poster/backdrop
-// matches and return their `posterPath`/`backdropPath` companion fields. It
-// was a workaround for plugin output (TMDB images, etc.) not being indexed
-// by the watcher.
-//
-// Now that the plugin output directory is a first-class watcher root
-// (see config.DefaultWatcherPaths), every plugin artefact has its own
-// midhash256 alias and resolves through the standard reverse index. Storing
-// paths in metadata broke the CID-as-identity contract; the watcher
-// indexing fixes the root cause.

@@ -52,26 +52,23 @@ func TestNewUUID_TimeSortable(t *testing.T) {
 	}
 }
 
-func TestCIDTokenFromField(t *testing.T) {
+func TestCIDFromKeysetField(t *testing.T) {
 	cases := []struct {
-		field, value string
-		want         string
+		field string
+		want  string
 	}{
-		{"midhash256", "bafk", "midhash256:bafk"},
-		{"cid_sha256", "bafk", "sha256:bafk"},
-		{"cid_ipfs", "bafy", "ipfs:bafy"},
-		{"cid_sha256", "sha256:bafk", "sha256:bafk"}, // already prefixed
-		{"cid_ipfs", "ipfs:bafy", "ipfs:bafy"},       // already prefixed
-		{"title", "Inception", ""},                    // non-CID field
-		{"tmdb/title", "Inception", ""},               // non-CID nested
-		{"cid_", "bafk", ""},                          // empty algo
-		{"midhash256", "", ""},                        // empty value
-		{"cid_sha256", "", ""},                        // empty value
+		{"cids/bafkmidhash", "bafkmidhash"},
+		{"cids/baejbeisha256", "baejbeisha256"},
+		{"cids/bafyipfs", "bafyipfs"},
+		{"title", ""},          // non-CID field
+		{"tmdb/title", ""},     // non-CID nested
+		{"cid_sha2-256", ""},   // legacy flat field — no longer recognized
+		{"midhash256", ""},     // legacy named field — no longer recognized
+		{"cids", ""},           // prefix without a member
 	}
 	for _, tc := range cases {
-		if got := cidTokenFromField(tc.field, tc.value); got != tc.want {
-			t.Errorf("cidTokenFromField(%q, %q) = %q, want %q",
-				tc.field, tc.value, got, tc.want)
+		if got := cidFromKeysetField(tc.field); got != tc.want {
+			t.Errorf("cidFromKeysetField(%q) = %q, want %q", tc.field, got, tc.want)
 		}
 	}
 }

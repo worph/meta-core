@@ -291,16 +291,16 @@ func (c *Client) DeleteMetadata(hashID string) (int64, error) {
 
 	prefix := c.buildKeyPrefix(hashID)
 
-	// Read the cids set first — once file:<uuid>/* is gone we've lost the
+	// Read the cids key-set first — once file:<uuid>/* is gone we've lost the
 	// list of reverse-index keys that need cleanup.
-	tokens, err := c.client.SMembers(ctx, prefix+CIDsField).Result()
-	if err != nil && err != redis.Nil {
-		return 0, fmt.Errorf("smembers cids: %w", err)
+	cids, err := c.cidsForRootLocked(ctx, hashID)
+	if err != nil {
+		return 0, err
 	}
-	if len(tokens) > 0 {
-		idxKeys := make([]string, 0, len(tokens))
-		for _, t := range tokens {
-			idxKeys = append(idxKeys, c.buildCIDIndexKey(t))
+	if len(cids) > 0 {
+		idxKeys := make([]string, 0, len(cids))
+		for _, cidStr := range cids {
+			idxKeys = append(idxKeys, c.buildCIDIndexKey(cidStr))
 		}
 		if err := c.client.Del(ctx, idxKeys...).Err(); err != nil {
 			return 0, fmt.Errorf("del cid index: %w", err)
@@ -347,31 +347,23 @@ func (c *Client) CountFiles() (int, error) {
 	return len(hashIDs), nil
 }
 
-// LookupPathByCID resolves a CID to its file path on disk via the reverse
-// index. O(1) lookup followed by a single GET of file:<uuid>/filePath.
+// LookupPathByCID resolves a bare CID to its file path on disk via the
+// reverse index. O(1) lookup followed by a single GET of file:<uuid>/filePath.
 //
-// Accepts both prefixed tokens ("midhash256:bafk…", "sha256:…",
-// "ipfs:bafy…") and bare midhash256 CIDs — the bare form is what the
-// editor passes to /api/file/{cid}/info because that's how plugins
-// write the value (e.g. `backdrop=<bare-cid>`). For bare tokens we
-// try the midhash256 prefix as a fallback.
+// Any registered CID resolves — the midhash, a sibling sha2-256, an IPFS
+// CID, a btih, etc. (they all alias to the same root). The bare CID is what
+// the editor passes to /api/file/{cid}/info and what plugins write (e.g.
+// `backdrop=<bare-cid>`).
 //
 // Plugin output (TMDB posters/backdrops, extracted subtitles, etc.) is
 // resolved through this same path: the plugin output directory is a
-// watcher root (see config.DefaultWatcherPaths), so every plugin
-// artefact gets a midhash256 alias and resolves through the reverse
-// index like any other file. There is no path-companion sidecar field.
-func (c *Client) LookupPathByCID(token string) (string, error) {
-	uuid, err := c.GetByCID(token)
+// watcher root (see config.DefaultWatcherPaths), so every plugin artefact
+// gets a midhash alias and resolves through the reverse index like any
+// other file. There is no path-companion sidecar field.
+func (c *Client) LookupPathByCID(cidStr string) (string, error) {
+	uuid, err := c.GetByCID(cidStr)
 	if err != nil {
 		return "", err
-	}
-	if uuid == "" && !strings.Contains(token, ":") {
-		// Bare CID — most likely a midhash256 written by a plugin.
-		uuid, err = c.GetByCID("midhash256:" + token)
-		if err != nil {
-			return "", err
-		}
 	}
 	if uuid == "" {
 		return "", nil
@@ -599,23 +591,24 @@ func (c *Client) RemoveFromSet(hashID, property, value string) (bool, error) {
 // file. Used by the watcher hydrator at startup to avoid re-mid-hashing
 // files whose tuple matches what's already in Redis.
 //
-// HashID is the root identifier (UUIDv7 in the current model); MidHash256
-// is the actual midhash CID for the file, present iff the watcher already
-// computed and stored it. Hydration uses HashID for the state-registry
-// key and MidHash256 for the in-memory "I already know this hash" flag.
+// HashID is the root identifier (UUIDv7 in the current model). Hydration
+// uses HashID + (FilePath, Size, MtimeNano) to seed the in-memory state so
+// the next scan can skip re-mid-hashing files whose size+mtime are unchanged.
 type FileTuple struct {
-	HashID     string
-	FilePath   string
-	Size       int64
-	MtimeNano  int64
-	MidHash256 string
+	HashID    string
+	FilePath  string
+	Size      int64
+	MtimeNano int64
 }
 
 // GetTuplesForAllFiles returns one FileTuple per indexed root, fetched in
 // batched MGETs (no SCAN per root). Skips files missing any of filePath,
-// sizeByte, or mtimeNano. midhash256 is optional — files that haven't
-// been hashed yet still appear in the result with an empty MidHash256.
-// Sub-second on local Redis for ~10K files.
+// sizeByte, or mtimeNano. Sub-second on local Redis for ~10K files.
+//
+// The midhash is intentionally NOT fetched here: it now lives only as a
+// cids/<cid> key-set member (no named field), and the skip-rehash decision
+// is purely size+mtime — so reading it would cost a SCAN per file for no
+// benefit.
 func (c *Client) GetTuplesForAllFiles() ([]FileTuple, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -638,8 +631,8 @@ func (c *Client) GetTuplesForAllFiles() ([]FileTuple, error) {
 	// Build the key list: 4 keys per root, in a fixed order so we can decode
 	// the MGET response by position. fields[i] for hashIDs[j] sits at
 	// keys[j*4+i].
-	const fieldsPerFile = 4
-	fields := [fieldsPerFile]string{"filePath", "sizeByte", "mtimeNano", "midhash256"}
+	const fieldsPerFile = 3
+	fields := [fieldsPerFile]string{"filePath", "sizeByte", "mtimeNano"}
 	keys := make([]string, 0, len(hashIDs)*fieldsPerFile)
 	for _, h := range hashIDs {
 		prefix := c.buildKeyPrefix(h)
@@ -669,7 +662,6 @@ func (c *Client) GetTuplesForAllFiles() ([]FileTuple, error) {
 		filePath, _ := values[base].(string)
 		sizeStr, _ := values[base+1].(string)
 		mtimeStr, _ := values[base+2].(string)
-		midhash, _ := values[base+3].(string)
 		if filePath == "" || sizeStr == "" || mtimeStr == "" {
 			continue
 		}
@@ -682,11 +674,10 @@ func (c *Client) GetTuplesForAllFiles() ([]FileTuple, error) {
 			continue
 		}
 		out = append(out, FileTuple{
-			HashID:     h,
-			FilePath:   filePath,
-			Size:       size,
-			MtimeNano:  mtime,
-			MidHash256: midhash,
+			HashID:    h,
+			FilePath:  filePath,
+			Size:      size,
+			MtimeNano: mtime,
 		})
 	}
 	return out, nil
