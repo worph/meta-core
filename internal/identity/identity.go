@@ -21,6 +21,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
@@ -156,6 +158,134 @@ func Delete(path string) error {
 func Exists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// --- Multi-account keystore -------------------------------------------------
+//
+// Accounts live as one file per keypair at {dir}/{uid}.json. The uid is a
+// multibase base58btc string, so it is filename-safe; validUID still refuses
+// anything that could escape the accounts directory.
+
+// validUID accepts the alphanumeric multibase/base58btc shape we mint for uids
+// and rejects path separators or traversal sequences.
+func validUID(uid string) bool {
+	if uid == "" || len(uid) > 128 || uid != filepath.Base(uid) {
+		return false
+	}
+	for _, r := range uid {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func accountFilePath(dir, uid string) (string, error) {
+	if !validUID(uid) {
+		return "", fmt.Errorf("invalid uid: %q", uid)
+	}
+	return filepath.Join(dir, uid+".json"), nil
+}
+
+// SaveAccount writes an identity into the multi-account store. It does not
+// check for prior existence — callers wanting append-only semantics check
+// ExistsByUID first.
+func SaveAccount(dir string, id *Identity) error {
+	if id == nil {
+		return errors.New("nil identity")
+	}
+	path, err := accountFilePath(dir, id.UID)
+	if err != nil {
+		return err
+	}
+	return Save(path, id)
+}
+
+// LoadByUID reads one account. Returns (nil, nil) when absent.
+func LoadByUID(dir, uid string) (*Identity, error) {
+	path, err := accountFilePath(dir, uid)
+	if err != nil {
+		return nil, err
+	}
+	return Load(path)
+}
+
+// ExistsByUID reports whether an account file exists for uid.
+func ExistsByUID(dir, uid string) bool {
+	path, err := accountFilePath(dir, uid)
+	if err != nil {
+		return false
+	}
+	return Exists(path)
+}
+
+// DeleteByUID removes one account. Idempotent.
+func DeleteByUID(dir, uid string) error {
+	path, err := accountFilePath(dir, uid)
+	if err != nil {
+		return err
+	}
+	return Delete(path)
+}
+
+// List returns every account, sorted by CreatedAt ascending (then UID, for a
+// stable order among same-second creations). Returns nil when the directory
+// does not exist yet.
+func List(dir string) ([]*Identity, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read accounts dir: %w", err)
+	}
+	var out []*Identity
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		id, err := Load(filepath.Join(dir, e.Name()))
+		if err != nil {
+			return nil, err
+		}
+		if id != nil {
+			out = append(out, id)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt != out[j].CreatedAt {
+			return out[i].CreatedAt < out[j].CreatedAt
+		}
+		return out[i].UID < out[j].UID
+	})
+	return out, nil
+}
+
+// MigrateLegacy folds a pre-multi-account identity.json into the accounts
+// store as an entry, then removes the legacy file. Idempotent and a no-op when
+// the legacy file is absent. Returns true when a migration ran.
+func MigrateLegacy(legacyPath, accountsDir string) (bool, error) {
+	id, err := Load(legacyPath)
+	if err != nil {
+		return false, err
+	}
+	if id == nil {
+		return false, nil
+	}
+	// Don't clobber an account already present for this uid.
+	if !ExistsByUID(accountsDir, id.UID) {
+		if err := SaveAccount(accountsDir, id); err != nil {
+			return false, err
+		}
+	}
+	if err := Delete(legacyPath); err != nil {
+		return false, fmt.Errorf("remove legacy identity after migration: %w", err)
+	}
+	return true, nil
 }
 
 // Sign produces an ECDSA-secp256k1 signature over SHA-256(bytes). The output

@@ -11,6 +11,7 @@ import (
 	"github.com/metazla/meta-core/internal/config"
 	"github.com/metazla/meta-core/internal/discovery"
 	"github.com/metazla/meta-core/internal/events"
+	"github.com/metazla/meta-core/internal/identity"
 	"github.com/metazla/meta-core/internal/leader"
 	"github.com/metazla/meta-core/internal/mounts"
 	"github.com/metazla/meta-core/internal/schema"
@@ -136,6 +137,14 @@ func NewServer(
 	// Initialize WebDAV handler (caching is handled by nginx proxy_cache)
 	s.webdavHandler = webdav.NewHandler(cfg)
 
+	// One-time migration: fold a pre-multi-account identity.json into the
+	// per-account keystore so existing single-identity hosts keep their uid.
+	if migrated, err := identity.MigrateLegacy(cfg.IdentityFilePath(), cfg.IdentityAccountsDir()); err != nil {
+		log.Printf("[API] Warning: identity migration failed: %v", err)
+	} else if migrated {
+		log.Printf("[API] Migrated legacy identity.json into multi-account keystore")
+	}
+
 	s.setupRoutes()
 	return s
 }
@@ -158,6 +167,7 @@ func (s *Server) setupRoutes() {
 	// User Data Layer signing identity (see internal/identity). Auth-gated
 	// at the perimeter — do NOT add to nginx-hash-lock unauth bypass.
 	s.router.HandleFunc("/api/identity", s.handleIdentityGet).Methods("GET")
+	s.router.HandleFunc("/api/identity/accounts", s.handleIdentityAccounts).Methods("GET")
 	s.router.HandleFunc("/api/identity/generate", s.handleIdentityGenerate).Methods("POST")
 	s.router.HandleFunc("/api/identity/import", s.handleIdentityImport).Methods("POST")
 	s.router.HandleFunc("/api/identity", s.handleIdentityDelete).Methods("DELETE")

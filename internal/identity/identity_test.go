@@ -190,6 +190,111 @@ func TestDeriveAEADKeyIsDeterministic(t *testing.T) {
 	}
 }
 
+func TestAccountStoreRoundtrip(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "accounts")
+
+	// Empty store.
+	list, err := List(dir)
+	if err != nil {
+		t.Fatalf("List on missing dir: %v", err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("expected empty store, got %d", len(list))
+	}
+
+	a, _ := Generate()
+	b, _ := Generate()
+	if err := SaveAccount(dir, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveAccount(dir, b); err != nil {
+		t.Fatal(err)
+	}
+
+	if !ExistsByUID(dir, a.UID) || !ExistsByUID(dir, b.UID) {
+		t.Fatal("both accounts should exist")
+	}
+
+	list, err = List(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("expected 2 accounts, got %d", len(list))
+	}
+
+	got, err := LoadByUID(dir, a.UID)
+	if err != nil || got == nil || got.PrivateKeyHex != a.PrivateKeyHex {
+		t.Fatalf("LoadByUID roundtrip failed: %+v err=%v", got, err)
+	}
+
+	// Missing uid → (nil, nil).
+	if got, err := LoadByUID(dir, "zdoesnotexist"); err != nil || got != nil {
+		t.Fatalf("LoadByUID on missing should be (nil,nil): %+v %v", got, err)
+	}
+
+	// Delete one; the other remains. Delete is idempotent.
+	if err := DeleteByUID(dir, a.UID); err != nil {
+		t.Fatal(err)
+	}
+	if ExistsByUID(dir, a.UID) {
+		t.Fatal("account should be gone after delete")
+	}
+	if err := DeleteByUID(dir, a.UID); err != nil {
+		t.Fatalf("delete should be idempotent: %v", err)
+	}
+	list, _ = List(dir)
+	if len(list) != 1 || list[0].UID != b.UID {
+		t.Fatalf("expected only b remaining, got %+v", list)
+	}
+}
+
+func TestAccountFilePathRejectsTraversal(t *testing.T) {
+	for _, bad := range []string{"", "../escape", "a/b", "z..", strings.Repeat("z", 200)} {
+		if _, err := accountFilePath("/tmp/x", bad); err == nil {
+			t.Fatalf("expected rejection of uid %q", bad)
+		}
+	}
+	// A real uid is accepted.
+	id, _ := Generate()
+	if _, err := accountFilePath("/tmp/x", id.UID); err != nil {
+		t.Fatalf("real uid rejected: %v", err)
+	}
+}
+
+func TestMigrateLegacy(t *testing.T) {
+	base := t.TempDir()
+	legacy := filepath.Join(base, "identity.json")
+	accounts := filepath.Join(base, "accounts")
+
+	// No legacy file → no-op.
+	if migrated, err := MigrateLegacy(legacy, accounts); err != nil || migrated {
+		t.Fatalf("expected no-op migration, got migrated=%v err=%v", migrated, err)
+	}
+
+	id, _ := Generate()
+	if err := Save(legacy, id); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := MigrateLegacy(legacy, accounts)
+	if err != nil || !migrated {
+		t.Fatalf("expected migration to run: migrated=%v err=%v", migrated, err)
+	}
+	if Exists(legacy) {
+		t.Fatal("legacy file should be removed after migration")
+	}
+	got, err := LoadByUID(accounts, id.UID)
+	if err != nil || got == nil || got.UID != id.UID {
+		t.Fatalf("migrated account not found: %+v err=%v", got, err)
+	}
+
+	// Second run is a clean no-op (legacy already gone).
+	if migrated, err := MigrateLegacy(legacy, accounts); err != nil || migrated {
+		t.Fatalf("second migration should no-op: migrated=%v err=%v", migrated, err)
+	}
+}
+
 func bytesEqual(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false

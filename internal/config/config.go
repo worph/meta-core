@@ -111,9 +111,18 @@ func (c *Config) IdentityDir() string {
 	return c.MetaCorePath + "/identity"
 }
 
-// IdentityFilePath returns the path to the persisted identity JSON.
+// IdentityFilePath returns the path to the legacy single-identity JSON. It is
+// only read once, by the multi-account migration on startup; new accounts live
+// under IdentityAccountsDir.
 func (c *Config) IdentityFilePath() string {
 	return c.IdentityDir() + "/identity.json"
+}
+
+// IdentityAccountsDir returns the directory holding one JSON file per account
+// in the multi-account keystore ({uid}.json). meta-core is a pure multi-key
+// signer — display name / avatar live in the User Data Layer, not here.
+func (c *Config) IdentityAccountsDir() string {
+	return c.IdentityDir() + "/accounts"
 }
 
 func getEnv(key, defaultValue string) string {
