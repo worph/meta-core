@@ -87,9 +87,13 @@ func (s *Service) buildServiceInfo() *ServiceInfo {
 	hostname, _ := os.Hostname()
 	ip := getLocalIP()
 
-	// Use BASE_URL for external access, fall back to internal IP
+	// Browser-facing nav URL: prefer META_CORE_PUBLIC_URL (the reachable URL
+	// when there's no Caddy perimeter in front — e.g. a debug-direct port),
+	// then BASE_URL (the Caddy perimeter URL), then the internal IP.
 	var baseUrl string
-	if s.config.BaseURL != "" {
+	if s.config.PublicURL != "" {
+		baseUrl = s.config.PublicURL
+	} else if s.config.BaseURL != "" {
 		baseUrl = s.config.BaseURL
 	} else {
 		baseUrl = fmt.Sprintf("http://%s:%d", ip, s.config.APIPort)

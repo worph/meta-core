@@ -17,6 +17,7 @@ type Config struct {
 	ServiceVersion string // Service version (default: "1.0.0")
 	APIPort        int    // Service HTTP port (for leader info)
 	BaseURL        string // Base URL for stable service discovery
+	PublicURL      string // Browser-facing URL for the service-bar nav; overrides BaseURL when set (e.g. a debug-direct port with no Caddy in front)
 
 	// Redis configuration
 	RedisPort int // Redis port (default: 6379)
@@ -50,6 +51,7 @@ func Load() *Config {
 		ServiceVersion:        getEnv("SERVICE_VERSION", "1.0.0"),
 		APIPort:               getEnvInt("API_PORT", 8180),
 		BaseURL:               getEnv("BASE_URL", ""),
+		PublicURL:             getEnv("META_CORE_PUBLIC_URL", ""),
 		RedisPort:             getEnvInt("REDIS_PORT", 6379),
 		HTTPPort:              getEnvInt("META_CORE_HTTP_PORT", 9000),
 		HTTPHost:              getEnv("META_CORE_HTTP_HOST", "127.0.0.1"),
