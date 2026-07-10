@@ -50,8 +50,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		path = "/"
 	}
 
-	log.Printf("[WebDAV] %s %s", r.Method, path)
-
 	switch r.Method {
 	case "GET", "HEAD":
 		h.handleRead(w, r, path)

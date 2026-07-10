@@ -44,6 +44,8 @@ type PollingStatus struct {
 	CurrentScanStartedAt int64 `json:"currentScanStartedAt,omitempty"` // ms; start of in-flight scan
 	LastScanDurationMs   int64 `json:"lastScanDurationMs,omitempty"`   // duration of the previous scan
 	NextScanAt           int64 `json:"nextScanAt,omitempty"`           // ms; planned start of next adaptive scan
+	LastFileCount        int   `json:"-"`                              // last observed file count; used to suppress no-change scan logs
+	scanned              bool  // true once at least one scan has completed for this mount
 }
 
 // Poller manages per-mount polling goroutines
@@ -309,16 +311,22 @@ func (p *Poller) executeScan(mountID, mountPath string) (time.Duration, error) {
 	end := time.Now()
 	duration := end.Sub(start)
 
+	// Only log a completed scan when the file count changed (or on the very
+	// first scan) so a steady mount doesn't emit one line per poll tick.
+	changed := true
 	p.mu.Lock()
 	if status, exists := p.status[mountID]; exists {
 		status.Scanning = false
 		status.CurrentScanStartedAt = 0
 		status.LastScan = end.UnixMilli()
 		status.LastScanDurationMs = duration.Milliseconds()
+		changed = !status.scanned || status.LastFileCount != fileCount
+		status.LastFileCount = fileCount
+		status.scanned = true
 	}
 	p.mu.Unlock()
 
-	if err == nil {
+	if err == nil && changed {
 		log.Printf("[Poller] Poll scan complete for mount %s: %d files in %s", mountID, fileCount, duration.Round(time.Millisecond))
 	}
 

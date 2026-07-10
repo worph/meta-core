@@ -250,29 +250,22 @@ func (s *Server) setupRoutes() {
 	// Mount management routes (if manager initialized)
 	if s.mountsHandlers != nil {
 		s.mountsHandlers.RegisterRoutes(s.router)
-		log.Println("[API] Mount management routes registered at /api/mounts/*")
 	}
-
-	log.Println("[API] Metadata Editor routes registered at /api/metadata/*")
-	log.Println("[API] KV Browser routes registered at /api/kv/*")
 
 	// File watcher routes (if watcher initialized)
 	if s.watcherHandlers != nil {
 		s.watcherHandlers.RegisterRoutes(s.router)
-		log.Println("[API] File watcher routes registered at /api/events/*, /api/scan/*")
 	}
 
 	// Watchers management routes (if watchers initialized)
 	if s.watchersHandlers != nil {
 		s.watchersHandlers.RegisterRoutes(s.router)
-		log.Println("[API] Watchers management routes registered at /api/watchers/*")
 	}
 
 	// WebDAV handler (caching is handled by nginx proxy_cache)
 	if s.webdavHandler != nil {
 		s.router.PathPrefix("/webdav/").Handler(s.webdavHandler)
 		s.router.PathPrefix("/webdav").Handler(s.webdavHandler)
-		log.Println("[API] WebDAV routes registered at /webdav/*")
 	}
 
 	// Add middleware
@@ -421,12 +414,49 @@ func (s *Server) RepublishMetadata() (int, error) {
 	return s.metaPublisher.RepublishAllMetadata(republishFunc)
 }
 
-// loggingMiddleware logs all requests
+// statusRecorder captures the response status so loggingMiddleware can stay
+// silent on success and only report failures. It forwards Flush/Unwrap so SSE
+// and other streaming handlers keep working through the wrapper.
+type statusRecorder struct {
+	http.ResponseWriter
+	status  int
+	written bool
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	if !r.written {
+		r.status = code
+		r.written = true
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if !r.written {
+		r.status = http.StatusOK
+		r.written = true
+	}
+	return r.ResponseWriter.Write(b)
+}
+
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+// loggingMiddleware logs a request only when it fails (status >= 400), keeping
+// the nominal case quiet. Successful requests are not logged.
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		next.ServeHTTP(w, r)
-		log.Printf("[API] %s %s %s", r.Method, r.URL.Path, time.Since(start))
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		if rec.status >= 400 {
+			log.Printf("[API] %s %s -> %d (%s)", r.Method, r.URL.Path, rec.status, time.Since(start))
+		}
 	})
 }
 

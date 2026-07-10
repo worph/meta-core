@@ -422,10 +422,9 @@ func (w *Watcher) ScanMountPath(mountPath string) (int, error) {
 		return 0, nil
 	}
 
-	// Scan the directory
-	log.Printf("[Watcher] Scanning mount path: %s", mountPath)
+	// Scan the directory. The mount poller reports completed scans (only when
+	// the file count changes), so nothing is logged per scan here.
 	count := w.ScanDirectory(mountPath)
-	log.Printf("[Watcher] Mount scan complete: %s (%d files)", mountPath, count)
 
 	return count, nil
 }
