@@ -683,6 +683,115 @@ func (c *Client) GetTuplesForAllFiles() ([]FileTuple, error) {
 	return out, nil
 }
 
+// SearchTuple is one record's search state: its hashID, a lowercased haystack of
+// its searchable text fields (for token/substring match), and the full flat
+// metadata map (so a search hit is returned straight from memory — no per-result
+// Redis fetch).
+type SearchTuple struct {
+	HashID   string
+	Haystack string
+	Fields   map[string]string
+}
+
+// searchIndexFields are the metadata fields folded into a record's search
+// haystack — must stay in sync with the fields the search handler documents.
+var searchIndexFields = []string{"title", "fileName", "originaltitle", "showtitle", "filePath"}
+
+// GetSearchIndexTuples reads EVERY record's full metadata in a single keyspace
+// SCAN pass over the flat `file:{hashID}/{field}` keys plus batched MGETs,
+// grouped by record — one bulk pass instead of a SCAN+MGET per record (which is
+// O(records) Redis round-trips, ~40s over 72k field keys). It is the bulk source
+// the API folds into its in-memory search index, so per-request search does zero
+// Redis round-trips (match AND result metadata both come from memory).
+func (c *Client) GetSearchIndexTuples() ([]SearchTuple, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.client == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	filePrefix := c.buildKey("file:") // key layout: {filePrefix}{hashID}/{field}
+	indexKey := c.buildIndexKey()     // {filePrefix}__index__ (a SET, skip it)
+	pattern := filePrefix + "*"
+
+	records := make(map[string]map[string]string)
+	keyBatch := make([]string, 0, 1000)
+
+	flush := func() error {
+		if len(keyBatch) == 0 {
+			return nil
+		}
+		values, err := c.client.MGet(ctx, keyBatch...).Result()
+		if err != nil {
+			return fmt.Errorf("mget: %w", err)
+		}
+		for i, k := range keyBatch {
+			v, ok := values[i].(string)
+			if !ok {
+				continue
+			}
+			// {filePrefix}{hashID}/{field}; hashID has no '/', field may.
+			rest := strings.TrimPrefix(k, filePrefix)
+			slash := strings.IndexByte(rest, '/')
+			if slash < 0 {
+				continue
+			}
+			hashID, field := rest[:slash], rest[slash+1:]
+			m := records[hashID]
+			if m == nil {
+				m = make(map[string]string)
+				records[hashID] = m
+			}
+			m[field] = v
+		}
+		keyBatch = keyBatch[:0]
+		return nil
+	}
+
+	var cursor uint64
+	for {
+		keys, next, err := c.client.Scan(ctx, cursor, pattern, 1000).Result()
+		if err != nil {
+			return nil, fmt.Errorf("scan: %w", err)
+		}
+		for _, k := range keys {
+			if k == indexKey {
+				continue
+			}
+			keyBatch = append(keyBatch, k)
+			if len(keyBatch) >= 1000 {
+				if err := flush(); err != nil {
+					return nil, err
+				}
+			}
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	if err := flush(); err != nil {
+		return nil, err
+	}
+
+	out := make([]SearchTuple, 0, len(records))
+	for hashID, fields := range records {
+		var sb strings.Builder
+		for _, f := range searchIndexFields {
+			if v, ok := fields[f]; ok && v != "" {
+				sb.WriteString(strings.ToLower(v))
+				sb.WriteByte('\n')
+			}
+		}
+		out = append(out, SearchTuple{HashID: hashID, Haystack: sb.String(), Fields: fields})
+	}
+	return out, nil
+}
+
 // GetMemoryInfo returns Redis memory usage information
 func (c *Client) GetMemoryInfo() (string, error) {
 	c.mu.RLock()

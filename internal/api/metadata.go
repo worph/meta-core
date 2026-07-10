@@ -395,7 +395,18 @@ func (s *Server) handleSearchMetadata(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get all hash IDs
+	// Free-text query: served from the in-memory search index (search_index.go)
+	// so we match in memory instead of doing a SCAN+MGET Redis round-trip per
+	// record (that was 40s+ over ~72k records). Full metadata is fetched only
+	// for the <=limit matches.
+	if req.Query != "" && req.Property == "" {
+		s.serveIndexedSearch(w, req)
+		return
+	}
+
+	// Property filter (rare) or empty query (returns the first `limit`): the
+	// legacy scan. Empty query only fetches `limit` records; property search is
+	// low-volume and not on the hot search path.
 	allHashIDs, err := s.storage.GetAllHashIDs()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -404,9 +415,6 @@ func (s *Server) handleSearchMetadata(w http.ResponseWriter, r *http.Request) {
 
 	var results []MetadataSearchResult
 	total := len(allHashIDs)
-
-	// Search fields for query
-	searchFields := []string{"title", "fileName", "originaltitle", "showtitle", "filePath"}
 
 	for _, hashID := range allHashIDs {
 		if len(results) >= req.Limit {
@@ -425,28 +433,6 @@ func (s *Server) handleSearchMetadata(w http.ResponseWriter, r *http.Request) {
 			value, ok := metadata[req.Property]
 			if ok && strings.Contains(strings.ToLower(value), strings.ToLower(req.PropertyValue)) {
 				matches = true
-			}
-		}
-
-		// General query search
-		if req.Query != "" && req.Property == "" {
-			queryLower := strings.ToLower(req.Query)
-
-			// Check if query matches hashId
-			if strings.Contains(strings.ToLower(hashID), queryLower) {
-				matches = true
-			}
-
-			// Check search fields
-			if !matches {
-				for _, field := range searchFields {
-					if value, ok := metadata[field]; ok {
-						if strings.Contains(strings.ToLower(value), queryLower) {
-							matches = true
-							break
-						}
-					}
-				}
 			}
 		}
 

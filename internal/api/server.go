@@ -41,6 +41,7 @@ type Server struct {
 	metaPublisher     *events.MetaPublisher
 	schemaIndexer     *schema.Indexer
 	webdavHandler     *webdav.Handler
+	search            *searchIndex
 	router            *mux.Router
 	server            *http.Server
 }
@@ -59,6 +60,7 @@ func NewServer(
 		discovery:      disc,
 		cleaner:        cleaner,
 		storage:        stor,
+		search:         &searchIndex{},
 		router:         mux.NewRouter(),
 	}
 
@@ -312,6 +314,13 @@ func (s *Server) Start() error {
 	// mounts), so always-on rather than gated by config.
 	if s.mountStatsPoller != nil {
 		s.mountStatsPoller.Start()
+	}
+
+	// Build + periodically refresh the in-memory search index so
+	// POST /api/metadata/search matches in memory instead of a Redis
+	// round-trip per record (see search_index.go).
+	if s.storage != nil {
+		go s.search.runRefreshLoop(s.storage)
 	}
 
 	// Start meta publisher (if storage is connected)
