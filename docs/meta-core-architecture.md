@@ -515,7 +515,7 @@ via `/health`; metadata I/O and SSE event streams stop.
 | `BASE_URL` | _empty_ | Overrides constructed `baseUrl` (HTTPS perimeter). |
 | `REDIS_PORT` | `6379` | Local Redis port. |
 | `META_CORE_HTTP_PORT` | `9000` | Go HTTP+SSE+WebDAV port. |
-| `META_CORE_HTTP_HOST` | `127.0.0.1` | HTTP bind address. |
+| `META_CORE_HTTP_HOST` | `0.0.0.0` | HTTP bind address. |
 | `HEALTH_CHECK_INTERVAL_MS` | `5000` | Internal health-loop cadence. |
 | `HEARTBEAT_INTERVAL_MS` | `30000` | Service registry heartbeat. |
 | `STALE_THRESHOLD_MS` | `60000` | Age past which a registry entry is stale. |

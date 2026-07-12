@@ -24,7 +24,7 @@ type Config struct {
 
 	// HTTP API configuration
 	HTTPPort int    // HTTP API port (default: 9000)
-	HTTPHost string // HTTP API host (default: "127.0.0.1")
+	HTTPHost string // HTTP API host (default: "0.0.0.0" — meta-core always runs in a container and must answer siblings)
 
 	// Timing configuration
 	HealthCheckIntervalMS    int // Health check interval in ms (default: 5000)
@@ -54,7 +54,7 @@ func Load() *Config {
 		PublicURL:             getEnv("META_CORE_PUBLIC_URL", ""),
 		RedisPort:             getEnvInt("REDIS_PORT", 6379),
 		HTTPPort:              getEnvInt("META_CORE_HTTP_PORT", 9000),
-		HTTPHost:              getEnv("META_CORE_HTTP_HOST", "127.0.0.1"),
+		HTTPHost:              getEnv("META_CORE_HTTP_HOST", "0.0.0.0"),
 		HealthCheckIntervalMS:  getEnvInt("HEALTH_CHECK_INTERVAL_MS", 5000),
 		HeartbeatIntervalMS:   getEnvInt("HEARTBEAT_INTERVAL_MS", 30000),
 		StaleThresholdMS:      getEnvInt("STALE_THRESHOLD_MS", 60000),

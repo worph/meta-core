@@ -138,7 +138,7 @@ Environment variables consumed by `internal/config/config.go`:
 | `BASE_URL` | _empty_ | Overrides the constructed `baseUrl` if set (used for HTTPS perimeter). |
 | `REDIS_PORT` | `6379` | Local Redis port. |
 | `META_CORE_HTTP_PORT` | `9000` | Go HTTP+SSE+WebDAV port. |
-| `META_CORE_HTTP_HOST` | `127.0.0.1` | HTTP bind. |
+| `META_CORE_HTTP_HOST` | `0.0.0.0` | HTTP bind. |
 | `HEALTH_CHECK_INTERVAL_MS` | `5000` | Internal health-loop cadence. |
 | `HEARTBEAT_INTERVAL_MS` | `30000` | Service registry heartbeat. |
 | `STALE_THRESHOLD_MS` | `60000` | Age past which a registry entry is marked stale. |
