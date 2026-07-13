@@ -192,8 +192,9 @@ func (c *Client) SetMetadataFlat(hashID string, metadata map[string]string) erro
 		return fmt.Errorf("sadd index failed: %w", err)
 	}
 
-	// Auto-register reverse-index aliases for any cid_* or midhash256 fields
-	// in the payload. See cid_resolution.go for the rules.
+	// Auto-register reverse-index aliases for any cids/<cid> key-set members in
+	// the payload. That is the ONLY shape recognised — the legacy flat cid_* /
+	// midhash256 named fields are not (see cid_resolution.go: cidFromKeysetField).
 	c.maybeAddAliasesFromMetadataLocked(ctx, hashID, metadata)
 
 	return nil
@@ -461,8 +462,9 @@ func (c *Client) MergeMetadataFlat(hashID string, metadata map[string]string) (i
 		return len(metadata), fmt.Errorf("sadd index failed: %w", err)
 	}
 
-	// Auto-register reverse-index aliases for any cid_* or midhash256 fields
-	// in the payload. See cid_resolution.go for the rules.
+	// Auto-register reverse-index aliases for any cids/<cid> key-set members in
+	// the payload. That is the ONLY shape recognised — the legacy flat cid_* /
+	// midhash256 named fields are not (see cid_resolution.go: cidFromKeysetField).
 	c.maybeAddAliasesFromMetadataLocked(ctx, hashID, metadata)
 
 	return len(metadata), nil

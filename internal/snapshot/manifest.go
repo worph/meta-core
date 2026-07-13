@@ -5,11 +5,13 @@
 // reject archives whose schemaVersion exceeds what they know.
 //
 // v2 (current): root identifiers are UUIDv7 (Crockford Base32). Entries
-// under metadata/<root>.json carry the flat string properties; the cids
-// and duplicates Redis SETs are NOT serialized yet — they are rebuilt
-// transparently on import because SetMetadataFlat / MergeMetadataFlat
-// auto-register reverse-index aliases for any cid_*/midhash256 field they
-// see (see internal/storage/cid_resolution.go).
+// under metadata/<root>.json carry the flat string properties; the cid
+// reverse-index and the duplicates SET are NOT serialized — they are rebuilt
+// transparently on import because the cids/<cid> key-set members ARE flat
+// properties, and SetMetadataFlat / MergeMetadataFlat auto-register a
+// reverse-index alias for every one they see (see
+// internal/storage/cid_resolution.go: cidFromKeysetField). The legacy flat
+// cid_*/midhash256 named fields are not recognised.
 //
 // v1 (legacy): roots were content-hash-typed tokens like "midhash256:abc".
 // v1 archives can no longer be imported — they would resurrect the
