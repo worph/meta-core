@@ -1,0 +1,153 @@
+{
+  "$schema": "cid-rank-vectors/v1",
+  "$comment": [
+    "CANONICAL golden vectors for the CID utility rank. THE single source of truth.",
+    "The rank decides which of a record's several CIDs is elected canonical - the cid a",
+    "record is advertised and addressed by. It is reimplemented in Go, 2x Rust and 3x TS;",
+    "they cannot share code (independent submodules, no cargo path-dep). These vectors are",
+    "the only thing holding them in sync: every implementation's test suite loads this file.",
+    "",
+    "This file is VENDORED into each consuming submodule (submodule CI cannot read above its",
+    "own tree). scripts/check-cid-vectors.sh diffs every copy against this one.",
+    "",
+    "Ranking is by UTILITY for external retrieval, not cryptographic strength.",
+    "Ties break on the lexicographically smaller cid, so the election is deterministic",
+    "across peers and does not churn.",
+    "",
+    "See METADATA_KEYS.md section 2/14.13 and docs/cid-formats.md."
+  ],
+  "ladder": {
+    "40": "dag-pb (IPFS block)",
+    "30": "sha2-256 / sha3-256 / sha3-384 - real content digests",
+    "20": "BitTorrent infohashes - swarm interop",
+    "10": "midhash256 - the record address",
+    "5": "opaque locators (nzb-release, url) - never outrank a real digest",
+    "0": "weak/unknown digests, unparseable input"
+  },
+  "tieBreak": "lexicographically smaller cid wins",
+  "vectors": [
+    {
+      "name": "ipfs-dagpb",
+      "cid": "bafybeiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "rank": 40,
+      "note": "dag-pb codec 0x70 - chunked IPFS file, broadest network reach"
+    },
+    {
+      "name": "sha2-256-raw-codec",
+      "cid": "bafkreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "rank": 30,
+      "note": "fullhash/gateway convention: raw codec 0x55, mh names the algo"
+    },
+    {
+      "name": "sha2-256-codec-eq-mh",
+      "cid": "baejbeibku6ua2l6r5olnggx4pto2sii2s5jeeawgh4cbkhlbmp52gudbua",
+      "rank": 30,
+      "note": "REAL meta-hash fixture; meta-hash sets codec == mh"
+    },
+    {
+      "name": "sha3-256",
+      "cid": "baelbmidner7x3dd7t2kldh6wiq4w6lsye7qrwo6uoqot2t52zkhqk56fnq",
+      "rank": 30,
+      "note": "REAL meta-hash fixture"
+    },
+    {
+      "name": "sha3-384",
+      "cid": "baekrkmeglipkjf33exqexdvijl4twipruay4wsbvt44akce43lq5rgccxgr7v6dwksmj3sxedakevc53g6ga",
+      "rank": 30,
+      "note": "REAL meta-hash fixture"
+    },
+    {
+      "name": "btih-v2-codec-eq-mh",
+      "cid": "bag3sdnzbeaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "rank": 20,
+      "note": "meta-hash encoder convention"
+    },
+    {
+      "name": "btih-v2-raw-codec",
+      "cid": "bafk3oijaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "rank": 20,
+      "note": "fullhash encoder convention - SAME tier, both conventions must match"
+    },
+    {
+      "name": "btih-v1-file",
+      "cid": "bagasbajacqaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "rank": 20,
+      "note": "gateway per-file BitTorrent v1"
+    },
+    {
+      "name": "btih-v2-file",
+      "cid": "bagbcbaraeaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "rank": 20,
+      "note": "gateway per-file BitTorrent v2"
+    },
+    {
+      "name": "midhash256-codec-eq-mh",
+      "cid": "bagacbabaeaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "rank": 10,
+      "note": "the record address; internally meaningful, externally invisible"
+    },
+    {
+      "name": "midhash256-raw-codec",
+      "cid": "bafkyaibaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "rank": 10
+    },
+    {
+      "name": "nzb-release-locator",
+      "cid": "bagcsaaazcbqxa2jonz5gez3fmvvs42lomzx55ln657fp4aab",
+      "rank": 5,
+      "note": "codec 0x1005 + IDENTITY multihash 0x00. The locator code is in the CODEC slot, not the mh slot - rank MUST match on codec. Tier 5 = below midhash: a locator never outranks a real digest, it wins only as a record's sole cid."
+    },
+    {
+      "name": "url-locator",
+      "cid": "bagdcaaaznb2hi4dthixs6zlymfwxa3dffzxxezzpmexhazdg",
+      "rank": 5,
+      "note": "codec 0x1006 + IDENTITY multihash 0x00. Same tier/reasoning as nzb-release."
+    },
+    {
+      "name": "sha1",
+      "cid": "baeircff3eqvxxaqqot2lt242stkdtk3gq4c2vra",
+      "rank": 0,
+      "note": "REAL meta-hash fixture; weak digest"
+    },
+    {
+      "name": "md5",
+      "cid": "bahkqdvibcatpcfl7ine2n625eb5ml5mzkfaa",
+      "rank": 0,
+      "note": "REAL meta-hash fixture; weak digest"
+    },
+    {
+      "name": "crc32",
+      "cid": "bagzafmqcathsbnrk",
+      "rank": 0,
+      "note": "REAL meta-hash fixture; weak digest"
+    },
+    {
+      "name": "bt-pieces-root",
+      "cid": "bafkyf3qceaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "rank": 0,
+      "note": "torrent-internal merkle root, NOT a file-identity cid"
+    },
+    {
+      "name": "cidv0-rejected",
+      "cid": "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG",
+      "rank": 0,
+      "note": "TRAP: Go rejected this (rank 0) while Rust's MsCid::from_str ACCEPTED it and ranked it 40 (dag-pb). Strict parse = CIDv1 base32-lower only. This vector pins the fix."
+    },
+    {
+      "name": "token-form-rejected",
+      "cid": "midhash256:bagacbabaeaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "rank": 0,
+      "note": "TRAP: the deprecated <algo>:<cid> token form. Rust used to strip the prefix and rank it 10. It must now be rejected."
+    },
+    {
+      "name": "garbage",
+      "cid": "not-a-cid",
+      "rank": 0
+    },
+    {
+      "name": "empty",
+      "cid": "",
+      "rank": 0
+    }
+  ]
+}

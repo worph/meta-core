@@ -19,10 +19,13 @@ For the external-access contract (HTTP-only, SSE for events), see
   `01JKR8XW5T4QMV7AHNJ2DEFGHK`.
 - **Properties are flat Redis STRING keys**, one per leaf:
   `file:<uuid>/<property/path>` → string value. *Not* Redis Hashes.
-- **CIDs are reverse-index aliases**: `cid:<algorithm>:<value>` → `<uuid>`
-  (a Redis STRING per known CID).
-- **Per-root sets**: `file:<uuid>/cids` (every CID), `file:<uuid>/duplicates`
+- **CIDs are reverse-index aliases**: `cid:<bareCid>` → `<uuid>`
+  (a Redis STRING per known CID; no algorithm prefix — the multicodec
+  already carries it).
+- **Per-root sets**: `file:<uuid>/cids/<bareCid>` (a *key-set*: one STRING
+  `"true"` per known CID, midhash included), `file:<uuid>/duplicates`
   (alternate paths with the same content), plus `file:__index__` (every UUID).
+  There is **no stored `canonical_cid`** — it is derived by rank on read.
 - **A schema-version sentinel** (`meta-core:schema-version`) refuses to
   boot against legacy data.
 
@@ -59,37 +62,54 @@ file:01JKR8XW5T4QMV7AHNJ2DEFGHK/tmdb/poster                       = "bafkreih...
 
 ### Reverse-index aliases (CIDs)
 
-Every CID known for a file is registered as its own Redis STRING:
+Every CID known for a file is registered as its own Redis STRING, keyed by
+the **bare CID** — no algorithm prefix. A CIDv1 already encodes its hash
+function in the multicodec, so naming it again in the key would be
+redundant (and would let the same digest be indexed under two spellings):
 
 ```
-cid:<algorithm>:<value>   →   <uuid>
+cid:<bareCid>   →   <uuid>
 ```
 
 Examples:
 
 ```
-cid:midhash256:bafkreih5kapbjzq...   →   01JKR8XW5T4QMV7AHNJ2DEFGHK
-cid:sha256:abc...                    →   01JKR8XW5T4QMV7AHNJ2DEFGHK
-cid:ipfs:bafy...                     →   01JKR8XW5T4QMV7AHNJ2DEFGHK
+cid:bafkreih5kapbjzq...   →   01JKR8XW5T4QMV7AHNJ2DEFGHK
+cid:bagacbabaec7v3...     →   01JKR8XW5T4QMV7AHNJ2DEFGHK
 ```
 
 The reverse index makes `GET /api/meta/<cid>` an O(1) lookup for any
-registered CID, independent of which hash algorithm "primary" — there is
-no primary. The auto-alias hooks in `SetProperty` and `SetMetadataFlat`
-(see `internal/storage/cid_resolution.go`) catch any write of a `cid_*`
-or `midhash256` field and register the alias automatically, so plugins
-don't need to know about the reverse index.
+registered CID, independent of which hash algorithm — there is no primary.
+The auto-alias hook (`maybeAddAliasFromFieldLocked` in
+`internal/storage/cid_resolution.go`, called from `SetProperty`,
+`SetMetadataFlat` and `MergeMetadataFlat`) registers the alias for any
+field whose name starts with `cids/`, so writers emit key-set members
+without knowing the reverse index exists.
+
+> ⚠ The hook matches **only** the `cids/` prefix. A legacy `cid_*` or
+> `midhash256` *named* field written to a root is stored verbatim and is
+> **never indexed** — the record becomes unresolvable by that CID. Writers
+> must collapse such fields to `cids/<cid>` members before the write. See
+> `METADATA_KEYS.md` §14.13.
 
 ### Per-root sets
 
 ```
-file:<uuid>/cids              →   Redis SET of "<algorithm>:<value>" tokens
-file:<uuid>/canonical_cid     →   STRING — the highest-ranked CID for advertising externally
+file:<uuid>/cids/<bareCid>    →   STRING "true" — one key per known CID (a key-set, not a Redis SET)
 file:<uuid>/duplicates        →   Redis SET of alternate paths with same content
 ```
 
-`canonical_cid` is reconciled by `reconcileCanonicalCIDLocked` whenever
-the `cids` set changes; ranking is done by `internal/cid/rank.go`.
+`cids` is a **key-set**: one flat `file:<uuid>/cids/<cid>` STRING per member,
+which keeps it conflict-free to merge across peers (a SET would not be).
+The record's own address (the midhash) is just the `0x1000` member — it has
+no separate field.
+
+There is **no stored `canonical_cid`**. The canonical CID is *derived on
+read*: `GetMetadataDocument` (`internal/storage/cid_resolution.go`) ranks the
+key-set's members through `internal/cid/rank.go` (`cid.Better`) and returns
+the winner as the `canonical_cid` field of the JSON response only. Nothing
+reconciles or persists it — an earlier `reconcileCanonicalCIDLocked` did, and
+was removed with the flat `cid_*` keys.
 
 ### Global index
 
@@ -141,14 +161,15 @@ The Go API in `internal/storage/client.go`:
 | Method | Behaviour |
 |---|---|
 | `GetMetadataFlat(uuid)` | `SCAN` for `file:<uuid>/*`, `MGET` the values, return `map[string]string`. |
-| `SetMetadataFlat(uuid, m)` | Pipeline `SET` per field; `SADD file:__index__`; auto-register any `cid_*` aliases. |
+| `SetMetadataFlat(uuid, m)` | Pipeline `SET` per field; `SADD file:__index__`; auto-register an alias for every `cids/<cid>` member. |
 | `MergeMetadataFlat(uuid, m)` | Like `SetMetadataFlat` but doesn't pre-clear; used by `PATCH /meta/{hash}`. |
 | `GetProperty(uuid, field)` | `GET file:<uuid>/<field>`. |
 | `SetProperty(uuid, field, value)` | `SET file:<uuid>/<field>`; auto-register alias if the field is a CID. |
 | `DeleteRoot(uuid)` | `SCAN` + `DEL` for `file:<uuid>/*`, unmap every reverse-index entry. |
 | `Mint(filePath, size, mtimeNano)` | `NewUUID()` + write `filePath/sizeByte/mtimeNano` + add to index. |
-| `AddAlias(uuid, "<algo>:<value>")` | Set `cid:<algo>:<value>` → `<uuid>`, add to `file:<uuid>/cids`, reconcile `canonical_cid`. |
-| `ResolveCID("<algo>:<value>")` | `GET cid:<algo>:<value>` → uuid. |
+| `AddAlias(uuid, "<bareCid>")` | Set `cid:<bareCid>` → `<uuid>` and the key-set member `file:<uuid>/cids/<bareCid>` = `"true"`. Nothing to reconcile — canonical is derived on read. |
+| `ResolveRoot("<bareCid>")` | `GET cid:<bareCid>` → uuid (returns the input unchanged if it is already a UUID root). |
+| `GetMetadataDocument(uuid)` | Flat fields + `cids` hoisted to an array + `canonical_cid` **derived** by `cid.Better` rank + `duplicates`. Backs `GET /api/meta/{cid}`. |
 
 ## Reconstruction (flat → nested)
 
@@ -237,10 +258,14 @@ docker exec metacore-app redis-cli GET 'file:01JKR8XW5T4QMV7AHNJ2DEFGHK/fileinfo
 docker exec metacore-app redis-cli TYPE 'file:01JKR8XW5T4QMV7AHNJ2DEFGHK/filePath'
 # string
 
-# Reverse-index lookups
-docker exec metacore-app redis-cli GET 'cid:midhash256:bafkreih...'      # → uuid
-docker exec metacore-app redis-cli SMEMBERS 'file:01JKR8XW5T4QMV7AHNJ2DEFGHK/cids'
-docker exec metacore-app redis-cli GET 'file:01JKR8XW5T4QMV7AHNJ2DEFGHK/canonical_cid'
+# Reverse-index lookup (bare CID — no algorithm prefix)
+docker exec metacore-app redis-cli GET 'cid:bafkreih...'      # → uuid
+
+# The cids key-set (one STRING per member, NOT a Redis SET — SMEMBERS won't work)
+docker exec metacore-app redis-cli --scan --pattern 'file:01JKR8XW5T4QMV7AHNJ2DEFGHK/cids/*'
+
+# canonical_cid is NOT stored. Derive it via the API instead:
+curl -k https://metacore-dev.localhost:8083/api/meta/<cid> | jq '.canonical_cid, .cids'
 
 # Schema-version sentinel
 docker exec metacore-app redis-cli GET 'meta-core:schema-version'

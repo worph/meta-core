@@ -193,6 +193,9 @@ func (s *Server) handleGetMetadataByHashId(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Same resolution as the PUT below: callers hold a CID, not the root.
+	hashID = s.storage.ResolveRoot(hashID)
+
 	metadata, err := s.storage.GetMetadataFlat(hashID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -226,6 +229,17 @@ func (s *Server) handleUpdateMetadataByHashId(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusServiceUnavailable, "storage not connected")
 		return
 	}
+
+	// The {hashId} in the URL is whatever CID the caller knows the file by —
+	// the gateway's auto-store keys this PUT by the hash it just computed
+	// (dispatch.rs → store_metadata_only), which for a usenet→IPFS fetch is
+	// the dag-pb root, not the nzb-release cid the record was minted under.
+	// Without resolving, the write lands on file:<thatCid>/* and forks a
+	// second root for a file that already has one: a full duplicate record,
+	// cross-linked and separately indexed, which every downstream ingest then
+	// sees as two files. Unknown CIDs pass through unchanged, so a genuinely
+	// new gateway record still mints its root at the hash.
+	hashID = s.storage.ResolveRoot(hashID)
 
 	var metadata map[string]string
 	if err := json.NewDecoder(r.Body).Decode(&metadata); err != nil {
@@ -262,6 +276,12 @@ func (s *Server) handleDeleteMetadataByHashId(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusServiceUnavailable, "storage not connected")
 		return
 	}
+
+	// meta-gateway retracts a dropped hit by whichever CID it holds
+	// (meta_core.rs `delete`, which documents this resolution as a
+	// precondition). Without it, deleting by a non-root CID is a silent
+	// no-op and the retracted record lingers.
+	hashID = s.storage.ResolveRoot(hashID)
 
 	deletedCount, err := s.storage.DeleteMetadata(hashID)
 	if err != nil {

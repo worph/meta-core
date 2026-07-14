@@ -221,12 +221,13 @@ operators wipe with `pnpm run clean:all` and restart.
 │  Root: opaque UUIDv7 (Crockford Base32; ULID layout, 26 chars)     │
 │  Storage: flat string keys                                         │
 │           file:<uuid>/<property>           → string value          │
-│           file:<uuid>/cids                 → SET of CID tokens     │
-│           file:<uuid>/canonical_cid        → preferred CID         │
+│           file:<uuid>/cids/<bareCid>       → "true" (key-set)      │
 │           file:<uuid>/duplicates           → SET of paths          │
 │                                                                    │
+│  No stored canonical_cid — derived by rank on read.                │
+│                                                                    │
 │  Aliases (reverse index, one Redis STRING each):                   │
-│           cid:<algorithm>:<value>          → <uuid>                │
+│           cid:<bareCid>                    → <uuid>                │
 │                                                                    │
 │  Index:   file:__index__                   → SET of all UUIDs      │
 │                                                                    │

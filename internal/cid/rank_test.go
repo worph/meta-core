@@ -3,9 +3,55 @@ package cid
 import (
 	"encoding/base32"
 	"encoding/binary"
+	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
+
+// goldenVectors is the CANONICAL cross-language fixture: the same file is
+// vendored into meta-search, meta-share and meta-hash, and each of their test
+// suites asserts against it. It is the only mechanism keeping the seven
+// implementations of this ladder in agreement — they live in independent
+// submodules and cannot share code. `scripts/check-cid-vectors.sh` at the
+// meta-root fails if any vendored copy drifts from the canonical one.
+const goldenVectors = "cid-rank-vectors.json"
+
+type vector struct {
+	Name string `json:"name"`
+	CID  string `json:"cid"`
+	Rank int    `json:"rank"`
+	Note string `json:"note"`
+}
+
+func loadVectors(t *testing.T) []vector {
+	t.Helper()
+	raw, err := os.ReadFile(goldenVectors)
+	if err != nil {
+		t.Fatalf("read %s: %v (run ./scripts/check-cid-vectors.sh --fix from the meta-root)", goldenVectors, err)
+	}
+	var doc struct {
+		Vectors []vector `json:"vectors"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parse %s: %v", goldenVectors, err)
+	}
+	if len(doc.Vectors) == 0 {
+		t.Fatalf("%s has no vectors", goldenVectors)
+	}
+	return doc.Vectors
+}
+
+// TestRank_GoldenVectors is the load-bearing test. Every other test in this
+// file is a convenience; this one is the contract with Rust and TypeScript.
+func TestRank_GoldenVectors(t *testing.T) {
+	for _, v := range loadVectors(t) {
+		if got := Rank(v.CID); got != v.Rank {
+			t.Errorf("Rank(%s) = %d, want %d\n  cid:  %s\n  note: %s",
+				v.Name, got, v.Rank, v.CID, v.Note)
+		}
+	}
+}
 
 // buildCID assembles a multibase-base32 CIDv1 from a content codec, a
 // multihash code, and a digest length (digest bytes are zero — only the

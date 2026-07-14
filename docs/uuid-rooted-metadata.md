@@ -4,6 +4,25 @@
 
 **Status:** Implemented (2026 alpha clean-wipe gate landed). Kept for design rationale.
 
+> ⚠ **Two parts of this proposal were superseded before shipping.** This doc
+> is the design record; it is *not* the schema reference. For what is actually
+> stored, see `METADATA_KEYS.md` §2/§14.13 and
+> [metadata-storage-structure.md](./metadata-storage-structure.md).
+>
+> 1. **`canonical_cid` is not a stored key.** The proposed reconciler
+>    (`reconcileCanonicalCIDLocked`) was never kept — a stored scalar isn't
+>    conflict-free to merge across peers. The canonical CID is **derived on
+>    read** by ranking the `cids` members (`internal/cid/rank.go` →
+>    `cid.Better`), and appears only in the `GET /api/meta/{cid}` response.
+> 2. **`cids` is a key-set, not a Redis SET, and holds bare CIDs, not
+>    `<algo>:<value>` tokens.** One flat STRING per member:
+>    `file:<uuid>/cids/<bareCid>` = `"true"`. The reverse index is likewise
+>    `cid:<bareCid>` → uuid. A CIDv1's multicodec already names its hash
+>    function, so the `<algo>:` prefix was redundant.
+>
+> Text below that references either shape describes the *proposal*, not the
+> code. The rank ordering and everything else did ship as written.
+
 ## Motivation
 
 Today, every metadata entry in Redis is keyed by a content hash, specifically
@@ -79,18 +98,20 @@ today — anything that wrote `file:<midhash>/fileinfo/duration` now writes
 file:01JKR8XW5T4QMV7AHNJ2DEFGHK/filePath          = /watch/Inception.mkv
 file:01JKR8XW5T4QMV7AHNJ2DEFGHK/size              = 4500000000
 file:01JKR8XW5T4QMV7AHNJ2DEFGHK/mtime             = 1729872000000000000
-file:01JKR8XW5T4QMV7AHNJ2DEFGHK/cids              = SET{midhash256:abc, sha256:def, ipfs:bafy...}
+file:01JKR8XW5T4QMV7AHNJ2DEFGHK/cids/bagacbabaec…  = "true"    ← midhash (record address)
+file:01JKR8XW5T4QMV7AHNJ2DEFGHK/cids/bafybeigd…    = "true"    ← sha2-256
 file:01JKR8XW5T4QMV7AHNJ2DEFGHK/duplicates        = SET{/watch/dup1.mkv, /watch/dup2.mkv}
-file:01JKR8XW5T4QMV7AHNJ2DEFGHK/canonical_cid     = ipfs:bafy...
 file:01JKR8XW5T4QMV7AHNJ2DEFGHK/title             = "Inception"
 file:01JKR8XW5T4QMV7AHNJ2DEFGHK/fileinfo/duration = 7200.5
 file:01JKR8XW5T4QMV7AHNJ2DEFGHK/tmdb/poster       = bafy...
 file:01JKR8XW5T4QMV7AHNJ2DEFGHK/subtitle/eng      = ...
 
-cid:midhash256:abc  → 01JKR8XW5T4QMV7AHNJ2DEFGHK
-cid:sha256:def      → 01JKR8XW5T4QMV7AHNJ2DEFGHK
-cid:ipfs:bafy...    → 01JKR8XW5T4QMV7AHNJ2DEFGHK
+cid:bagacbabaec…  → 01JKR8XW5T4QMV7AHNJ2DEFGHK
+cid:bafybeigd…    → 01JKR8XW5T4QMV7AHNJ2DEFGHK
 ```
+
+*(As shipped — the proposal originally wrote `cids` as a Redis SET of
+`<algo>:<value>` tokens plus a `canonical_cid` scalar. See the Status note.)*
 
 ### UUID format: UUIDv7
 
@@ -111,26 +132,33 @@ The metadata schema is open — any writer can put any key under
 `file:<uuid>/`. This proposal does not change that. It adds three keys whose
 sole writer is meta-core itself:
 
-| Key | Type | Purpose |
+| Key | Type (as shipped) | Purpose |
 |-----|------|---------|
-| `cids` | Redis SET | All CIDs known for this file. Mirror of the `cid:*` reverse index. Source of truth for delete-time GC. |
+| `cids/<bareCid>` | STRING `"true"` — a *key-set*, one key per member | All CIDs known for this file, midhash included. Mirror of the `cid:*` reverse index. Source of truth for delete-time GC. **Proposed as a Redis SET of `<algo>:<value>` tokens; shipped as a key-set of bare CIDs** — a key-set merges conflict-free across peers and the multicodec already names the algorithm. |
 | `duplicates` | Redis SET | Additional file paths whose content matches this entry. One UUID = one set of metadata; multiple physical files may share that content. Consumed by meta-dup. |
-| `canonical_cid` | STRING | The CID this entry should be presented as externally (meta-share announce, UI display). Selected by the rank function (below). |
+| ~~`canonical_cid`~~ | *(not stored)* | **Dropped.** Was to hold the externally-presented CID. Now derived on read by ranking the `cids` members; surfaced only on `GET /api/meta/{cid}`. |
 
 Existing meta-core-owned fields (`filePath`, `size`, `mtime`, `midhash256`)
 keep their names and writers. Plugin-written fields (`tmdb/*`, `fileinfo/*`,
 `subtitle/<lang>`, …) are unaffected.
 
-Redis SET is a departure from the all-strings convention in the current
+~~Redis SET is a departure from the all-strings convention in the current
 storage doc, but `file:__index__` is already a SET — so the precedent exists
-for using sets where they're the right structure.
+for using sets where they're the right structure.~~ **Reversed for `cids`.**
+The all-strings convention won: `cids` ships as flat `cids/<cid>` STRING keys
+so that two peers merging the same record can never disagree about set
+membership. `duplicates` remained a Redis SET (it is leader-local and never
+merged across peers).
 
 ### Canonical CID selection
 
-`canonical_cid` is a label, not a key. Updating it costs one write — no
-rename, no race, no broken external references.
+The canonical CID is a label, not a key — so nothing external breaks when it
+changes. **As shipped it is not written at all**: it is computed on every read
+from the `cids` members, which makes the "update" cost zero and removes the
+reconciler entirely.
 
-Selection rule, highest-wins:
+Selection rule, highest-wins (this part shipped as designed —
+`internal/cid/rank.go`):
 
 1. IPFS CID (any variant)
 2. SHA-256 / SHA-3 family
@@ -142,8 +170,10 @@ midhash256 and sha256 are both 256-bit, but only sha256/IPFS CIDs are
 externally meaningful for content addressing. btih ranks above midhash because
 it enables swarm interop even if it's weaker as a digest.
 
-Reconciler runs on the leader, recomputes `canonical_cid` whenever
-`AddAlias` registers a new CID for an entry.
+~~Reconciler runs on the leader, recomputes `canonical_cid` whenever
+`AddAlias` registers a new CID for an entry.~~ **Not shipped** — there is no
+reconciler. `GetMetadataDocument` folds the members through `cid.Better` on
+each read.
 
 ## Internal operations
 
@@ -157,8 +187,8 @@ CID-based API.
 Mint(filePath string, size int64, mtime int64) (uuid string, err error)
 
 // AddAlias registers a CID as resolving to this UUID. Updates both the
-// cid:<cid> reverse index and the file:<uuid>/cids set atomically.
-// Triggers canonical_cid reconciliation.
+// cid:<cid> reverse index and the file:<uuid>/cids/<cid> key-set member.
+// (As shipped: no reconciliation step — canonical is derived on read.)
 AddAlias(uuid string, cid string) error
 
 // GetByCID resolves any known CID to its UUID. Returns ("", nil) if unknown.
@@ -199,7 +229,8 @@ DeleteRoot(uuid string) error
    - Plugin reports back: "for CID midhash256:abc..., sha256 is sha256:def...".
    - meta-core resolves midhash256:abc → uuid_Y via GetByCID.
    - meta-core calls AddAlias(uuid_Y, "sha256:def...").
-   - Reconciler updates canonical_cid if sha256 outranks midhash256.
+   - Nothing else to do: the next read of this entry derives a canonical CID
+     of sha2-256, because it outranks the midhash.
 ```
 
 ### Lifecycle: file deletion
@@ -250,12 +281,19 @@ so the impact is contained but real.
   client.
 - **meta-dup**: gains a cleaner data source — duplicates are now explicit in
   the `duplicates` set, not implicit in colliding writes.
-- **meta-share**: announces `canonical_cid` rather than midhash. Federated
-  search responses include all CIDs from the `cids` set so any peer querying
-  by any digest gets a hit.
+- **meta-search / meta-share**: announce the *derived* canonical CID rather
+  than the midhash — each mirrors the Go rank in `ingest::canonical_cid_from_metadata`
+  rather than reading a stored field. Federated search responses include all
+  CIDs from the `cids` key-set so any peer querying by any digest gets a hit.
+  (Written before the 2026-06 discovery/transport split; discovery is now
+  meta-search's job.)
 - **Plugins**: no change. They speak CIDs only.
 
 ## Migration
+
+> **Historical — this sweep was never run.** The alpha shipped behind a
+> clean-wipe gate (Redis was flushed and the library re-ingested), so no
+> in-place migration code exists. Kept for the record.
 
 One-time sweep, idempotent, runs on first boot after upgrade:
 
@@ -285,7 +323,8 @@ roots and resumes by detecting which step completed (presence of
 | UUID visible externally? | No | Pure meta-core internal. Clients address by CID only. |
 | Merge semantics | One UUID per content; additional paths into `duplicates` | One file (logical) = one metadata set. Multiple physical paths supported via `duplicates`. |
 | Canonical CID rank | IPFS > sha-family > btih > midhash | Utility-weighted, not strength-weighted. |
-| `cids` and `duplicates` field type | Redis SET | Departure from "all-strings" convention but consistent with the existing `file:__index__` precedent. |
+| ~~`cids` and `duplicates` field type~~ | ~~Redis SET~~ → **`cids` is a key-set of bare CIDs; `duplicates` stayed a SET** | Reversed before shipping. Flat `cids/<cid>` STRING keys merge conflict-free across peers; a SET does not. See §14.13 of `METADATA_KEYS.md`. |
+| ~~Stored `canonical_cid`~~ | **Dropped — derived on read** | A stored scalar is not conflict-free to merge. `GetMetadataDocument` ranks the `cids` members per request. |
 | Reverse-index format | Flat `cid:<cid>` STRING keys | Simple, scan-friendly, no hot-key contention. |
 
 ## Open questions
@@ -297,9 +336,10 @@ roots and resumes by detecting which step completed (presence of
   hashing reveals the collision. Worth doing eventually; not required for
   this iteration.
 
-- **meta-share announce strategy.** Announce only `canonical_cid`, or every
-  entry in `cids`? Maximum discoverability vs. DHT footprint. Decide as part
-  of the meta-share work, not here.
+- ~~**meta-share announce strategy.**~~ **Settled.** The record carries *every*
+  member of `cids` on the wire (`Record.cids`) and addresses itself by the
+  single derived canonical (`Record.cid`), so a peer querying by any digest
+  gets a hit without the DHT footprint of announcing each one separately.
 
 - **IPFS gateway endpoint.** Should meta-core expose `/ipfs/<cid>` as a
   content-streaming endpoint for external IPFS clients? Adjacent to this

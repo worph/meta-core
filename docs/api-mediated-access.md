@@ -18,7 +18,7 @@ out to be load-bearing).
 
 meta-core was designed as the sidecar that mediates every metadata read and
 write — a single point that owns the Redis schema, enforces invariants
-(reverse index, canonical_cid reconciliation, schema-version sentinel),
+(reverse index, `cids/` key-set integrity, schema-version sentinel),
 and presents a stable HTTP contract. Other services were meant to talk to
 meta-core, not to Redis.
 
@@ -392,7 +392,7 @@ specifically with the Kubernetes flavour where streams are mediated too.
   coordinating releases across every other service. The UUID-root
   migration is the cautionary tale of what happens without this.
 - **Validation choke point.** Every write passes through one code path
-  that can enforce invariants (reverse index, canonical_cid, type
+  that can enforce invariants (reverse index, `cids/` key-set, type
   constraints, schema version).
 - **Observability.** Audit logs, request metrics, slow-query detection
   all live at one layer.
@@ -697,11 +697,11 @@ contract violation."
 **The fix.** Three layers in `internal/storage/cid_resolution.go`:
 
 1. **`ResolveRoot(hash)`** — at the entry of every `/meta/{hash}`
-   read/write handler, look up `cid:midhash256:<hash>` in the reverse
-   index. If found, use the UUID as the storage root. Falls through to
-   the bare hash for direct-UUID writes / legacy entries.
+   read/write handler, look up `cid:<hash>` in the reverse index (bare
+   CID — no algorithm prefix). If found, use the UUID as the storage root.
+   Falls through to the bare hash for direct-UUID writes / legacy entries.
 2. **Self-pointing alias guard in `addAliasLocked`** — refuse to
-   register `cid:<algo>:<v>` → `<v>`. The dual-root bug's chicken-and-
+   register `cid:<v>` → `<v>`. The dual-root bug's chicken-and-
    egg is: meta-sort writes first, registers self-pointing alias,
    watcher then can't recover. Refusing the self-write keeps the
    watcher's legitimate alias intact.

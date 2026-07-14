@@ -20,6 +20,14 @@ import (
 // Multicodec / multihash codes used for ranking. Source of truth for the
 // digest codes is meta-hash/src/lib/hash-compute/MultiHashData.ts and
 // METADATA_KEYS.md §2.
+//
+// The tier every code maps to is pinned by the golden fixture
+// `cid-rank-vectors.json` (vendored next to this package). This is one of
+// seven implementations of the same ladder across Go, Rust and TypeScript;
+// the fixture is the only thing keeping them in agreement. If you add a code
+// here, add a vector — an unranked code silently falls to tier 0, which is
+// exactly how the nzb-release/url locators came to be ranked 20 in meta-share
+// and 0 here and in meta-search.
 const (
 	CodecRaw   = 0x55   // raw — IPFS content-addressed block
 	CodecDagPB = 0x70   // dag-pb — IPFS content-addressed block
@@ -34,6 +42,23 @@ const (
 	CodeBtihV2      = 0x10B7  // custom — BitTorrent v2 info hash (BEP 52)
 	CodeBtihV1File  = 0x1001  // custom — per-file BitTorrent v1 CID
 	CodeBtihV2File  = 0x1002  // custom — per-file BitTorrent v2 CID
+
+	// Opaque locators. These are NOT digests: the payload rides in an identity
+	// multihash (0x00), so the code identifying them sits in the *content
+	// codec* slot, never the multihash slot. Rank must match on the codec for
+	// these — matching on mh would see 0x00 and rank them 0.
+	CodeNzbRelease = 0x1005 // custom — self-describing Newznab release locator
+	CodeURL        = 0x1006 // custom — identity-multihash CID wrapping an http(s) URL
+)
+
+// Rank tiers, named so the ladder reads as a ladder.
+const (
+	RankIPFS    = 40 // dag-pb — broadest network reach
+	RankDigest  = 30 // sha2-256 / sha3-* — real content digests
+	RankBtih    = 20 // BitTorrent infohashes — swarm interop
+	RankMidhash = 10 // the record address — internally meaningful, externally invisible
+	RankLocator = 5  // opaque locators — never outrank a real digest
+	RankUnknown = 0  // weak/unknown digests, unparseable input
 )
 
 // Decode parses a multibase-base32 CIDv1 string ("b…") into its content
@@ -89,31 +114,42 @@ func Decode(cidStr string) (codec uint64, mhCode uint64, err error) {
 //     block of the file IS its sha2-256, so they share this tier).
 //   - BitTorrent infohashes (btih v2, per-file v1/v2) outrank midhash256 for
 //     swarm interop, not strength.
-//   - midhash256 is the floor among real options: internally meaningful,
+//   - midhash256 is the floor among real *digests*: internally meaningful,
 //     externally invisible.
+//   - opaque locators (nzb-release, url) sit BELOW midhash. They are not
+//     content-derived — two URLs to the same bytes yield two different locator
+//     CIDs — so a locator must never displace a real digest as the identity a
+//     record is advertised under. Tier 5 means a locator wins the election only
+//     when it is the record's sole CID, which is exactly the guarantee
+//     METADATA_KEYS.md §2 states.
 //   - md5 / crc32 / plain sha1 / pieces-root / unknown rank 0.
 func Rank(cidStr string) int {
 	codec, mh, err := Decode(cidStr)
 	if err != nil {
-		return 0
+		return RankUnknown
 	}
 	if codec == CodecDagPB {
-		return 40
+		return RankIPFS
 	}
 	// BitTorrent: distinct CID codecs (per-file v1/v2) or the btih-v2
 	// multihash code, in either encoder convention.
 	if codec == CodeBtihV1File || codec == CodeBtihV2File || codec == CodeBtihV2 ||
 		mh == CodeBtihV1File || mh == CodeBtihV2File || mh == CodeBtihV2 {
-		return 20
+		return RankBtih
+	}
+	// Opaque locators. Codec-only: their multihash is identity (0x00), so
+	// there is nothing to match on the mh side.
+	if codec == CodeNzbRelease || codec == CodeURL {
+		return RankLocator
 	}
 	switch mh {
 	case CodeSha256, CodeSha3_256, CodeSha3_384:
-		return 30
+		return RankDigest
 	case CodeMidhash256:
-		return 10
+		return RankMidhash
 	default:
 		// md5, crc32, plain sha1, pieces-root, unknown.
-		return 0
+		return RankUnknown
 	}
 }
 

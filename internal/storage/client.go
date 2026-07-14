@@ -821,8 +821,16 @@ func (c *Client) GetMemoryInfo() (string, error) {
 	return "N/A", nil
 }
 
-// ClearAllMetadata deletes all file metadata and index
-// Returns the number of files deleted
+// ClearAllMetadata deletes all file metadata, the file index, and the CID
+// reverse index. Returns the number of files deleted.
+//
+// The CID reverse index (cid:<cid> → root, see cid_resolution.go) MUST be
+// purged too: ResolveRoot consults it, so a surviving cid:<cid> entry pointing
+// at a root we just deleted silently redirects the next /meta/<cid> write back
+// into that dead root, resurrecting a zombie record under an old identity.
+// DeleteRoot already does this per-record; here we sweep the whole prefix
+// rather than deriving the CID list per root, which is both simpler and
+// self-healing — it also collects entries orphaned by earlier clears.
 func (c *Client) ClearAllMetadata() (int64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -870,12 +878,40 @@ func (c *Client) ClearAllMetadata() (int64, error) {
 		deletedCount++
 	}
 
+	// Delete every CID reverse-index entry (cid:<cid> → root). Swept by
+	// prefix rather than per-root so entries orphaned by an earlier clear —
+	// which did not purge this index at all — are collected too. Built via
+	// buildCIDIndexKey so the configured namespace prefix is honoured.
+	cidIndexPattern := c.buildCIDIndexKey("*")
+	var cidIndexDeleted int64
+	var cidCursor uint64
+	for {
+		keys, nextCursor, err := c.client.Scan(ctx, cidCursor, cidIndexPattern, 1000).Result()
+		if err != nil {
+			log.Printf("[Storage] Warning: failed to scan %s: %v", cidIndexPattern, err)
+			break
+		}
+
+		if len(keys) > 0 {
+			if err := c.client.Del(ctx, keys...).Err(); err != nil {
+				log.Printf("[Storage] Warning: failed to delete cid index keys: %v", err)
+			} else {
+				cidIndexDeleted += int64(len(keys))
+			}
+		}
+
+		cidCursor = nextCursor
+		if cidCursor == 0 {
+			break
+		}
+	}
+
 	// Delete the index set
 	if err := c.client.Del(ctx, indexKey).Err(); err != nil {
 		log.Printf("[Storage] Warning: failed to delete index: %v", err)
 	}
 
-	log.Printf("[Storage] Cleared %d file metadata entries", deletedCount)
+	log.Printf("[Storage] Cleared %d file metadata entries (%d cid index entries)", deletedCount, cidIndexDeleted)
 	return deletedCount, nil
 }
 

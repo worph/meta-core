@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/base32"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -84,7 +85,44 @@ const (
 	ErrSchemaViolation   = "schema_violation"
 	ErrStorageUnavailable = "storage_unavailable"
 	ErrInternal          = "internal"
+	ErrDeprecatedField   = "deprecated_field"
 )
+
+// rejectDeprecatedField reports whether a field name is one of the removed
+// per-algorithm CID shapes (`cid_sha2-256`, `cid_midhash256`, `midhash256`, …).
+//
+// This is a tripwire, not a compatibility shim. Such a field used to be
+// accepted and written verbatim — but the reverse-index hook
+// (`maybeAddAliasFromFieldLocked`) only registers aliases for fields named
+// `cids/<cid>`, so a `cid_*` field was stored and then NEVER INDEXED: the
+// record silently became unresolvable by that CID. Failing the write loudly is
+// strictly better than a record that looks fine and cannot be found.
+//
+// Writers must emit the bare-CID key-set instead: `cids/<bareCid>` = "true".
+// See METADATA_KEYS.md §2/§14.13.
+func rejectDeprecatedField(field string) bool {
+	return strings.HasPrefix(field, "cid_") ||
+		field == "midhash256" ||
+		field == "canonical_cid"
+}
+
+// validateFields rejects a write carrying any deprecated CID field. Returns
+// true if the request was rejected (the handler must return immediately).
+func validateFields(w http.ResponseWriter, metadata map[string]string) bool {
+	for field := range metadata {
+		if rejectDeprecatedField(field) {
+			writeErrorSlug(w, http.StatusBadRequest, ErrDeprecatedField,
+				fmt.Sprintf("field %q is a removed per-algorithm CID shape; "+
+					"write the bare-CID key-set instead: \"cids/<bareCid>\": \"true\" "+
+					"(a cid_* field would be stored but never indexed, leaving the "+
+					"record unresolvable by that CID). See METADATA_KEYS.md §2/§14.13.",
+					field),
+				false)
+			return true
+		}
+	}
+	return false
+}
 
 // defaultSlugFor maps an HTTP status code to the most likely error slug.
 // Handlers that want to override (e.g. /api/meta/{cid} → "unknown_cid"
@@ -252,6 +290,10 @@ func (s *Server) handlePutMeta(w http.ResponseWriter, r *http.Request) {
 	var metadata map[string]string
 	if err := json.NewDecoder(r.Body).Decode(&metadata); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	if validateFields(w, metadata) {
 		return
 	}
 
@@ -620,6 +662,10 @@ func (s *Server) handlePatchMeta(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if validateFields(w, metadata) {
+		return
+	}
+
 	updated, err := s.storage.MergeMetadataFlat(hashID, metadata)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -694,6 +740,10 @@ func (s *Server) handlePutProperty(w http.ResponseWriter, r *http.Request) {
 
 	if key == "" {
 		writeError(w, http.StatusBadRequest, "key is required")
+		return
+	}
+
+	if validateFields(w, map[string]string{key: ""}) {
 		return
 	}
 
@@ -787,6 +837,10 @@ func (s *Server) handleAddToSet(w http.ResponseWriter, r *http.Request) {
 
 	if key == "" {
 		writeError(w, http.StatusBadRequest, "key is required")
+		return
+	}
+
+	if validateFields(w, map[string]string{key: ""}) {
 		return
 	}
 
