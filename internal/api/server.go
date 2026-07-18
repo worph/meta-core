@@ -201,6 +201,15 @@ func (s *Server) setupRoutes() {
 	s.router.HandleFunc("/api/kv/value", s.handleKVValueDelete).Methods("DELETE")
 	s.router.HandleFunc("/api/kv/key/{key:.*}", s.handleKVGetKey).Methods("GET")
 
+	// User Data Layer (UDL) routes — per-user signed records (My List,
+	// Continue Watching, ratings, profile). See internal/api/udl.go.
+	s.router.HandleFunc("/api/udl/record", s.handleUDLRecordGet).Methods("GET")
+	s.router.HandleFunc("/api/udl/record", s.handleUDLRecordPut).Methods("PUT")
+	s.router.HandleFunc("/api/udl/user/{uid}/key/{key}", s.handleUDLUserKey).Methods("GET")
+	s.router.HandleFunc("/api/udl/user/{uid}/cid/{cid}", s.handleUDLUserCid).Methods("GET")
+	s.router.HandleFunc("/api/udl/cid/{cid}/users", s.handleUDLCidUsers).Methods("GET")
+	s.router.HandleFunc("/api/udl/cid/{cid}/aggregate", s.handleUDLAggregate).Methods("GET")
+
 	// Metadata operations - base endpoints
 	s.router.HandleFunc("/meta/{hash}", s.handleGetMeta).Methods("GET")
 	s.router.HandleFunc("/meta/{hash}", s.handlePutMeta).Methods("PUT")
