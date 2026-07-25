@@ -150,12 +150,31 @@ func TestRank_Tiers(t *testing.T) {
 func TestRank_StrictOrdering(t *testing.T) {
 	ipfs := Rank(buildCID(CodecDagPB, CodeSha256, 32))
 	sha := Rank(cidSha256)
+	posting := Rank(buildCID(CodeNzbPosting, CodeSha256, 32))
 	btih := Rank(buildCID(CodeBtihV2, CodeBtihV2, 32))
 	mid := Rank(buildCID(CodeMidhash256, CodeMidhash256, 32))
 	unknown := Rank(cidMd5)
-	if !(ipfs > sha && sha > btih && btih > mid && mid > unknown) {
-		t.Fatalf("rank ordering broken: ipfs=%d sha=%d btih=%d mid=%d unknown=%d",
-			ipfs, sha, btih, mid, unknown)
+	if !(ipfs > sha && sha > posting && posting > btih && btih > mid && mid > unknown) {
+		t.Fatalf("rank ordering broken: ipfs=%d sha=%d posting=%d btih=%d mid=%d unknown=%d",
+			ipfs, sha, posting, btih, mid, unknown)
+	}
+}
+
+// TestRank_NzbPostingMatchesCodecNotMultihash pins the inverse trap:
+// nzb-posting's multihash is a REAL sha2-256 (unlike nzb-release/url, whose mh
+// is identity 0x00), so Rank must match on the codec BEFORE falling into the
+// mh switch — otherwise this ties with a genuine content digest at 30 instead
+// of sitting at 25.
+func TestRank_NzbPostingMatchesCodecNotMultihash(t *testing.T) {
+	posting := buildCID(CodeNzbPosting, CodeSha256, 32)
+	if got := Rank(posting); got != RankNzbPosting {
+		t.Errorf("Rank(nzb-posting) = %d, want %d (RankNzbPosting) — codec check must precede the mh switch", got, RankNzbPosting)
+	}
+	// A real sha2-256 with the SAME digest bytes must still rank 30 — the
+	// codec, not the digest, is what distinguishes the two.
+	realDigest := buildCID(CodecRaw, CodeSha256, 32)
+	if got := Rank(realDigest); got != RankDigest {
+		t.Errorf("Rank(sha2-256) regressed to %d, want %d", got, RankDigest)
 	}
 }
 

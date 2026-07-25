@@ -49,16 +49,29 @@ const (
 	// these — matching on mh would see 0x00 and rank them 0.
 	CodeNzbRelease = 0x1005 // custom — self-describing Newznab release locator
 	CodeURL        = 0x1006 // custom — identity-multihash CID wrapping an http(s) URL
+
+	// CodeNzbPosting is the INVERSE trap of the two above: its multihash is a
+	// REAL sha2-256 digest (over the normalised, sorted article Message-ID
+	// set of a Usenet posting we scanned ourselves — never a locator, no
+	// indexer host embedded), so it would silently fall into RankDigest via
+	// the mh switch unless matched on the codec FIRST. It is content-derived
+	// (so it outranks the opaque locators) but addresses no fetchable block —
+	// the digest is over an id set, not over any block's bytes, so it can
+	// never be bitswap-fetched under itself — so it must stay BELOW a real
+	// digest (once the media is materialised and re-seeded, that genuine
+	// sha2-256 cid has to win the canonical election, not this one).
+	CodeNzbPosting = 0x1003 // custom — self-scanned Usenet posting identity
 )
 
 // Rank tiers, named so the ladder reads as a ladder.
 const (
-	RankIPFS    = 40 // dag-pb — broadest network reach
-	RankDigest  = 30 // sha2-256 / sha3-* — real content digests
-	RankBtih    = 20 // BitTorrent infohashes — swarm interop
-	RankMidhash = 10 // the record address — internally meaningful, externally invisible
-	RankLocator = 5  // opaque locators — never outrank a real digest
-	RankUnknown = 0  // weak/unknown digests, unparseable input
+	RankIPFS       = 40 // dag-pb — broadest network reach
+	RankDigest     = 30 // sha2-256 / sha3-* — real content digests
+	RankNzbPosting = 25 // content-derived, but the digest addresses no fetchable block
+	RankBtih       = 20 // BitTorrent infohashes — swarm interop
+	RankMidhash    = 10 // the record address — internally meaningful, externally invisible
+	RankLocator    = 5  // opaque locators — never outrank a real digest
+	RankUnknown    = 0  // weak/unknown digests, unparseable input
 )
 
 // Decode parses a multibase-base32 CIDv1 string ("b…") into its content
@@ -112,6 +125,11 @@ func Decode(cidStr string) (codec uint64, mhCode uint64, err error) {
 //   - dag-pb (chunked IPFS file) wins: best retrieval over the IPFS network.
 //   - sha2-256 / sha3 digests follow: standard content hashes (a raw IPFS
 //     block of the file IS its sha2-256, so they share this tier).
+//   - nzb-posting is content-derived (a digest over a Usenet posting's article
+//     Message-ID set) so it outranks the opaque locators below, but the
+//     digest addresses no fetchable block, so it stays below a real content
+//     digest — once the media is materialised and re-seeded under a genuine
+//     sha2-256 cid, that cid must win the election, not this one.
 //   - BitTorrent infohashes (btih v2, per-file v1/v2) outrank midhash256 for
 //     swarm interop, not strength.
 //   - midhash256 is the floor among real *digests*: internally meaningful,
@@ -141,6 +159,12 @@ func Rank(cidStr string) int {
 	// there is nothing to match on the mh side.
 	if codec == CodeNzbRelease || codec == CodeURL {
 		return RankLocator
+	}
+	// nzb-posting: codec-only, checked BEFORE the mh switch below — its
+	// multihash is a real sha2-256 and would otherwise match CodeSha256 there
+	// and rank 30, tying with genuine content digests.
+	if codec == CodeNzbPosting {
+		return RankNzbPosting
 	}
 	switch mh {
 	case CodeSha256, CodeSha3_256, CodeSha3_384:

@@ -19,6 +19,7 @@
   "ladder": {
     "40": "dag-pb (IPFS block)",
     "30": "sha2-256 / sha3-256 / sha3-384 - real content digests",
+    "25": "nzb-posting - content-derived (Message-ID set digest), but not itself fetchable",
     "20": "BitTorrent infohashes - swarm interop",
     "10": "midhash256 - the record address",
     "5": "opaque locators (nzb-release, url) - never outrank a real digest",
@@ -55,6 +56,12 @@
       "cid": "baekrkmeglipkjf33exqexdvijl4twipruay4wsbvt44akce43lq5rgccxgr7v6dwksmj3sxedakevc53g6ga",
       "rank": 30,
       "note": "REAL meta-hash fixture"
+    },
+    {
+      "name": "nzb-posting",
+      "cid": "bagbsaeraaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "rank": 25,
+      "note": "codec 0x1003 + REAL sha2-256 multihash (0x12) over the normalised, sorted Message-ID set - NOT a locator, so it sits ABOVE tier 5, but it addresses no fetchable block (bitswap can never satisfy a want for it - the digest is over an id set, not over any block's bytes), so it stays BELOW a real content digest (30): once meta-share materialises the media and re-seeds it, that genuine sha2-256 cid must win the canonical election, not this one. Rank MUST match on codec BEFORE falling through to the mh switch, or this scores 30 (same trap as nzb-release/url, in reverse: those need a codec check because their mh is identity 0x00; this needs one because its mh is REAL sha2-256 and would otherwise tie with tier 30)."
     },
     {
       "name": "btih-v2-codec-eq-mh",
