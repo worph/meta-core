@@ -49,6 +49,14 @@ const (
 	// these — matching on mh would see 0x00 and rank them 0.
 	CodeNzbRelease = 0x1005 // custom — self-describing Newznab release locator
 	CodeURL        = 0x1006 // custom — identity-multihash CID wrapping an http(s) URL
+	// CodeCard is the limit case of the family: the only CID with NO bytes
+	// behind it anywhere, ever. It addresses a *work* (a series, a film) via
+	// varint(len(source))‖source‖id — ("tmdb","tv:95479") — so `/api/file/{cid}`
+	// correctly 404s and bitswap never offers it. Ranking it here (rather than
+	// letting it fall to RankUnknown) is what makes the planned "one card, two
+	// CIDs" cross-source merge safe: a TMDB and a MyAnimeList locator can sit on
+	// one record, and a real digest added later still wins the election.
+	CodeCard = 0x1007 // custom — identity-multihash CID wrapping a card (work) id
 
 	// CodeNzbPosting is the INVERSE trap of the two above: its multihash is a
 	// REAL sha2-256 digest (over the normalised, sorted article Message-ID
@@ -134,7 +142,7 @@ func Decode(cidStr string) (codec uint64, mhCode uint64, err error) {
 //     swarm interop, not strength.
 //   - midhash256 is the floor among real *digests*: internally meaningful,
 //     externally invisible.
-//   - opaque locators (nzb-release, url) sit BELOW midhash. They are not
+//   - opaque locators (nzb-release, url, card) sit BELOW midhash. They are not
 //     content-derived — two URLs to the same bytes yield two different locator
 //     CIDs — so a locator must never displace a real digest as the identity a
 //     record is advertised under. Tier 5 means a locator wins the election only
@@ -157,7 +165,7 @@ func Rank(cidStr string) int {
 	}
 	// Opaque locators. Codec-only: their multihash is identity (0x00), so
 	// there is nothing to match on the mh side.
-	if codec == CodeNzbRelease || codec == CodeURL {
+	if codec == CodeNzbRelease || codec == CodeURL || codec == CodeCard {
 		return RankLocator
 	}
 	// nzb-posting: codec-only, checked BEFORE the mh switch below — its

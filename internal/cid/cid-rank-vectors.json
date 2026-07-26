@@ -22,7 +22,7 @@
     "25": "nzb-posting - content-derived (Message-ID set digest), but not itself fetchable",
     "20": "BitTorrent infohashes - swarm interop",
     "10": "midhash256 - the record address",
-    "5": "opaque locators (nzb-release, url) - never outrank a real digest",
+    "5": "opaque locators (nzb-release, url, card) - never outrank a real digest",
     "0": "weak/unknown digests, unparseable input"
   },
   "tieBreak": "lexicographically smaller cid wins",
@@ -109,6 +109,12 @@
       "cid": "bagdcaaaznb2hi4dthixs6zlymfwxa3dffzxxezzpmexhazdg",
       "rank": 5,
       "note": "codec 0x1006 + IDENTITY multihash 0x00. Same tier/reasoning as nzb-release."
+    },
+    {
+      "name": "card-locator",
+      "cid": "bagdsaaanar2g2zdcor3duojvgq3ts",
+      "rank": 5,
+      "note": "codec 0x1007 + IDENTITY multihash 0x00, digest = varint(len(source)) || source || id — here (\"tmdb\",\"tv:95479\"). Same codec-slot rule as nzb-release/url: match on the CODEC, never the mh. The limit case of the family — the only CID in MetaMesh with NO bytes behind it anywhere, ever: it addresses a *work* (a series, a film), not a file, so the byte path 404s by design and bitswap never offers it (seeding is gated on sha2-256). Tier 5 is load-bearing for the planned cross-source merge: one card record may carry BOTH a TMDB and a MyAnimeList locator, and if a real card body is ever added (see card-tier-search.md §4.3) its sha2-256 must win the canonical election over both locators without any addressing change. Ranking it 0 instead would still lose to a digest, but would put the implementations back out of agreement — which is the exact failure this fixture exists to prevent."
     },
     {
       "name": "sha1",
