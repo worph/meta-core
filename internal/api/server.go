@@ -172,6 +172,7 @@ func (s *Server) setupRoutes() {
 	s.router.HandleFunc("/api/identity/accounts", s.handleIdentityAccounts).Methods("GET")
 	s.router.HandleFunc("/api/identity/generate", s.handleIdentityGenerate).Methods("POST")
 	s.router.HandleFunc("/api/identity/import", s.handleIdentityImport).Methods("POST")
+	s.router.HandleFunc("/api/identity/reveal", s.handleIdentityReveal).Methods("POST")
 	s.router.HandleFunc("/api/identity", s.handleIdentityDelete).Methods("DELETE")
 	s.router.HandleFunc("/api/identity/sign", s.handleIdentitySign).Methods("POST")
 	s.router.HandleFunc("/api/identity/aead-key", s.handleIdentityAEADKey).Methods("GET")

@@ -50,6 +50,26 @@ type identityImportResponse struct {
 	UID       string `json:"uid"`
 	Curve     string `json:"curve"`
 	CreatedAt int64  `json:"createdAt"`
+	// Created distinguishes "this key was new here" (201) from "this key was
+	// already in the keystore" (200). Import is the sign-in primitive for
+	// clients: presenting the secret key is the proof of ownership, so a
+	// re-import must succeed rather than conflict. Clients use the flag only
+	// to word the confirmation ("new profile" vs "welcome back").
+	Created bool `json:"created"`
+}
+
+// identityRevealRequest asks for an existing account's private key back. The
+// key was shown once at generate; without a way to see it again, a client with
+// a real sign-out has no recovery path for a user who never saved it.
+type identityRevealRequest struct {
+	Confirm bool   `json:"confirm"`
+	UID     string `json:"uid"`
+}
+
+type identityRevealResponse struct {
+	UID           string `json:"uid"`
+	Curve         string `json:"curve"`
+	PrivateKeyHex string `json:"privateKeyHex"`
 }
 
 type identityDeleteRequest struct {
@@ -172,9 +192,17 @@ func (s *Server) handleIdentityImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dir := s.config.IdentityAccountsDir()
-	if identity.ExistsByUID(dir, id.UID) {
-		writeErrorSlug(w, http.StatusConflict, "identity_exists",
-			"an account with this key already exists", false)
+	// Idempotent: importing a key that is already in the keystore is how a
+	// second device signs in to an existing account. Answer 200 with the
+	// stored account (preserving its original createdAt) instead of 409 —
+	// the caller proved ownership by presenting the key.
+	if existing, err := identity.LoadByUID(dir, id.UID); err == nil && existing != nil {
+		writeJSON(w, http.StatusOK, identityImportResponse{
+			UID:       existing.UID,
+			Curve:     existing.Curve,
+			CreatedAt: existing.CreatedAt,
+			Created:   false,
+		})
 		return
 	}
 	if err := identity.SaveAccount(dir, id); err != nil {
@@ -185,6 +213,35 @@ func (s *Server) handleIdentityImport(w http.ResponseWriter, r *http.Request) {
 		UID:       id.UID,
 		Curve:     id.Curve,
 		CreatedAt: id.CreatedAt,
+		Created:   true,
+	})
+}
+
+// handleIdentityReveal returns an existing account's private key. Deliberately
+// POST + explicit confirm (never a bare GET) so it cannot be triggered by a
+// link or an image tag, and so it reads as the deliberate act it is. The
+// endpoint is auth-gated at the perimeter like the rest of /api/identity/*.
+func (s *Server) handleIdentityReveal(w http.ResponseWriter, r *http.Request) {
+	var body identityRevealRequest
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if !body.Confirm && r.URL.Query().Get("confirm") != "true" {
+		writeErrorSlug(w, http.StatusBadRequest, "confirm_required",
+			"revealing a private key requires {\"confirm\": true} or ?confirm=true", false)
+		return
+	}
+	uid := strings.TrimSpace(body.UID)
+	if uid == "" {
+		uid = strings.TrimSpace(r.URL.Query().Get("uid"))
+	}
+	id, status, slug, msg := s.resolveAccount(uid)
+	if status != 0 {
+		writeErrorSlug(w, status, slug, msg, false)
+		return
+	}
+	writeJSON(w, http.StatusOK, identityRevealResponse{
+		UID:           id.UID,
+		Curve:         id.Curve,
+		PrivateKeyHex: id.PrivateKeyHex,
 	})
 }
 
