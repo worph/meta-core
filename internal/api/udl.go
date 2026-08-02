@@ -27,6 +27,14 @@ type UDLPutRequest struct {
 	Ts      int64            `json:"ts"`
 	Record  string           `json:"record"` // base64 CBOR, opaque + signed
 	Value   *json.RawMessage `json:"value,omitempty"`
+	// Tombstone marks this write as a deletion of (uid, cid, key). The record
+	// itself is opaque here — meta-core never decodes the CBOR, and a private-
+	// tier value and a tombstone are equally "no plaintext value" — so the
+	// writer has to say. Without it the cid is never removed from
+	// udl:idx:user:<uid>:key:<key>, which then grows for the life of the
+	// account and is returned in full on every My List / Continue Watching
+	// read. Omitted by older writers, which keeps the previous behaviour.
+	Tombstone bool `json:"tombstone,omitempty"`
 }
 
 // UDLPutResponse is the response of PUT /api/udl/record.
@@ -104,7 +112,7 @@ func (s *Server) handleUDLRecordPut(w http.ResponseWriter, r *http.Request) {
 		hasValue = true
 	}
 
-	accepted, err := s.storage.UDLUpsertIfNewer(req.Uid, req.Cid, req.Key, req.Version, req.Ts, req.Record, publicValue, hasValue)
+	accepted, err := s.storage.UDLUpsertIfNewer(req.Uid, req.Cid, req.Key, req.Version, req.Ts, req.Record, publicValue, hasValue, req.Tombstone)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

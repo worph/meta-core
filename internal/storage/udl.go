@@ -72,7 +72,15 @@ func udlIdxCidUsers(cid string) string      { return fmt.Sprintf("udl:idx:cid:%s
 //
 //	KEYS: 1=cell 2=idx:user:key 3=idx:user:cid 4=idx:cid:key 5=idx:cid:users
 //	ARGV: 1=version 2=ts 3=record 4=value 5=hasValue("1"/"0")
-//	      6=cid 7=key 8=uid
+//	      6=cid 7=key 8=uid 9=tombstone("1"/"0")
+//
+// A tombstone still writes the cell — that is the CRDT state, and dropping it
+// would let an older write resurrect the value — but it SREMs the cid from the
+// user+key index. That index is what `active_for_user_key` returns, so leaving
+// deleted cids in it means every My List / Continue Watching read carries every
+// title ever un-liked or finished, forever. The other three indexes are left
+// alone: they answer "who has an opinion about this cid", where a tombstone is
+// still an answer.
 var udlUpsertScript = redis.NewScript(`
 local stored = redis.call('HGET', KEYS[1], 'version')
 if stored and tonumber(stored) >= tonumber(ARGV[1]) then
@@ -84,7 +92,11 @@ if ARGV[5] == '1' then
 else
   redis.call('HDEL', KEYS[1], 'value')
 end
-redis.call('SADD', KEYS[2], ARGV[6])
+if ARGV[9] == '1' then
+  redis.call('SREM', KEYS[2], ARGV[6])
+else
+  redis.call('SADD', KEYS[2], ARGV[6])
+end
 redis.call('SADD', KEYS[3], ARGV[7])
 redis.call('SADD', KEYS[4], ARGV[8])
 redis.call('SADD', KEYS[5], ARGV[8])
@@ -94,8 +106,10 @@ return 1
 // UDLUpsertIfNewer stores a record cell iff version strictly exceeds the stored
 // one. publicValue/hasValue carry the plaintext JSON scalar for public keys
 // (used by aggregation); pass hasValue=false for private-tier keys and
-// tombstones. Returns accepted=false when the write is stale.
-func (c *Client) UDLUpsertIfNewer(uid, cid, key string, version, ts int64, record, publicValue string, hasValue bool) (bool, error) {
+// tombstones. Set tombstone=true when the record deletes the cell, which also
+// prunes the cid from the user+key index. Returns accepted=false when the write
+// is stale.
+func (c *Client) UDLUpsertIfNewer(uid, cid, key string, version, ts int64, record, publicValue string, hasValue, tombstone bool) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -117,7 +131,11 @@ func (c *Client) UDLUpsertIfNewer(uid, cid, key string, version, ts int64, recor
 	if hasValue {
 		hv = "1"
 	}
-	res, err := udlUpsertScript.Run(ctx, c.client, keys, version, ts, record, publicValue, hv, cid, key, uid).Result()
+	tomb := "0"
+	if tombstone {
+		tomb = "1"
+	}
+	res, err := udlUpsertScript.Run(ctx, c.client, keys, version, ts, record, publicValue, hv, cid, key, uid, tomb).Result()
 	if err != nil {
 		return false, fmt.Errorf("udl upsert failed: %w", err)
 	}
