@@ -109,8 +109,12 @@ func (c *Client) buildIndexKey() string {
 	return c.buildKey("file:__index__")
 }
 
-// GetMetadataFlat retrieves all metadata for a file as a flat map
-// Uses flat keys: SCAN file:{hashId}/* then MGET
+// GetMetadataFlat retrieves all metadata for a file as a flat map.
+//
+// Reads the record's field-name index and MGETs those keys — two round-trips,
+// independent of keyspace size. Records written before the index existed fall
+// back to the old SCAN and are indexed on the way out. See field_index.go for
+// why the index exists and why it is safe to derive.
 func (c *Client) GetMetadataFlat(hashID string) (map[string]string, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -122,41 +126,7 @@ func (c *Client) GetMetadataFlat(hashID string) (map[string]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	prefix := c.buildKeyPrefix(hashID)
-	result := make(map[string]string)
-
-	// Scan for all keys with this prefix
-	var cursor uint64
-	for {
-		keys, nextCursor, err := c.client.Scan(ctx, cursor, prefix+"*", 1000).Result()
-		if err != nil {
-			return nil, fmt.Errorf("scan failed: %w", err)
-		}
-
-		if len(keys) > 0 {
-			values, err := c.client.MGet(ctx, keys...).Result()
-			if err != nil {
-				return nil, fmt.Errorf("mget failed: %w", err)
-			}
-			for i, key := range keys {
-				field := strings.TrimPrefix(key, prefix)
-				if values[i] != nil {
-					result[field] = values[i].(string)
-				}
-			}
-		}
-
-		cursor = nextCursor
-		if cursor == 0 {
-			break
-		}
-	}
-
-	if len(result) == 0 {
-		return nil, nil
-	}
-
-	return result, nil
+	return c.readMetadataLocked(ctx, hashID)
 }
 
 // SetMetadataFlat stores metadata for a file using flat keys
@@ -179,9 +149,21 @@ func (c *Client) SetMetadataFlat(hashID string, metadata map[string]string) erro
 	prefix := c.buildKeyPrefix(hashID)
 	pipe := c.client.Pipeline()
 
+	fields := make([]string, 0, len(metadata))
 	for field, value := range metadata {
+		// A payload carrying the reserved name (a hand-made snapshot, a buggy
+		// client) would SET a string over the index SET and break every
+		// subsequent read of this record. Drop it — it is derived state, so
+		// there is never a reason to accept it from outside.
+		if isReservedFieldName(field) {
+			continue
+		}
 		pipe.Set(ctx, prefix+field, value, 0)
+		fields = append(fields, field)
 	}
+	// Same pipeline as the SETs, so indexing the field names costs no extra
+	// round-trip. See field_index.go.
+	c.addFieldsToPipe(ctx, pipe, hashID, fields)
 
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("pipeline exec failed: %w", err)
@@ -256,12 +238,20 @@ func (c *Client) SetProperty(hashID, property, value string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	// See SetMetadataFlat: the reserved name addresses the derived index SET,
+	// not a metadata field.
+	if isReservedFieldName(property) {
+		return fmt.Errorf("field name %q is reserved", property)
+	}
+
 	key := c.buildKeyPrefix(hashID) + property
 
 	// Use SET to set the key
 	if err := c.client.Set(ctx, key, value, 0).Err(); err != nil {
 		return fmt.Errorf("set failed: %w", err)
 	}
+
+	c.addFieldLocked(ctx, hashID, property)
 
 	// Add to index set
 	if err := c.client.SAdd(ctx, c.buildIndexKey(), hashID).Err(); err != nil {
@@ -387,32 +377,14 @@ func normalizeFilesRelativePath(p string) string {
 // getMetadataFlatInternal mirrors GetMetadataFlat without re-acquiring the lock.
 // Callers must already hold c.mu.
 func (c *Client) getMetadataFlatInternal(ctx context.Context, hashID string) (map[string]string, error) {
-	prefix := c.buildKeyPrefix(hashID)
-	result := make(map[string]string)
-
-	var cursor uint64
-	for {
-		keys, nextCursor, err := c.client.Scan(ctx, cursor, prefix+"*", 1000).Result()
-		if err != nil {
-			return nil, fmt.Errorf("scan failed: %w", err)
-		}
-		if len(keys) > 0 {
-			values, err := c.client.MGet(ctx, keys...).Result()
-			if err != nil {
-				return nil, fmt.Errorf("mget failed: %w", err)
-			}
-			for i, key := range keys {
-				if values[i] == nil {
-					continue
-				}
-				field := strings.TrimPrefix(key, prefix)
-				result[field] = values[i].(string)
-			}
-		}
-		cursor = nextCursor
-		if cursor == 0 {
-			break
-		}
+	result, err := c.readMetadataLocked(ctx, hashID)
+	if err != nil {
+		return nil, err
+	}
+	// Unlike GetMetadataFlat, this variant hands back an empty map rather than
+	// nil for a record with no fields — GetMetadataDocument writes into it.
+	if result == nil {
+		result = make(map[string]string)
 	}
 	return result, nil
 }
@@ -449,9 +421,17 @@ func (c *Client) MergeMetadataFlat(hashID string, metadata map[string]string) (i
 	prefix := c.buildKeyPrefix(hashID)
 	pipe := c.client.Pipeline()
 
+	fields := make([]string, 0, len(metadata))
 	for field, value := range metadata {
+		// See SetMetadataFlat: never let an inbound payload overwrite the
+		// derived index SET with a string.
+		if isReservedFieldName(field) {
+			continue
+		}
 		pipe.Set(ctx, prefix+field, value, 0)
+		fields = append(fields, field)
 	}
+	c.addFieldsToPipe(ctx, pipe, hashID, fields)
 
 	if _, err := pipe.Exec(ctx); err != nil {
 		return 0, fmt.Errorf("pipeline exec failed: %w", err)
@@ -484,7 +464,11 @@ func (c *Client) DeleteProperty(hashID, property string) error {
 	defer cancel()
 
 	key := c.buildKeyPrefix(hashID) + property
-	return c.client.Del(ctx, key).Err()
+	if err := c.client.Del(ctx, key).Err(); err != nil {
+		return err
+	}
+	c.removeFieldLocked(ctx, hashID, property)
+	return nil
 }
 
 // AddToSet adds a value to a set-type field (stored as pipe-delimited string in flat key)
@@ -529,6 +513,9 @@ func (c *Client) AddToSet(hashID, property, value string) (bool, error) {
 	if err := c.client.Set(ctx, key, newValue, 0).Err(); err != nil {
 		return false, err
 	}
+
+	// The SET above may have created the key, so the field name is new.
+	c.addFieldLocked(ctx, hashID, property)
 
 	// Add to index set
 	if err := c.client.SAdd(ctx, c.buildIndexKey(), hashID).Err(); err != nil {
@@ -582,7 +569,12 @@ func (c *Client) RemoveFromSet(hashID, property, value string) (bool, error) {
 
 	// Save back (or delete key if empty)
 	if len(newValues) == 0 {
-		return true, c.client.Del(ctx, key).Err()
+		if err := c.client.Del(ctx, key).Err(); err != nil {
+			return true, err
+		}
+		// The key is gone, so the field name must leave the index too.
+		c.removeFieldLocked(ctx, hashID, property)
+		return true, nil
 	}
 
 	newValue := strings.Join(newValues, "|")
@@ -762,6 +754,12 @@ func (c *Client) GetSearchIndexTuples() ([]SearchTuple, error) {
 		}
 		for _, k := range keys {
 			if k == indexKey {
+				continue
+			}
+			// Per-record field indexes live under the same prefix and are SETs
+			// — MGET would error on them, and they are bookkeeping, not
+			// searchable metadata.
+			if strings.HasSuffix(k, "/"+FieldsField) {
 				continue
 			}
 			keyBatch = append(keyBatch, k)
@@ -1039,6 +1037,12 @@ func (c *Client) FindByValue(contains string, fields []string, limit int) ([]Fin
 		if field == "" {
 			continue
 		}
+		// The per-record field index is a SET, so an MGET over those keys
+		// would fail the whole query with WRONGTYPE. It holds field names,
+		// not values, so there is nothing here to search anyway.
+		if isReservedFieldName(field) {
+			continue
+		}
 		if len(matches) >= limit {
 			truncated = true
 			break
@@ -1207,7 +1211,17 @@ func (c *Client) SetRawValue(key, value string) error {
 	if t != "none" && t != "string" {
 		return fmt.Errorf("key has incompatible type %q (only string is editable)", t)
 	}
-	return c.client.Set(ctx, full, value, 0).Err()
+	if err := c.client.Set(ctx, full, value, 0).Err(); err != nil {
+		return err
+	}
+	// The raw editor can mint a record property out of band, so it has to keep
+	// the field index honest like every other write path. Non-record keys
+	// (`cid:*`, `udl:*`, `file:__index__`, the index set itself) split false
+	// and are left alone.
+	if hashID, field, ok := c.splitRecordKey(full); ok {
+		c.addFieldLocked(ctx, hashID, field)
+	}
+	return nil
 }
 
 // DeleteRawKey deletes the exact key. Returns true if the key existed.
@@ -1222,9 +1236,15 @@ func (c *Client) DeleteRawKey(key string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	n, err := c.client.Del(ctx, c.buildKey(key)).Result()
+	full := c.buildKey(key)
+	n, err := c.client.Del(ctx, full).Result()
 	if err != nil {
 		return false, err
+	}
+	if n > 0 {
+		if hashID, field, ok := c.splitRecordKey(full); ok {
+			c.removeFieldLocked(ctx, hashID, field)
+		}
 	}
 	return n > 0, nil
 }
@@ -1257,14 +1277,20 @@ func (c *Client) IndexRemoveIfEmpty(hashID string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	prefix := c.buildKeyPrefix(hashID)
-	keys, _, err := c.client.Scan(ctx, 0, prefix+"*", 1).Result()
+	nonEmpty, err := c.recordHasFieldsLocked(ctx, hashID)
 	if err != nil {
-		return false, fmt.Errorf("scan failed: %w", err)
+		return false, err
 	}
-	if len(keys) > 0 {
+	if nonEmpty {
 		return false, nil
 	}
+
+	// Nothing left but (possibly) an empty field index — drop it too, so a
+	// de-indexed root leaves no orphan key behind.
+	if err := c.client.Del(ctx, c.buildFieldsKey(hashID)).Err(); err != nil {
+		return false, fmt.Errorf("del field index: %w", err)
+	}
+
 	removed, err := c.client.SRem(ctx, c.buildIndexKey(), hashID).Result()
 	if err != nil {
 		return false, fmt.Errorf("srem failed: %w", err)

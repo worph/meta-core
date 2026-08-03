@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/metazla/meta-core/internal/storage"
 )
 
 const (
@@ -124,6 +126,14 @@ func (p *MetaPublisher) publishEvent(channel, operation string) {
 
 	// Skip index key and non-file keys
 	if strings.Contains(key, "__index__") || !strings.HasPrefix(key, "file:") {
+		return
+	}
+	// Skip the per-record field index. It is bookkeeping (see
+	// storage.FieldsField), not a metadata field — publishing it would make
+	// every downstream consumer that parses `file:<id>/<field>` off this
+	// stream (meta-search, meta-dup, meta-fuse, meta-sort) see a phantom
+	// field change on a key they can never read.
+	if strings.HasSuffix(key, "/"+storage.FieldsField) {
 		return
 	}
 

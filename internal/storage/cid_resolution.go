@@ -83,6 +83,7 @@ func (c *Client) Mint(filePath string, size, mtimeNano int64) (string, error) {
 	pipe.Set(ctx, prefix+"sizeByte", strconv.FormatInt(size, 10), 0)
 	pipe.Set(ctx, prefix+"mtimeNano", strconv.FormatInt(mtimeNano, 10), 0)
 	pipe.SAdd(ctx, c.buildIndexKey(), uuid)
+	c.addFieldsToPipe(ctx, pipe, uuid, []string{"filePath", "sizeByte", "mtimeNano"})
 	if _, err := pipe.Exec(ctx); err != nil {
 		return "", fmt.Errorf("mint pipeline: %w", err)
 	}
@@ -116,7 +117,13 @@ func (c *Client) addAliasLocked(ctx context.Context, uuid, cidStr string) error 
 		return fmt.Errorf("uuid and cid are required")
 	}
 
-	keysetKey := c.buildKeyPrefix(uuid) + CIDsKeyPrefix + cidStr
+	keysetField := CIDsKeyPrefix + cidStr
+	keysetKey := c.buildKeyPrefix(uuid) + keysetField
+
+	// Every branch below writes the key-set member, so index the field name
+	// once here — including the two guard branches that skip the alias itself.
+	// Missing it would leave `cids/<cid>` invisible to a record read.
+	defer c.addFieldLocked(ctx, uuid, keysetField)
 
 	// Self-pointing alias guard. If the caller is trying to register
 	// cid:<cid> → <cid> (i.e. the root IS the cid value), that's the
@@ -233,26 +240,13 @@ func (c *Client) AddDuplicatePath(uuid, path string) (bool, error) {
 	return added > 0, nil
 }
 
-// cidsForRootLocked scans the bare-CID key-set for a root and returns its
-// members (bare CIDs, with the cids/ prefix stripped). Caller must hold c.mu.
+// cidsForRootLocked returns a root's bare-CID key-set members (with the cids/
+// prefix stripped). Caller must hold c.mu.
+//
+// Reads the field index and filters by prefix; only an un-indexed root falls
+// back to a SCAN, and then over the narrower cids/ glob. See field_index.go.
 func (c *Client) cidsForRootLocked(ctx context.Context, uuid string) ([]string, error) {
-	prefix := c.buildKeyPrefix(uuid) + CIDsKeyPrefix
-	var out []string
-	var cursor uint64
-	for {
-		keys, next, err := c.client.Scan(ctx, cursor, prefix+"*", 1000).Result()
-		if err != nil {
-			return nil, fmt.Errorf("scan cids: %w", err)
-		}
-		for _, k := range keys {
-			out = append(out, strings.TrimPrefix(k, prefix))
-		}
-		cursor = next
-		if cursor == 0 {
-			break
-		}
-	}
-	return out, nil
+	return c.fieldsWithPrefixLocked(ctx, uuid, CIDsKeyPrefix)
 }
 
 // DeleteRoot removes everything keyed off uuid: every file:<uuid>/* property
