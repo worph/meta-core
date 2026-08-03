@@ -369,6 +369,68 @@ func TestFieldIndex_StaleEntryIsHarmless(t *testing.T) {
 	})
 }
 
+// WarmFieldIndexes is what keeps an upgrade from spending hours reading
+// un-indexed records one full-keyspace scan at a time. It must index every
+// record in one pass, be idempotent, and leave already-indexed records alone.
+func TestFieldIndex_WarmBuildsEveryMissingIndex(t *testing.T) {
+	forEachPrefix(t, func(t *testing.T, c *Client) {
+		ctx := context.Background()
+
+		// Two legacy records seeded straight into Redis (no index), plus one
+		// written through the normal path (already indexed).
+		legacy := map[string]map[string]string{
+			"old1": {"filePath": "/a.mkv", "cids/bafkreiaaa": "true"},
+			"old2": {"filePath": "/b.mkv", "titles/jpn": "ナルト", "deep/a/b": "x"},
+		}
+		for root, fields := range legacy {
+			for f, v := range fields {
+				if err := c.client.Set(ctx, c.buildKeyPrefix(root)+f, v, 0).Err(); err != nil {
+					t.Fatalf("seed: %v", err)
+				}
+			}
+			if err := c.IndexAdd(root); err != nil {
+				t.Fatalf("IndexAdd: %v", err)
+			}
+		}
+		if err := c.SetMetadataFlat("fresh", map[string]string{"title": "x"}); err != nil {
+			t.Fatalf("SetMetadataFlat: %v", err)
+		}
+
+		n, err := c.WarmFieldIndexes()
+		if err != nil {
+			t.Fatalf("WarmFieldIndexes: %v", err)
+		}
+		if n < 2 {
+			t.Errorf("warmed %d records, want at least the 2 legacy ones", n)
+		}
+
+		if got := fieldNames(t, c, "old1"); !reflect.DeepEqual(got, []string{"cids/bafkreiaaa", "filePath"}) {
+			t.Errorf("old1 index = %v", got)
+		}
+		if got := fieldNames(t, c, "old2"); !reflect.DeepEqual(got, []string{"deep/a/b", "filePath", "titles/jpn"}) {
+			t.Errorf("old2 index = %v", got)
+		}
+		if got := fieldNames(t, c, "fresh"); !reflect.DeepEqual(got, []string{"title"}) {
+			t.Errorf("fresh index disturbed = %v", got)
+		}
+
+		// Reads must now agree with what the records actually hold.
+		for root, want := range legacy {
+			if got := mustGetMetadata(t, c, root); !reflect.DeepEqual(got, want) {
+				t.Errorf("%s read = %v, want %v", root, got, want)
+			}
+		}
+
+		// Idempotent: a second pass changes nothing.
+		if _, err := c.WarmFieldIndexes(); err != nil {
+			t.Fatalf("second WarmFieldIndexes: %v", err)
+		}
+		if got := fieldNames(t, c, "old2"); !reflect.DeepEqual(got, []string{"deep/a/b", "filePath", "titles/jpn"}) {
+			t.Errorf("old2 index after second warm = %v", got)
+		}
+	})
+}
+
 // The bulk search read enumerates the whole file: keyspace and MGETs what it
 // finds. The index keys are SETs living in that same namespace, so it has to
 // skip them or the MGET fails with WRONGTYPE and search dies wholesale.

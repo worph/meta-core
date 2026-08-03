@@ -351,6 +351,21 @@ func (s *Server) Start() error {
 
 			// Republish events for all existing metadata
 			go func() {
+				// Build any missing per-record field indexes first, in ONE
+				// keyspace pass. The republish below reads every record, and
+				// an un-indexed record read costs a full-keyspace SCAN — on a
+				// real store that walk warmed at ~1.3 records/s (a ~2.6h tail,
+				// paid again on every restart). Warming first turns the whole
+				// republish into index-served reads. Idempotent, so a
+				// fully-indexed store just pays the single scan.
+				// See storage/field_index.go.
+				started := time.Now()
+				if n, err := s.storage.WarmFieldIndexes(); err != nil {
+					log.Printf("[API] Warning: field index warm failed: %v (reads fall back to SCAN)", err)
+				} else if n > 0 {
+					log.Printf("[API] Warmed %d field indexes in %s", n, time.Since(started).Round(time.Millisecond))
+				}
+
 				count, err := s.RepublishMetadata()
 				if err != nil {
 					log.Printf("[API] Warning: failed to republish metadata on startup: %v", err)

@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -265,6 +267,11 @@ func (c *Client) fieldsWithPrefixLocked(ctx context.Context, hashID, fieldPrefix
 			out = append(out, strings.TrimPrefix(f, fieldPrefix))
 		}
 	}
+	// SMEMBERS order is arbitrary and SCAN order was too, so the CID array in
+	// GetMetadataDocument used to shuffle between calls. Sorting costs nothing
+	// at these sizes and makes the response byte-stable, which matters for
+	// anything diffing or caching it.
+	sort.Strings(out)
 	return out, nil
 }
 
@@ -285,7 +292,100 @@ func (c *Client) scanFieldsWithPrefixLocked(ctx context.Context, hashID, fieldPr
 			break
 		}
 	}
+	sort.Strings(out)
 	return out, nil
+}
+
+// WarmFieldIndexes builds every missing field index in a SINGLE keyspace pass.
+//
+// Without it the indexes still appear — each record's first read falls back to
+// a scan and backfills — but that transition is O(records x keyspace) and it
+// runs again from scratch after any wipe. Measured on the real store (12,345
+// records / 445k keys) the lazy path warmed at ~1.3 records/s: a ~2.6 HOUR tail
+// during which meta-core stays pinned exactly as it was before the fix. Worse,
+// `RepublishMetadata` walks every record at startup, so that tail is paid on
+// every restart.
+//
+// One bulk `file:*` scan grouped by record collapses it to a few seconds. This
+// is the same shape `GetSearchIndexTuples` already uses for the bulk read, and
+// for the same reason.
+//
+// Idempotent, and safe to run against a partially-indexed store: SADD of a
+// member that is already there is a no-op. Returns the number of records it
+// wrote an index for.
+func (c *Client) WarmFieldIndexes() (int, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.client == nil {
+		return 0, fmt.Errorf("not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	filePrefix := c.buildKey("file:") // {filePrefix}{hashID}/{field}
+	indexKey := c.buildIndexKey()
+
+	byRecord := make(map[string][]string)
+	var cursor uint64
+	for {
+		keys, next, err := c.client.Scan(ctx, cursor, filePrefix+"*", 1000).Result()
+		if err != nil {
+			return 0, fmt.Errorf("scan: %w", err)
+		}
+		for _, k := range keys {
+			if k == indexKey {
+				continue
+			}
+			// hashID has no '/'; field may contain them.
+			rest := strings.TrimPrefix(k, filePrefix)
+			slash := strings.IndexByte(rest, '/')
+			if slash < 0 {
+				continue
+			}
+			hashID, field := rest[:slash], rest[slash+1:]
+			if isReservedFieldName(field) {
+				// Already indexed — remember the record so we don't treat it
+				// as missing, but there is nothing to add for this key.
+				if _, seen := byRecord[hashID]; !seen {
+					byRecord[hashID] = nil
+				}
+				continue
+			}
+			byRecord[hashID] = append(byRecord[hashID], field)
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+
+	written := 0
+	pipe := c.client.Pipeline()
+	pending := 0
+	for hashID, fields := range byRecord {
+		if len(fields) == 0 {
+			continue
+		}
+		pipe.SAdd(ctx, c.buildFieldsKey(hashID), toAny(fields)...)
+		written++
+		pending++
+		// Bound the pipeline so a large store doesn't buffer every command.
+		if pending >= 500 {
+			if _, err := pipe.Exec(ctx); err != nil {
+				return written, fmt.Errorf("sadd pipeline: %w", err)
+			}
+			pipe = c.client.Pipeline()
+			pending = 0
+		}
+	}
+	if pending > 0 {
+		if _, err := pipe.Exec(ctx); err != nil {
+			return written, fmt.Errorf("sadd pipeline: %w", err)
+		}
+	}
+	return written, nil
 }
 
 // recordHasFieldsLocked reports whether a record still has at least one
