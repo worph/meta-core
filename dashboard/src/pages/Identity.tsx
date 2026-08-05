@@ -1,20 +1,42 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
-// Status returned by GET /api/identity. Private key is never present here —
-// it is shown exactly once at generation time (see GeneratedKeyPanel).
-interface IdentityStatus {
-  hasIdentity: boolean;
-  uid?: string;
-  curve?: string;
-  createdAt?: number;
-}
+// Admin console for meta-core's account keystore.
+//
+// meta-core stores one secp256k1 keypair per file under
+// {META_CORE_PATH}/identity/accounts/<uid>.json and has NO notion of a current
+// user — which account is "you" is decided by whichever client signs in
+// (meta-watch). So this page lists accounts; it never speaks of an active one.
+//
+// The private key is returned by exactly two calls: POST /api/identity/generate
+// (once, at creation) and POST /api/identity/reveal (on demand, for an account
+// that already exists). Both land in the same exclusive SecretKeyPanel.
 
-interface GeneratedKey {
+interface Account {
   uid: string;
   curve: string;
   createdAt: number;
-  privateKeyHex: string;
 }
+
+// A secret on screen. Carries no createdAt: /api/identity/reveal answers with
+// {uid, curve, privateKeyHex} only.
+interface SecretKeyView {
+  uid: string;
+  privateKeyHex: string;
+  kind: 'generated' | 'revealed';
+}
+
+// Which row has an open confirmation, and for what. One discriminated value
+// rather than a pair of ids, so at most one confirm panel can ever be open.
+interface Pending {
+  uid: string;
+  kind: 'remove' | 'reveal';
+}
+
+// meta-watch's sentinel cell for profile records: display name and avatar are
+// about the *user*, not a content file, so they live at (uid, "self", ...).
+// meta-core stores them opaquely and knows nothing of the convention.
+const PROFILE_CID = 'self';
+const PROFILE_NAME_KEY = 'profile:name';
 
 const cardStyle: React.CSSProperties = {
   background: '#16213e',
@@ -59,6 +81,21 @@ const monoStyle: React.CSSProperties = {
   borderRadius: '4px',
 };
 
+const dangerPanelStyle: React.CSSProperties = {
+  background: '#1f0a0a',
+  border: '1px solid #7f1d1d',
+  padding: '0.75rem 1rem',
+  borderRadius: '4px',
+  marginTop: '0.75rem',
+};
+
+const errorTextStyle: React.CSSProperties = {
+  color: '#f87171',
+  background: '#1f0a0a',
+  padding: '0.5rem 0.75rem',
+  borderRadius: '4px',
+};
+
 function formatCreatedAt(unixSec?: number): string {
   if (!unixSec) return '';
   try {
@@ -79,25 +116,76 @@ async function errorMessage(res: Response, fallback: string): Promise<string> {
   return `${fallback} (HTTP ${res.status})`;
 }
 
-function GeneratedKeyPanel({ data, onDismiss }: { data: GeneratedKey; onDismiss: () => void }) {
-  const [copied, setCopied] = useState(false);
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(data.privateKeyHex);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch {
-      // Clipboard API blocked (non-HTTPS context, etc.) — fall back to selection.
-      const sel = window.getSelection();
+// Copy text, falling back to selecting the element that displays it.
+//
+// The fallback is load-bearing, not politeness: the dashboard is served over
+// plain HTTP, where navigator.clipboard is undefined — without it the copy
+// buttons do nothing at all on a real deployment.
+async function copyToClipboard(text: string, fallbackElementId: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const sel = window.getSelection();
+    const el = document.getElementById(fallbackElementId);
+    if (sel && el) {
       const range = document.createRange();
-      const el = document.getElementById('mm-privkey-box');
-      if (sel && el) {
-        range.selectNodeContents(el);
-        sel.removeAllRanges();
-        sel.addRange(range);
-      }
+      range.selectNodeContents(el);
+      sel.removeAllRanges();
+      sel.addRange(range);
     }
+  }
+}
+
+async function fetchAccounts(): Promise<Account[]> {
+  const res = await fetch('/api/identity/accounts');
+  if (!res.ok) throw new Error(await errorMessage(res, 'Failed to load accounts'));
+  const data = (await res.json()) as { accounts?: Account[] };
+  // Backend order is CreatedAt ascending then uid (identity.List) — stable, so
+  // render it as given rather than re-sorting here.
+  return data.accounts ?? [];
+}
+
+// Resolve an account's display name from the User Data Layer, or null.
+//
+// Never throws and never reports an error upward: a name is decoration on top
+// of the uid, and the account list must render identically whether Redis is up
+// (identity itself is file-backed, the UDL is not). The name is also *unsigned*
+// — meta-core stores the plaintext beside the signed record and verifies
+// nothing — so the uid stays on screen as the real identity, and the length cap
+// bounds what a hostile writer can do to the layout.
+async function fetchDisplayName(uid: string): Promise<string | null> {
+  const url =
+    `/api/udl/record?uid=${encodeURIComponent(uid)}` +
+    `&cid=${encodeURIComponent(PROFILE_CID)}` +
+    `&key=${encodeURIComponent(PROFILE_NAME_KEY)}`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null; // 503 when storage is down, 500, …
+    const data = (await res.json()) as { exists?: boolean; value?: unknown };
+    // Key off `value`, not `exists`: clearing a name writes a tombstone, which
+    // leaves the cell existing with no plaintext. Private-tier cells look the
+    // same, which is exactly right — there is nothing to show for either.
+    if (typeof data.value !== 'string') return null;
+    const name = data.value.trim();
+    return name ? name.slice(0, 64) : null;
+  } catch {
+    return null;
+  }
+}
+
+// The one place a private key is ever displayed. Rendered exclusively (the
+// account list is hidden while it is open) so the "save it now" contract of a
+// freshly generated key is not competing with anything, and so the hardcoded
+// element id below stays unique.
+function SecretKeyPanel({ data, onDismiss }: { data: SecretKeyView; onDismiss: () => void }) {
+  const [copied, setCopied] = useState(false);
+
+  const copy = async () => {
+    await copyToClipboard(data.privateKeyHex, 'mm-privkey-box');
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
   };
+
   return (
     <div style={{ ...cardStyle, border: '2px solid #dc2626' }}>
       <div
@@ -109,9 +197,19 @@ function GeneratedKeyPanel({ data, onDismiss }: { data: GeneratedKey; onDismiss:
           marginBottom: '1rem',
         }}
       >
-        <strong>This private key is shown ONCE.</strong> Save it now in a password manager.
-        It will never be displayed again — there is no recovery path. Losing it means losing access
-        to every record signed under this identity.
+        {data.kind === 'generated' ? (
+          <>
+            <strong>This private key is shown ONCE.</strong> Save it now in a password manager.
+            You can ask for it again later with <em>Reveal private key</em>, but only for as long
+            as this account exists on this node — delete it and the key is gone for good.
+          </>
+        ) : (
+          <>
+            <strong>This is the live private key for an existing account.</strong> Anyone holding
+            it can sign as this uid forever, on any machine. There is no revocation and no
+            rotation. Do not paste it into chat, tickets or screenshots.
+          </>
+        )}
       </div>
       <p style={{ color: '#9ca3af', margin: '0 0 0.5rem' }}>uid (public):</p>
       <div style={monoStyle}>{data.uid}</div>
@@ -124,36 +222,40 @@ function GeneratedKeyPanel({ data, onDismiss }: { data: GeneratedKey; onDismiss:
           {copied ? 'Copied' : 'Copy private key'}
         </button>
         <button style={dangerButtonStyle} onClick={onDismiss}>
-          I have saved it
+          {data.kind === 'generated' ? 'I have saved it' : 'Done — hide it'}
         </button>
       </div>
     </div>
   );
 }
 
-function NoIdentityPanel({
+// Create / import. Always available, not just on an empty keystore: this is an
+// admin console, so adding an account to a populated node has to be possible.
+function NewAccountPanel({
   onGenerated,
   onImported,
 }: {
-  onGenerated: (g: GeneratedKey) => void;
+  onGenerated: (s: SecretKeyView) => void;
   onImported: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [importing, setImporting] = useState(false);
   const [importHex, setImportHex] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const generate = async () => {
     setBusy(true);
     setError(null);
+    setNotice(null);
     try {
       const res = await fetch('/api/identity/generate', { method: 'POST' });
       if (!res.ok) {
         setError(await errorMessage(res, 'Generate failed'));
         return;
       }
-      const data = (await res.json()) as GeneratedKey;
-      onGenerated(data);
+      const data = (await res.json()) as { uid: string; privateKeyHex: string };
+      onGenerated({ uid: data.uid, privateKeyHex: data.privateKeyHex, kind: 'generated' });
     } catch (e) {
       setError(`Generate failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
@@ -165,6 +267,7 @@ function NoIdentityPanel({
     e.preventDefault();
     setBusy(true);
     setError(null);
+    setNotice(null);
     try {
       const res = await fetch('/api/identity/import', {
         method: 'POST',
@@ -175,6 +278,15 @@ function NoIdentityPanel({
         setError(await errorMessage(res, 'Import failed'));
         return;
       }
+      // Import is idempotent — presenting the key IS the proof of ownership, so
+      // a key this node already holds is a success, not a conflict. `created`
+      // only decides the wording.
+      const data = (await res.json()) as { created?: boolean };
+      setNotice(
+        data.created
+          ? 'Imported — a new account was added to this keystore.'
+          : 'That key was already in this keystore; nothing changed.'
+      );
       setImportHex('');
       setImporting(false);
       onImported();
@@ -187,15 +299,16 @@ function NoIdentityPanel({
 
   return (
     <div style={cardStyle}>
-      <h3 style={{ marginTop: 0 }}>No identity yet</h3>
-      <p style={{ color: '#9ca3af' }}>
-        The User Data Layer needs a signing key for your ratings, watch progress, and "liked" flags
-        to be attributed to you across devices. Nothing happens automatically — generate one below,
-        or import a key you already have.
+      <h3 style={{ marginTop: 0 }}>Add an account</h3>
+      <p style={{ color: '#9ca3af', marginTop: 0 }}>
+        Generating mints a fresh secp256k1 keypair here. Importing adds a key created elsewhere —
+        it is also how an existing account is moved onto this node, so importing a key the
+        keystore already holds succeeds and changes nothing.
       </p>
-      {error && (
-        <p style={{ color: '#f87171', background: '#1f0a0a', padding: '0.5rem 0.75rem', borderRadius: '4px' }}>
-          {error}
+      {error && <p style={errorTextStyle}>{error}</p>}
+      {notice && (
+        <p style={{ color: '#9ca3af', background: '#0a0a18', padding: '0.5rem 0.75rem', borderRadius: '4px' }}>
+          {notice}
         </p>
       )}
       <div>
@@ -235,71 +348,125 @@ function NoIdentityPanel({
   );
 }
 
-function HasIdentityPanel({ status, onReplace }: { status: IdentityStatus; onReplace: () => void }) {
-  const [confirming, setConfirming] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+function AccountCard({
+  account,
+  name,
+  busy,
+  disabled,
+  pending,
+  error,
+  onAsk,
+  onCancel,
+  onReveal,
+  onRemove,
+}: {
+  account: Account;
+  name?: string;
+  busy: boolean;
+  disabled: boolean;
+  pending: Pending | null;
+  error: string | null;
+  onAsk: (p: Pending) => void;
+  onCancel: () => void;
+  onReveal: (uid: string) => void;
+  onRemove: (uid: string) => void;
+}) {
+  const [copied, setCopied] = useState(false);
+  const uidBoxId = `mm-uid-${account.uid}`;
+  const label = name ?? account.uid;
 
-  const remove = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      const res = await fetch('/api/identity?confirm=true', { method: 'DELETE' });
-      if (!res.ok && res.status !== 204) {
-        setError(await errorMessage(res, 'Delete failed'));
-        return;
-      }
-      onReplace();
-    } catch (e) {
-      setError(`Delete failed: ${e instanceof Error ? e.message : String(e)}`);
-    } finally {
-      setBusy(false);
-      setConfirming(false);
-    }
+  const copyUid = async () => {
+    await copyToClipboard(account.uid, uidBoxId);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
   };
 
   return (
     <div style={cardStyle}>
-      <h3 style={{ marginTop: 0 }}>Active identity</h3>
-      <p style={{ color: '#9ca3af', margin: '0 0 0.5rem' }}>uid:</p>
-      <div style={monoStyle}>{status.uid}</div>
-      <p style={{ color: '#888', marginTop: '1rem' }}>
-        Curve: {status.curve} · Created: {formatCreatedAt(status.createdAt)}
-      </p>
-      <p style={{ color: '#9ca3af', fontSize: '0.85rem' }}>
-        The private key lives at <code>/meta-core/identity/identity.json</code> on this volume and
-        is never returned through the API after generation. Other services on this stack (e.g.
-        meta-watch) sign records by calling <code>POST /api/identity/sign</code>.
-      </p>
-      {error && (
-        <p style={{ color: '#f87171', background: '#1f0a0a', padding: '0.5rem 0.75rem', borderRadius: '4px' }}>
-          {error}
-        </p>
-      )}
-      {!confirming ? (
-        <button style={dangerButtonStyle} onClick={() => setConfirming(true)} disabled={busy}>
-          Replace identity
-        </button>
-      ) : (
-        <div
-          style={{
-            background: '#1f0a0a',
-            border: '1px solid #7f1d1d',
-            padding: '0.75rem 1rem',
-            borderRadius: '4px',
-            marginTop: '0.5rem',
-          }}
-        >
-          <p style={{ color: '#fecaca', marginTop: 0 }}>
-            Replacing the identity deletes the current keypair from disk. Records signed by the
-            current uid will keep verifying for anyone who has them cached, but this node will no
-            longer be able to write under that uid. <strong>Make sure you have backed up the key
-            first.</strong>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '1rem' }}>
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <h3 style={{ margin: '0 0 0.5rem', color: name ? '#fff' : '#888' }}>
+            {name ?? 'Unnamed account'}
+          </h3>
+          <div id={uidBoxId} style={monoStyle}>
+            {account.uid}
+          </div>
+          <p style={{ color: '#888', margin: '0.75rem 0 0', fontSize: '0.85rem' }}>
+            Curve: {account.curve} · Created: {formatCreatedAt(account.createdAt)}
           </p>
-          <button style={dangerButtonStyle} onClick={remove} disabled={busy}>
-            {busy ? 'Deleting…' : 'Yes, delete identity'}
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', flexShrink: 0 }}>
+          <button style={{ ...buttonStyle, marginRight: 0 }} onClick={copyUid} disabled={disabled}>
+            {copied ? 'Copied' : 'Copy uid'}
           </button>
-          <button style={buttonStyle} onClick={() => setConfirming(false)} disabled={busy}>
+          <button
+            style={{ ...dangerButtonStyle, marginRight: 0 }}
+            onClick={() => onAsk({ uid: account.uid, kind: 'reveal' })}
+            disabled={disabled}
+          >
+            Reveal private key
+          </button>
+          <button
+            style={{ ...dangerButtonStyle, marginRight: 0 }}
+            onClick={() => onAsk({ uid: account.uid, kind: 'remove' })}
+            disabled={disabled}
+          >
+            Remove
+          </button>
+        </div>
+      </div>
+
+      {error && <p style={{ ...errorTextStyle, marginBottom: 0 }}>{error}</p>}
+
+      {pending?.uid === account.uid && pending.kind === 'reveal' && (
+        <div style={dangerPanelStyle}>
+          <p style={{ color: '#fecaca', marginTop: 0 }}>
+            Show the private key for <strong>{label}</strong>?
+          </p>
+          <p style={{ color: '#fecaca', marginTop: 0 }}>
+            The key <em>is</em> the account. Anyone who copies it can sign records as this uid on
+            any machine, forever — there is no way to revoke or rotate it afterwards. meta-core
+            will hand it over without asking who you are; see the note at the top of this page.
+          </p>
+          <button style={dangerButtonStyle} onClick={() => onReveal(account.uid)} disabled={busy}>
+            {busy ? 'Revealing…' : 'Yes, show the private key'}
+          </button>
+          <button style={buttonStyle} onClick={onCancel} disabled={busy}>
+            Cancel
+          </button>
+        </div>
+      )}
+
+      {pending?.uid === account.uid && pending.kind === 'remove' && (
+        <div style={dangerPanelStyle}>
+          <p style={{ color: '#fecaca', marginTop: 0 }}>
+            Remove <strong>{label}</strong> from this node?
+          </p>
+          <ul style={{ color: '#fecaca', paddingLeft: '1.2rem', margin: '0 0 0.75rem' }}>
+            <li>
+              <strong>The key is gone for good.</strong> The uid <em>is</em> the public key, and
+              the private half exists only in this node's keystore. If nobody saved it, nothing —
+              not you, not meta-core — can ever sign as this uid again. Reveal and copy it first
+              if there is any doubt.
+            </li>
+            <li>
+              <strong>Nothing is retracted.</strong> Records already signed under this uid keep
+              verifying on every peer that replicated them. Deleting a key is not a recall.
+            </li>
+            <li>
+              <strong>Its data stays, but goes read-only.</strong> The account's User Data Layer
+              cells — likes, ratings, watch progress — survive in Redis, and no newer version of
+              any of them can ever be written.
+            </li>
+            <li>
+              <strong>This signs nobody out elsewhere.</strong> Any device that holds this key
+              still holds it, and can import it back here at any time.
+            </li>
+          </ul>
+          <button style={dangerButtonStyle} onClick={() => onRemove(account.uid)} disabled={busy}>
+            {busy ? 'Removing…' : 'Yes, remove this account'}
+          </button>
+          <button style={buttonStyle} onClick={onCancel} disabled={busy}>
             Cancel
           </button>
         </div>
@@ -309,66 +476,183 @@ function HasIdentityPanel({ status, onReplace }: { status: IdentityStatus; onRep
 }
 
 export default function Identity() {
-  const [status, setStatus] = useState<IdentityStatus | null>(null);
-  const [generated, setGenerated] = useState<GeneratedKey | null>(null);
+  const [accounts, setAccounts] = useState<Account[] | null>(null);
+  const [names, setNames] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
+  const [secret, setSecret] = useState<SecretKeyView | null>(null);
+  const [pending, setPending] = useState<Pending | null>(null);
+  const [busyUid, setBusyUid] = useState<string | null>(null);
+  const [rowError, setRowError] = useState<{ uid: string; message: string } | null>(null);
+
+  // Bumped per refresh so a slow response from a superseded load cannot
+  // overwrite a newer one. The page does not poll (unlike the rest of the
+  // dashboard) — a key list has no business changing under the cursor.
+  const reqGen = useRef(0);
 
   const refresh = async () => {
+    const gen = ++reqGen.current;
     setLoading(true);
     setFetchError(null);
+    let list: Account[];
     try {
-      const res = await fetch('/api/identity');
-      if (!res.ok) {
-        setFetchError(await errorMessage(res, 'Failed to load identity status'));
-        return;
-      }
-      setStatus((await res.json()) as IdentityStatus);
+      list = await fetchAccounts();
     } catch (e) {
-      setFetchError(`Failed to load identity status: ${e instanceof Error ? e.message : String(e)}`);
-    } finally {
+      if (gen !== reqGen.current) return;
+      setFetchError(e instanceof Error ? e.message : String(e));
       setLoading(false);
+      return;
     }
+    if (gen !== reqGen.current) return;
+    // Render the list before resolving names, so a down Redis delays nothing.
+    setAccounts(list);
+    setLoading(false);
+
+    const settled = await Promise.allSettled(list.map((a) => fetchDisplayName(a.uid)));
+    if (gen !== reqGen.current) return;
+    const next: Record<string, string> = {};
+    settled.forEach((r, i) => {
+      if (r.status === 'fulfilled' && r.value) next[list[i].uid] = r.value;
+    });
+    // Replace rather than merge, so a removed account's name goes with it.
+    setNames(next);
   };
 
   useEffect(() => {
     refresh();
   }, []);
 
+  const reveal = async (uid: string) => {
+    setBusyUid(uid);
+    setRowError(null);
+    try {
+      // POST with a body rather than ?uid=, so the target stays out of the
+      // proxy's access log. The handler accepts either.
+      const res = await fetch('/api/identity/reveal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: true, uid }),
+      });
+      if (!res.ok) {
+        setRowError({ uid, message: await errorMessage(res, 'Reveal failed') });
+        return;
+      }
+      const data = (await res.json()) as { uid: string; privateKeyHex: string };
+      setPending(null);
+      setSecret({ uid: data.uid, privateKeyHex: data.privateKeyHex, kind: 'revealed' });
+    } catch (e) {
+      setRowError({ uid, message: `Reveal failed: ${e instanceof Error ? e.message : String(e)}` });
+    } finally {
+      setBusyUid(null);
+    }
+  };
+
+  const remove = async (uid: string) => {
+    setBusyUid(uid);
+    setRowError(null);
+    try {
+      // The uid is mandatory: with more than one account the backend refuses an
+      // unqualified delete (400 uid_required) rather than guess.
+      const res = await fetch(`/api/identity?uid=${encodeURIComponent(uid)}&confirm=true`, {
+        method: 'DELETE',
+      });
+      if (!res.ok) {
+        setRowError({ uid, message: await errorMessage(res, 'Remove failed') });
+        return;
+      }
+      setPending(null);
+      await refresh();
+    } catch (e) {
+      setRowError({ uid, message: `Remove failed: ${e instanceof Error ? e.message : String(e)}` });
+    } finally {
+      setBusyUid(null);
+    }
+  };
+
+  const dismissSecret = () => {
+    setSecret(null);
+    refresh();
+  };
+
+  const showList = !loading && !fetchError && !secret;
+
   return (
     <div style={{ padding: '2rem', maxWidth: '900px', margin: '0 auto' }}>
-      <h1>Identity</h1>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <h1 style={{ marginBottom: 0 }}>Identity</h1>
+        <button style={{ ...buttonStyle, marginRight: 0 }} onClick={refresh} disabled={loading}>
+          {loading ? 'Loading…' : 'Refresh'}
+        </button>
+      </div>
       <p style={{ color: '#9ca3af' }}>
-        Signing key for the User Data Layer (per-user ratings, progress, "liked" flags). One
-        identity per node. The same key on another device makes that device count as "you".
+        Every signing key in this node's keystore. meta-core has no "current user" — it stores
+        accounts, and which one is <em>you</em> is decided by whichever client signs in (e.g.
+        meta-watch). Keys live one JSON file per account under{' '}
+        <code>{'{META_CORE_PATH}'}/identity/accounts/&lt;uid&gt;.json</code>, and are used to sign
+        User Data Layer records (ratings, watch progress, "liked" flags).
       </p>
 
+      <div style={{ ...dangerPanelStyle, marginTop: 0, marginBottom: '1rem' }}>
+        <p style={{ color: '#fecaca', margin: 0 }}>
+          <strong>Admin page — no authorisation happens here.</strong> <code>/api/identity/*</code>{' '}
+          asks no questions: anything that can reach this API can list, create, reveal or delete{' '}
+          <em>any</em> account's private key. The only access control is the perimeter in front of
+          this port. Client-facing screens (meta-watch) authorise reveal and delete against the
+          caller's own session and expose no delete at all; this page has neither check. Treat
+          reaching it as equivalent to holding every key on this node.
+        </p>
+      </div>
+
       {loading && <div style={cardStyle}>Loading…</div>}
+
       {fetchError && (
         <div style={{ ...cardStyle, border: '1px solid #7f1d1d' }}>
-          <p style={{ color: '#f87171', margin: 0 }}>{fetchError}</p>
+          <p style={{ color: '#f87171', margin: '0 0 1rem' }}>{fetchError}</p>
           <button style={buttonStyle} onClick={refresh}>
             Retry
           </button>
         </div>
       )}
 
-      {!loading && !fetchError && generated && (
-        <GeneratedKeyPanel
-          data={generated}
-          onDismiss={() => {
-            setGenerated(null);
-            refresh();
-          }}
-        />
-      )}
+      {!loading && !fetchError && secret && <SecretKeyPanel data={secret} onDismiss={dismissSecret} />}
 
-      {!loading && !fetchError && !generated && status && !status.hasIdentity && (
-        <NoIdentityPanel onGenerated={(g) => setGenerated(g)} onImported={refresh} />
-      )}
+      {showList && (
+        <>
+          <NewAccountPanel onGenerated={(s) => setSecret(s)} onImported={refresh} />
 
-      {!loading && !fetchError && !generated && status && status.hasIdentity && (
-        <HasIdentityPanel status={status} onReplace={refresh} />
+          <h2 style={{ fontSize: '1.1rem', color: '#9ca3af', margin: '1.5rem 0 1rem' }}>
+            Accounts ({accounts?.length ?? 0})
+          </h2>
+
+          {accounts && accounts.length === 0 && (
+            <div style={cardStyle}>
+              <p style={{ color: '#9ca3af', margin: 0 }}>
+                No accounts in this keystore. Accounts are normally created by a client when
+                someone signs up; use <em>Add an account</em> above if you are bootstrapping this
+                node.
+              </p>
+            </div>
+          )}
+
+          {accounts?.map((a) => (
+            <AccountCard
+              key={a.uid}
+              account={a}
+              name={names[a.uid]}
+              busy={busyUid === a.uid}
+              disabled={busyUid !== null}
+              pending={pending}
+              error={rowError?.uid === a.uid ? rowError.message : null}
+              onAsk={(p) => {
+                setRowError(null);
+                setPending(p);
+              }}
+              onCancel={() => setPending(null)}
+              onReveal={reveal}
+              onRemove={remove}
+            />
+          ))}
+        </>
       )}
     </div>
   );

@@ -48,6 +48,18 @@ type UDLRecordResponse struct {
 	Version int64  `json:"version"`
 	Ts      int64  `json:"ts"`
 	Exists  bool   `json:"exists"`
+	// Value is the plaintext JSON scalar stored beside the opaque record, and
+	// is present only for PUBLIC-tier keys (like, rating, profile:name,
+	// profile:avatar). json.RawMessage rather than string because the field is
+	// generic over keys — a bool for `like`, a number for `rating`, a string
+	// for a profile name (see aggregatePublicValues) — and because it is the
+	// exact type UDLPutRequest.Value uses, so a value written through PUT reads
+	// back byte-identical.
+	//
+	// Absent, never null, when there is no plaintext: private-tier cells,
+	// tombstones and never-written cells must not read as an empty public
+	// value. Readers key off presence, not `exists`.
+	Value *json.RawMessage `json:"value,omitempty"`
 }
 
 // UDLAggregate mirrors meta-watch's Aggregate wire shape exactly (snake_case
@@ -79,12 +91,20 @@ func (s *Server) handleUDLRecordGet(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, UDLRecordResponse{
+	resp := UDLRecordResponse{
 		Record:  cell.Record,
 		Version: cell.Version,
 		Ts:      cell.Ts,
 		Exists:  exists,
-	})
+	}
+	// json.Valid guards the encoder: a malformed `value` hash field (hand-edited
+	// Redis, a future writer bug) would otherwise fail mid-encode and emit a
+	// truncated body instead of a readable error.
+	if exists && cell.HasValue && json.Valid([]byte(cell.Value)) {
+		raw := json.RawMessage(cell.Value)
+		resp.Value = &raw
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleUDLRecordPut handles PUT /api/udl/record. Version-gated: a stale write
