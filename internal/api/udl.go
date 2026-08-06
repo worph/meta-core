@@ -42,6 +42,32 @@ type UDLPutResponse struct {
 	Accepted bool `json:"accepted"`
 }
 
+// UDLPutBatchRequest is the body of PUT /api/udl/records — many cells, one
+// request. Each entry is exactly a UDLPutRequest, so a client can build the
+// same signed record for either endpoint.
+type UDLPutBatchRequest struct {
+	Records []UDLPutRequest `json:"records"`
+}
+
+// UDLPutBatchResult is one cell's outcome. Accepted=false with an empty Error
+// means the write was stale (the single-record endpoint's 409), which in a
+// batch is an ordinary outcome rather than a failure.
+type UDLPutBatchResult struct {
+	Key      string `json:"key"`
+	Accepted bool   `json:"accepted"`
+	Error    string `json:"error,omitempty"`
+}
+
+// UDLPutBatchResponse mirrors the request order index-for-index.
+type UDLPutBatchResponse struct {
+	Results []UDLPutBatchResult `json:"results"`
+}
+
+// maxUDLBatch bounds one batch. Each record is a Redis round trip while the
+// request is held open; sized to match the sign batch on the other side of the
+// same operation (see maxSignBatch).
+const maxUDLBatch = 1000
+
 // UDLRecordResponse is the response of GET /api/udl/record.
 type UDLRecordResponse struct {
 	Record  string `json:"record"`
@@ -142,6 +168,64 @@ func (s *Server) handleUDLRecordPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, UDLPutResponse{Accepted: true})
+}
+
+// handleUDLRecordsPut handles PUT /api/udl/records — the batch form of
+// handleUDLRecordPut.
+//
+// Exists for the bulk verbs above this layer ("mark this whole series seen"),
+// where one user action produces one cell per episode. Each cell still goes
+// through the same version-gated Lua upsert, so the CRDT semantics are
+// identical — this batches the transport only.
+//
+// **Not transactional, and deliberately not 409.** A per-record `accepted` flag
+// replaces the single-record conflict status: in a batch, one stale cell is a
+// normal outcome (another device already marked that episode) and must not fail
+// the 299 cells beside it. Callers read the array, not the status code.
+func (s *Server) handleUDLRecordsPut(w http.ResponseWriter, r *http.Request) {
+	if !s.storage.IsConnected() {
+		writeError(w, http.StatusServiceUnavailable, "storage not connected")
+		return
+	}
+	var req UDLPutBatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if len(req.Records) == 0 {
+		writeError(w, http.StatusBadRequest, "records is required")
+		return
+	}
+	if len(req.Records) > maxUDLBatch {
+		writeError(w, http.StatusBadRequest, "too many records in one batch")
+		return
+	}
+	results := make([]UDLPutBatchResult, 0, len(req.Records))
+	for _, rec := range req.Records {
+		if rec.Uid == "" || rec.Cid == "" || rec.Key == "" || rec.Record == "" {
+			results = append(results, UDLPutBatchResult{
+				Key:   rec.Key,
+				Error: "uid, cid, key and record are required",
+			})
+			continue
+		}
+		publicValue := ""
+		hasValue := false
+		if rec.Value != nil {
+			publicValue = string(*rec.Value)
+			hasValue = true
+		}
+		accepted, err := s.storage.UDLUpsertIfNewer(rec.Uid, rec.Cid, rec.Key, rec.Version, rec.Ts, rec.Record, publicValue, hasValue, rec.Tombstone)
+		if err != nil {
+			// A storage error is per-record here rather than fatal for the whole
+			// batch: the cells already written stay written, and reporting which
+			// ones failed lets the caller retry exactly those.
+			results = append(results, UDLPutBatchResult{Key: rec.Key, Error: err.Error()})
+			continue
+		}
+		results = append(results, UDLPutBatchResult{Key: rec.Key, Accepted: accepted})
+	}
+	writeJSON(w, http.StatusOK, UDLPutBatchResponse{Results: results})
 }
 
 // handleUDLUserKey handles GET /api/udl/user/{uid}/key/{key}

@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/metazla/meta-core/internal/identity"
@@ -87,6 +88,31 @@ type identitySignRequest struct {
 type identitySignResponse struct {
 	SigB64 string `json:"sigB64"`
 }
+
+// identitySignBatchRequest signs many payloads under one account in one call.
+//
+// Exists because a User Data Layer write signs exactly one record, and the bulk
+// verbs above it ("mark this whole series seen") produce one record per episode:
+// a 300-episode show is 300 sequential sign round trips through
+// meta-watch -> meta-search -> here, which dominates the operation. The private
+// key still never leaves this process; only the transport is batched.
+type identitySignBatchRequest struct {
+	// PayloadsB64 are the canonical byte strings to sign, in order. The
+	// response's signatures line up index-for-index.
+	PayloadsB64 []string `json:"payloadsB64"`
+	// UID selects which account signs — same optional single-identity
+	// back-compat as identitySignRequest.
+	UID string `json:"uid,omitempty"`
+}
+
+type identitySignBatchResponse struct {
+	SigsB64 []string `json:"sigsB64"`
+}
+
+// maxSignBatch bounds one batch. A signature is cheap but not free, and the
+// request holds the account lock for its duration; a caller with more than this
+// should page. Sized well above the longest real series (Supernatural, 327).
+const maxSignBatch = 1000
 
 type identityAEADKeyResponse struct {
 	AEADKeyB64 string `json:"aeadKeyB64"`
@@ -315,6 +341,53 @@ func (s *Server) handleIdentitySign(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, identitySignResponse{
 		SigB64: base64.StdEncoding.EncodeToString(sig),
 	})
+}
+
+// handleIdentitySignBatch signs every payload in the request under one account.
+//
+// All-or-nothing: a single bad base64 or signing failure fails the whole
+// request rather than returning a short array. The caller pairs signatures with
+// records by index, so a partial response would silently misalign them — and a
+// misaligned signature verifies against the wrong record, which is worse than
+// an error.
+func (s *Server) handleIdentitySignBatch(w http.ResponseWriter, r *http.Request) {
+	var body identitySignBatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	uid := body.UID
+	if strings.TrimSpace(uid) == "" {
+		uid = r.URL.Query().Get("uid")
+	}
+	if len(body.PayloadsB64) == 0 {
+		writeError(w, http.StatusBadRequest, "payloadsB64 is required")
+		return
+	}
+	if len(body.PayloadsB64) > maxSignBatch {
+		writeError(w, http.StatusBadRequest, "too many payloads in one batch")
+		return
+	}
+	id, status, slug, msg := s.resolveAccount(uid)
+	if status != 0 {
+		writeErrorSlug(w, status, slug, msg, false)
+		return
+	}
+	sigs := make([]string, 0, len(body.PayloadsB64))
+	for i, p := range body.PayloadsB64 {
+		raw, err := base64.StdEncoding.DecodeString(p)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "payloadsB64["+strconv.Itoa(i)+"] is not valid base64")
+			return
+		}
+		sig, err := identity.Sign(id, raw)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		sigs = append(sigs, base64.StdEncoding.EncodeToString(sig))
+	}
+	writeJSON(w, http.StatusOK, identitySignBatchResponse{SigsB64: sigs})
 }
 
 func (s *Server) handleIdentityAEADKey(w http.ResponseWriter, r *http.Request) {

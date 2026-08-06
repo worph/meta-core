@@ -175,6 +175,7 @@ func (s *Server) setupRoutes() {
 	s.router.HandleFunc("/api/identity/reveal", s.handleIdentityReveal).Methods("POST")
 	s.router.HandleFunc("/api/identity", s.handleIdentityDelete).Methods("DELETE")
 	s.router.HandleFunc("/api/identity/sign", s.handleIdentitySign).Methods("POST")
+	s.router.HandleFunc("/api/identity/sign-batch", s.handleIdentitySignBatch).Methods("POST")
 	s.router.HandleFunc("/api/identity/aead-key", s.handleIdentityAEADKey).Methods("GET")
 
 	// Snapshot (export / import / wipe)
@@ -206,6 +207,7 @@ func (s *Server) setupRoutes() {
 	// Continue Watching, ratings, profile). See internal/api/udl.go.
 	s.router.HandleFunc("/api/udl/record", s.handleUDLRecordGet).Methods("GET")
 	s.router.HandleFunc("/api/udl/record", s.handleUDLRecordPut).Methods("PUT")
+	s.router.HandleFunc("/api/udl/records", s.handleUDLRecordsPut).Methods("PUT")
 	s.router.HandleFunc("/api/udl/user/{uid}/key/{key}", s.handleUDLUserKey).Methods("GET")
 	s.router.HandleFunc("/api/udl/user/{uid}/cid/{cid}", s.handleUDLUserCid).Methods("GET")
 	s.router.HandleFunc("/api/udl/cid/{cid}/users", s.handleUDLCidUsers).Methods("GET")
