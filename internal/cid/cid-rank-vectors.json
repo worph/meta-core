@@ -22,7 +22,7 @@
     "25": "nzb-posting - content-derived (Message-ID set digest), but not itself fetchable",
     "20": "BitTorrent infohashes - swarm interop",
     "10": "midhash256 - the record address",
-    "5": "opaque locators (nzb-release, url, card) - never outrank a real digest",
+    "5": "opaque locators (nzb-release, url, card, yt-video, ext-play) - never outrank a real digest",
     "0": "weak/unknown digests, unparseable input"
   },
   "tieBreak": "lexicographically smaller cid wins",
@@ -115,6 +115,18 @@
       "cid": "bagdsaaanar2g2zdcor3duojvgq3ts",
       "rank": 5,
       "note": "codec 0x1007 + IDENTITY multihash 0x00, digest = varint(len(source)) || source || id — here (\"tmdb\",\"tv:95479\"). Same codec-slot rule as nzb-release/url: match on the CODEC, never the mh. The limit case of the family — the only CID in MetaMesh with NO bytes behind it anywhere, ever: it addresses a *work* (a series, a film), not a file, so the byte path 404s by design and bitswap never offers it (seeding is gated on sha2-256). Tier 5 is load-bearing for the planned cross-source merge: one card record may carry BOTH a TMDB and a MyAnimeList locator, and if a real card body is ever added (see card-tier-search.md §4.3) its sha2-256 must win the canonical election over both locators without any addressing change. Ranking it 0 instead would still lose to a digest, but would put the implementations back out of agreement — which is the exact failure this fixture exists to prevent."
+    },
+    {
+      "name": "yt-video-locator",
+      "cid": "bagecaaarav3gszdfn42ein3vgvfumn2tka4a",
+      "rank": 5,
+      "note": "codec 0x1008 + IDENTITY multihash 0x00, digest = varint(len(kind)) || kind || id — here (\"video\",\"4D7u5KF7SP8\"). DELEGATED PLAYBACK: the limit case beyond card. A card addresses a work with no bytes anywhere; this addresses a *rendition* whose bytes exist but are permanently someone else's — an external player renders it, nothing is transported, seeded or content-addressed. Framing is byte-identical to card (0x1007) on purpose, so each implementation extends the parser it already wrote. Same codec-slot rule: match on the CODEC, never the mh (identity 0x00 would fall through and score 0). Tier 5 is load-bearing for the on-ramp: a delegated reference and a real archived copy can sit on ONE record, and that sha2-256 must win the canonical election over this locator with no addressing change. NOTE the byte path must REFUSE this (400), not 404 — see docs/cid-formats.md §7.4."
+    },
+    {
+      "name": "ext-play-locator",
+      "cid": "bagesaabenb2hi4dthixs6zlymfwxa3dffzrgc3temnqw24bomnxw2l3bnrrhk3jppa",
+      "rank": 5,
+      "note": "codec 0x1009 + IDENTITY multihash 0x00, digest = the verbatim UTF-8 URL. WIRE-IDENTICAL to url (0x1006) apart from the codec, and that difference is the entire contract: 0x1006 means 'fetch these bytes once and seed them', 0x1009 means 'open this in a browser, there are no bytes for us'. A decoder that matched on SHAPE rather than on the codec slot would see an identity multihash wrapping an http(s) URL, take the 0x1006 path, fetch a watch/Bandcamp page, chunk it, seed the HTML and link that content CID onto the record AS THE FILE — the MSR1 poisoning shape, except permanent and replicated. Same tier/reasoning as the rest of the locator family."
     },
     {
       "name": "sha1",

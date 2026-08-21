@@ -58,6 +58,23 @@ const (
 	// one record, and a real digest added later still wins the election.
 	CodeCard = 0x1007 // custom — identity-multihash CID wrapping a card (work) id
 
+	// CodeYtVideo and CodeExtPlay are the DELEGATED-PLAYBACK locators — the
+	// limit case beyond CodeCard. A card addresses a work with no bytes
+	// anywhere; these address a *rendition* whose bytes exist but are
+	// permanently someone else's: an external player renders the media, nothing
+	// is transported, seeded or content-addressed.
+	//
+	// They rank on the CODEC like the rest of the family — their multihash is
+	// identity (0x00), so a rank that dispatched on the multihash would see 0x00,
+	// fall through and silently score 0. That is the exact drift that once made
+	// meta-share and meta-search elect different canonical CIDs for one record.
+	//
+	// Tier 5 is also what keeps the on-ramp safe: a delegated reference and a
+	// real CID can sit on one record, and if the media is ever archived to the
+	// mesh its sha2-256 wins the canonical election with no addressing change.
+	CodeYtVideo = 0x1008 // custom — identity-multihash CID wrapping a YouTube (kind, id)
+	CodeExtPlay = 0x1009 // custom — identity-multihash CID wrapping a URL to OPEN, never fetch
+
 	// CodeNzbPosting is the INVERSE trap of the two above: its multihash is a
 	// REAL sha2-256 digest (over the normalised, sorted article Message-ID
 	// set of a Usenet posting we scanned ourselves — never a locator, no
@@ -165,7 +182,8 @@ func Rank(cidStr string) int {
 	}
 	// Opaque locators. Codec-only: their multihash is identity (0x00), so
 	// there is nothing to match on the mh side.
-	if codec == CodeNzbRelease || codec == CodeURL || codec == CodeCard {
+	if codec == CodeNzbRelease || codec == CodeURL || codec == CodeCard ||
+		codec == CodeYtVideo || codec == CodeExtPlay {
 		return RankLocator
 	}
 	// nzb-posting: codec-only, checked BEFORE the mh switch below — its
