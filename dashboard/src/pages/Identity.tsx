@@ -1,5 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 
+import {
+  INSECURE_CONTEXT_MESSAGE,
+  canSign,
+  proveOwnership,
+  uidFromSecretKey,
+  type IdentityAction,
+} from '../lib/sign';
+
 // Admin console for meta-core's account keystore.
 //
 // meta-core stores one secp256k1 keypair per file under
@@ -10,11 +18,26 @@ import { useEffect, useRef, useState } from 'react';
 // The private key is returned by exactly two calls: POST /api/identity/generate
 // (once, at creation) and POST /api/identity/reveal (on demand, for an account
 // that already exists). Both land in the same exclusive SecretKeyPanel.
+//
+// Reveal and remove both require the account's own secret key, entered here and
+// used to sign a one-shot challenge locally — the key itself is never sent. So
+// this page can enumerate and create, but it holds no authority over an
+// existing account that its operator does not already have the key for. There
+// is deliberately no admin override: on this node the private key *is* the
+// account.
 
 interface Account {
   uid: string;
   curve: string;
   createdAt: number;
+}
+
+// What one account holds in the User Data Layer. Absent from
+// /api/udl/users/stats means zero, not unknown.
+interface Stats {
+  records: number;
+  cids: number;
+  keys: number;
 }
 
 // A secret on screen. Carries no createdAt: /api/identity/reveal answers with
@@ -31,6 +54,14 @@ interface Pending {
   uid: string;
   kind: 'remove' | 'reveal';
 }
+
+// Both confirmable operations map to a server-side action name, and the
+// challenge is bound to it: a challenge minted to reveal a key cannot delete
+// the account. Keeping the mapping in one place stops the two drifting.
+const ACTION_FOR: Record<Pending['kind'], IdentityAction> = {
+  reveal: 'reveal',
+  remove: 'delete',
+};
 
 // meta-watch's sentinel cell for profile records: display name and avatar are
 // about the *user*, not a content file, so they live at (uid, "self", ...).
@@ -171,6 +202,95 @@ async function fetchDisplayName(uid: string): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+// How much each account holds. One call for the whole page, not one per row:
+// meta-core answers it from a keyspace SCAN (there is no per-user cid index),
+// so per-row calls would walk the keyspace once per account.
+//
+// Never throws, for the same reason fetchDisplayName does not: the counts are
+// context on top of the uid, and the list must render identically when Redis is
+// down — accounts are file-backed, their data is not.
+//
+// Returns null on failure rather than an empty map. The difference is
+// load-bearing: an empty map renders as "no stored data" against every account,
+// which inside a delete confirmation is a false statement about what is at
+// stake. Unknown has to look like unknown.
+async function fetchStats(): Promise<Record<string, Stats> | null> {
+  try {
+    const res = await fetch('/api/udl/users/stats');
+    if (!res.ok) return null;
+    const data = (await res.json()) as { users?: Record<string, Stats> };
+    return data.users ?? {};
+  } catch {
+    return null;
+  }
+}
+
+// The secret-key box shared by the reveal and remove confirmations.
+//
+// Separate from the surrounding panel so both operations ask the same way, and
+// so the key lives in this component's state rather than the page's — it is
+// discarded with the panel instead of lingering in a parent that outlives it.
+function SecretKeyConfirm({
+  label,
+  actionLabel,
+  busy,
+  onConfirm,
+  onCancel,
+}: {
+  label: string;
+  actionLabel: string;
+  busy: boolean;
+  onConfirm: (secretKeyHex: string) => void;
+  onCancel: () => void;
+}) {
+  const [secret, setSecret] = useState('');
+  const signable = canSign();
+  // Derived locally, purely to tell the operator they have the wrong key before
+  // they hit the button. The server would refuse either way.
+  const derived = secret.trim() ? uidFromSecretKey(secret) : null;
+  const mismatch = Boolean(secret.trim() && derived && derived !== label);
+
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        onConfirm(secret.trim());
+      }}
+    >
+      <p style={{ color: '#fecaca', margin: '0 0 0.5rem' }}>
+        Paste this account's secret key to prove it is yours. It is used to sign a one-time
+        challenge <em>in this browser</em> and is never sent to the server.
+      </p>
+      {!signable && <p style={errorTextStyle}>{INSECURE_CONTEXT_MESSAGE}</p>}
+      <input
+        style={inputStyle}
+        type="password"
+        autoComplete="off"
+        placeholder="64 hex characters"
+        value={secret}
+        onChange={(e) => setSecret(e.target.value)}
+        disabled={busy || !signable}
+        autoFocus
+      />
+      {mismatch && (
+        <p style={{ ...errorTextStyle, marginTop: 0 }}>
+          That key belongs to a different account ({derived}).
+        </p>
+      )}
+      <button
+        type="submit"
+        style={dangerButtonStyle}
+        disabled={busy || !signable || !secret.trim() || mismatch}
+      >
+        {busy ? 'Verifying…' : actionLabel}
+      </button>
+      <button type="button" style={buttonStyle} onClick={onCancel} disabled={busy}>
+        Cancel
+      </button>
+    </form>
+  );
 }
 
 // The one place a private key is ever displayed. Rendered exclusively (the
@@ -351,6 +471,7 @@ function NewAccountPanel({
 function AccountCard({
   account,
   name,
+  stats,
   busy,
   disabled,
   pending,
@@ -362,18 +483,24 @@ function AccountCard({
 }: {
   account: Account;
   name?: string;
+  // undefined means "counted, and it holds nothing"; null means "could not be
+  // counted". The two must not read the same on a confirmation screen.
+  stats?: Stats | null;
   busy: boolean;
   disabled: boolean;
   pending: Pending | null;
   error: string | null;
   onAsk: (p: Pending) => void;
   onCancel: () => void;
-  onReveal: (uid: string) => void;
-  onRemove: (uid: string) => void;
+  onReveal: (uid: string, secretKeyHex: string) => void;
+  onRemove: (uid: string, secretKeyHex: string) => void;
 }) {
   const [copied, setCopied] = useState(false);
   const uidBoxId = `mm-uid-${account.uid}`;
   const label = name ?? account.uid;
+  const counted = stats !== null;
+  const records = stats?.records ?? 0;
+  const titles = stats?.cids ?? 0;
 
   const copyUid = async () => {
     await copyToClipboard(account.uid, uidBoxId);
@@ -393,6 +520,16 @@ function AccountCard({
           </div>
           <p style={{ color: '#888', margin: '0.75rem 0 0', fontSize: '0.85rem' }}>
             Curve: {account.curve} · Created: {formatCreatedAt(account.createdAt)}
+          </p>
+          <p style={{ color: '#888', margin: '0.25rem 0 0', fontSize: '0.85rem' }}>
+            {/* An account that has never been used legitimately holds nothing, so
+                zero is a real answer — but only once the count actually ran. */}
+            {!counted
+              ? 'Stored data: could not be counted (storage unavailable)'
+              : records === 0
+                ? 'No stored data'
+                : `${records.toLocaleString()} stored ${records === 1 ? 'record' : 'records'}` +
+                  ` across ${titles.toLocaleString()} ${titles === 1 ? 'title' : 'titles'}`}
           </p>
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', flexShrink: 0 }}>
@@ -425,15 +562,17 @@ function AccountCard({
           </p>
           <p style={{ color: '#fecaca', marginTop: 0 }}>
             The key <em>is</em> the account. Anyone who copies it can sign records as this uid on
-            any machine, forever — there is no way to revoke or rotate it afterwards. meta-core
-            will hand it over without asking who you are; see the note at the top of this page.
+            any machine, forever — there is no way to revoke or rotate it afterwards. Because
+            proving ownership already requires the key, this only confirms that the copy this node
+            holds matches yours.
           </p>
-          <button style={dangerButtonStyle} onClick={() => onReveal(account.uid)} disabled={busy}>
-            {busy ? 'Revealing…' : 'Yes, show the private key'}
-          </button>
-          <button style={buttonStyle} onClick={onCancel} disabled={busy}>
-            Cancel
-          </button>
+          <SecretKeyConfirm
+            label={account.uid}
+            actionLabel="Show the private key"
+            busy={busy}
+            onConfirm={(secret) => onReveal(account.uid, secret)}
+            onCancel={onCancel}
+          />
         </div>
       )}
 
@@ -454,21 +593,31 @@ function AccountCard({
               verifying on every peer that replicated them. Deleting a key is not a recall.
             </li>
             <li>
-              <strong>Its data stays, but goes read-only.</strong> The account's User Data Layer
-              cells — likes, ratings, watch progress — survive in Redis, and no newer version of
-              any of them can ever be written.
+              <strong>Its data is destroyed, not orphaned.</strong>{' '}
+              {!counted
+                ? 'This account\u2019s records could not be counted because storage is unavailable — ' +
+                  'so meta-core will refuse this delete rather than remove the key and strand them.'
+                : records === 0
+                  ? 'This account holds no User Data Layer records, so there is nothing to purge.'
+                  : `All ${records.toLocaleString()} User Data Layer ${
+                      records === 1 ? 'record' : 'records'
+                    } — likes, ratings, watch progress across ${titles.toLocaleString()} ${
+                      titles === 1 ? 'title' : 'titles'
+                    } — are permanently deleted from Redis, along with every index that names this uid.`}{' '}
+              This cannot be undone and there is no backup.
             </li>
             <li>
               <strong>This signs nobody out elsewhere.</strong> Any device that holds this key
               still holds it, and can import it back here at any time.
             </li>
           </ul>
-          <button style={dangerButtonStyle} onClick={() => onRemove(account.uid)} disabled={busy}>
-            {busy ? 'Removing…' : 'Yes, remove this account'}
-          </button>
-          <button style={buttonStyle} onClick={onCancel} disabled={busy}>
-            Cancel
-          </button>
+          <SecretKeyConfirm
+            label={account.uid}
+            actionLabel="Remove this account and all its data"
+            busy={busy}
+            onConfirm={(secret) => onRemove(account.uid, secret)}
+            onCancel={onCancel}
+          />
         </div>
       )}
     </div>
@@ -478,6 +627,8 @@ function AccountCard({
 export default function Identity() {
   const [accounts, setAccounts] = useState<Account[] | null>(null);
   const [names, setNames] = useState<Record<string, string>>({});
+  const [stats, setStats] = useState<Record<string, Stats> | null>({});
+  const [notice, setNotice] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [secret, setSecret] = useState<SecretKeyView | null>(null);
@@ -508,30 +659,39 @@ export default function Identity() {
     setAccounts(list);
     setLoading(false);
 
-    const settled = await Promise.allSettled(list.map((a) => fetchDisplayName(a.uid)));
+    // Names and counts both come after the list is on screen, and neither can
+    // fail the page: a down Redis costs decoration, not the account list.
+    const [settled, counts] = await Promise.all([
+      Promise.allSettled(list.map((a) => fetchDisplayName(a.uid))),
+      fetchStats(),
+    ]);
     if (gen !== reqGen.current) return;
     const next: Record<string, string> = {};
     settled.forEach((r, i) => {
       if (r.status === 'fulfilled' && r.value) next[list[i].uid] = r.value;
     });
-    // Replace rather than merge, so a removed account's name goes with it.
+    // Replace rather than merge, so a removed account's name and counts go with
+    // it instead of lingering against a uid that no longer exists.
     setNames(next);
+    setStats(counts);
   };
 
   useEffect(() => {
     refresh();
   }, []);
 
-  const reveal = async (uid: string) => {
+  const reveal = async (uid: string, secretKeyHex: string) => {
     setBusyUid(uid);
     setRowError(null);
     try {
-      // POST with a body rather than ?uid=, so the target stays out of the
-      // proxy's access log. The handler accepts either.
+      const proof = await proveOwnership(uid, ACTION_FOR.reveal, secretKeyHex);
+      // POST with a body rather than ?uid=, so neither the target nor the
+      // signature reaches the proxy's access log. The handler accepts the uid
+      // either way; the proof must be in the body.
       const res = await fetch('/api/identity/reveal', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ confirm: true, uid }),
+        body: JSON.stringify({ confirm: true, uid, ...proof }),
       });
       if (!res.ok) {
         setRowError({ uid, message: await errorMessage(res, 'Reveal failed') });
@@ -547,19 +707,34 @@ export default function Identity() {
     }
   };
 
-  const remove = async (uid: string) => {
+  const remove = async (uid: string, secretKeyHex: string) => {
     setBusyUid(uid);
     setRowError(null);
+    setNotice(null);
     try {
-      // The uid is mandatory: with more than one account the backend refuses an
-      // unqualified delete (400 uid_required) rather than guess.
-      const res = await fetch(`/api/identity?uid=${encodeURIComponent(uid)}&confirm=true`, {
+      const proof = await proveOwnership(uid, ACTION_FOR.remove, secretKeyHex);
+      // The uid is mandatory: the signature authorises one specific account, so
+      // the backend refuses an unqualified delete rather than guess a target.
+      const res = await fetch('/api/identity', {
         method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: true, uid, ...proof }),
       });
       if (!res.ok) {
         setRowError({ uid, message: await errorMessage(res, 'Remove failed') });
         return;
       }
+      // Report what the purge actually removed. "Account removed" on its own
+      // would not distinguish a clean delete from one that stranded the data.
+      const data = (await res.json().catch(() => ({}))) as { purged?: Stats };
+      const purged = data.purged;
+      setNotice(
+        purged && purged.records > 0
+          ? `Account removed. Purged ${purged.records.toLocaleString()} User Data Layer ` +
+            `${purged.records === 1 ? 'record' : 'records'} across ` +
+            `${purged.cids.toLocaleString()} ${purged.cids === 1 ? 'title' : 'titles'}.`
+          : 'Account removed. It held no User Data Layer records.'
+      );
       setPending(null);
       await refresh();
     } catch (e) {
@@ -572,6 +747,12 @@ export default function Identity() {
   const dismissSecret = () => {
     setSecret(null);
     refresh();
+  };
+
+  const ask = (p: Pending) => {
+    setRowError(null);
+    setNotice(null);
+    setPending(p);
   };
 
   const showList = !loading && !fetchError && !secret;
@@ -594,14 +775,25 @@ export default function Identity() {
 
       <div style={{ ...dangerPanelStyle, marginTop: 0, marginBottom: '1rem' }}>
         <p style={{ color: '#fecaca', margin: 0 }}>
-          <strong>Admin page — no authorisation happens here.</strong> <code>/api/identity/*</code>{' '}
-          asks no questions: anything that can reach this API can list, create, reveal or delete{' '}
-          <em>any</em> account's private key. The only access control is the perimeter in front of
-          this port. Client-facing screens (meta-watch) authorise reveal and delete against the
-          caller's own session and expose no delete at all; this page has neither check. Treat
-          reaching it as equivalent to holding every key on this node.
+          <strong>The key is the only authority.</strong> Revealing or removing an account requires
+          that account's secret key, entered here and used to sign a one-time challenge in your
+          browser — there is no admin override, and holding this page is not one. Listing and
+          creating accounts are still open to anything that can reach this API, so the perimeter in
+          front of this port is what keeps the roster private.
+        </p>
+        <p style={{ color: '#fecaca', margin: '0.5rem 0 0' }}>
+          What this does <em>not</em> defend against: anyone with filesystem access to{' '}
+          <code>{'{META_CORE_PATH}'}/identity/accounts/</code> reads every private key directly.
+          The keys are stored in plaintext, matching the trust model of the rest of{' '}
+          <code>/meta-core</code>.
         </p>
       </div>
+
+      {notice && (
+        <div style={{ ...cardStyle, border: '1px solid #0f3460' }}>
+          <p style={{ color: '#9ca3af', margin: 0 }}>{notice}</p>
+        </div>
+      )}
 
       {loading && <div style={cardStyle}>Loading…</div>}
 
@@ -639,14 +831,12 @@ export default function Identity() {
               key={a.uid}
               account={a}
               name={names[a.uid]}
+              stats={stats === null ? null : stats[a.uid]}
               busy={busyUid === a.uid}
               disabled={busyUid !== null}
               pending={pending}
               error={rowError?.uid === a.uid ? rowError.message : null}
-              onAsk={(p) => {
-                setRowError(null);
-                setPending(p);
-              }}
+              onAsk={ask}
               onCancel={() => setPending(null)}
               onReveal={reveal}
               onRemove={remove}

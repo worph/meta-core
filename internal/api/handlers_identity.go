@@ -3,11 +3,14 @@ package api
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/metazla/meta-core/internal/identity"
+	"github.com/metazla/meta-core/internal/storage"
 )
 
 // identityStatusResponse is the shape of GET /api/identity. The private key
@@ -59,12 +62,40 @@ type identityImportResponse struct {
 	Created bool `json:"created"`
 }
 
-// identityRevealRequest asks for an existing account's private key back. The
-// key was shown once at generate; without a way to see it again, a client with
-// a real sign-out has no recovery path for a user who never saved it.
+// identityChallengeRequest asks for a one-shot challenge to sign.
+type identityChallengeRequest struct {
+	UID    string `json:"uid"`
+	Action string `json:"action"`
+}
+
+type identityChallengeResponse struct {
+	Challenge string `json:"challenge"`
+	ExpiresAt int64  `json:"expiresAt"`
+}
+
+// identityProof is the proof-of-possession carried by reveal and delete: the
+// challenge text as issued, and a signature over it by the account's key.
+//
+// The signature is produced by whoever holds the key — the browser, locally.
+// It is NOT obtainable from POST /api/identity/sign, which refuses any payload
+// in the challenge domain; that refusal is what makes this proof mean
+// something on a node that stores every private key in plaintext.
+type identityProof struct {
+	Challenge string `json:"challenge"`
+	Signature string `json:"signature"`
+}
+
+// identityRevealRequest asks for an existing account's private key back.
+//
+// Gated on proof-of-possession, which makes it a "does this node hold the same
+// key I do" check rather than the recovery path it once was. That is the
+// deliberate consequence of the rule this file enforces: the private key, and
+// nothing else, is authority over the account. An operator with root on the box
+// can still read the file; an operator with only the API cannot.
 type identityRevealRequest struct {
 	Confirm bool   `json:"confirm"`
 	UID     string `json:"uid"`
+	identityProof
 }
 
 type identityRevealResponse struct {
@@ -76,6 +107,15 @@ type identityRevealResponse struct {
 type identityDeleteRequest struct {
 	Confirm bool   `json:"confirm"`
 	UID     string `json:"uid"`
+	identityProof
+}
+
+// identityDeleteResponse reports what the delete actually removed. The purge
+// counts are the point: "account removed" alone leaves the caller unable to
+// tell a clean removal from one that silently stranded a decade of ratings.
+type identityDeleteResponse struct {
+	UID    string               `json:"uid"`
+	Purged storage.UDLUserStats `json:"purged"`
 }
 
 type identitySignRequest struct {
@@ -113,6 +153,16 @@ type identitySignBatchResponse struct {
 // request holds the account lock for its duration; a caller with more than this
 // should page. Sized well above the longest real series (Supernatural, 327).
 const maxSignBatch = 1000
+
+// reservedPayloadMessage explains the one refusal the signing endpoints make.
+//
+// This is the load-bearing half of proof-of-possession on a node that holds
+// every private key: without it, a caller wanting to delete someone else's
+// account just asks meta-core to sign the challenge for them, and the gate on
+// reveal/delete becomes a formality. See identity.ChallengeDomain.
+const reservedPayloadMessage = "payload is in the reserved account-authorisation domain (" +
+	identity.ChallengeDomain + "…); meta-core will not sign one. " +
+	"Signing a challenge is what proves you hold the key, so it must be done where the key is."
 
 type identityAEADKeyResponse struct {
 	AEADKeyB64 string `json:"aeadKeyB64"`
@@ -243,23 +293,105 @@ func (s *Server) handleIdentityImport(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleIdentityReveal returns an existing account's private key. Deliberately
-// POST + explicit confirm (never a bare GET) so it cannot be triggered by a
-// link or an image tag, and so it reads as the deliberate act it is. The
-// endpoint is auth-gated at the perimeter like the rest of /api/identity/*.
-func (s *Server) handleIdentityReveal(w http.ResponseWriter, r *http.Request) {
-	var body identityRevealRequest
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	if !body.Confirm && r.URL.Query().Get("confirm") != "true" {
-		writeErrorSlug(w, http.StatusBadRequest, "confirm_required",
-			"revealing a private key requires {\"confirm\": true} or ?confirm=true", false)
+// handleIdentityChallenge issues the one-shot text a client signs to prove it
+// holds an account's private key.
+//
+// Unauthenticated by design: a challenge is useless without the key, and
+// GET /api/identity/accounts already publishes every uid, so refusing to mint
+// one for an unknown caller would protect nothing. Requiring the account to
+// exist is for a clear error, not secrecy.
+func (s *Server) handleIdentityChallenge(w http.ResponseWriter, r *http.Request) {
+	var body identityChallengeRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
 	uid := strings.TrimSpace(body.UID)
 	if uid == "" {
+		writeErrorSlug(w, http.StatusBadRequest, "uid_required", "uid is required", false)
+		return
+	}
+	action := identity.Action(strings.TrimSpace(body.Action))
+	if !identity.ValidAction(action) {
+		writeErrorSlug(w, http.StatusBadRequest, "bad_action",
+			`action must be "reveal" or "delete"`, false)
+		return
+	}
+	if !identity.ExistsByUID(s.config.IdentityAccountsDir(), uid) {
+		writeErrorSlug(w, http.StatusNotFound, "no_identity", "no identity for the given uid", false)
+		return
+	}
+	text, expires, err := s.challenges.Issue(uid, action)
+	if err != nil {
+		if errors.Is(err, identity.ErrChallengeFull) {
+			writeErrorSlug(w, http.StatusServiceUnavailable, "challenges_full", err.Error(), true)
+			return
+		}
+		writeErrorSlug(w, http.StatusBadRequest, "bad_uid", err.Error(), false)
+		return
+	}
+	writeJSON(w, http.StatusOK, identityChallengeResponse{
+		Challenge: text,
+		ExpiresAt: expires.Unix(),
+	})
+}
+
+// requireProof resolves the target account and verifies the caller's
+// proof-of-possession for `action`. status == 0 means the proof held.
+//
+// The uid is mandatory here, unlike elsewhere in this file: the old "sole
+// account" fallback would have this pick a target the signature does not name,
+// and a proof that authorises an unnamed account authorises the wrong one as
+// soon as a second profile exists.
+func (s *Server) requireProof(uid string, proof identityProof, action identity.Action) (
+	id *identity.Identity, status int, slug, msg string,
+) {
+	uid = strings.TrimSpace(uid)
+	if uid == "" {
+		return nil, http.StatusBadRequest, "uid_required",
+			"uid is required: the signature authorises one specific account"
+	}
+	if proof.Challenge == "" || proof.Signature == "" {
+		return nil, http.StatusUnauthorized, "signature_required",
+			"this operation requires proof you hold the account's private key: " +
+				"POST /api/identity/challenge, sign the returned text, and resend it as {challenge, signature}"
+	}
+	sig, err := base64.StdEncoding.DecodeString(proof.Signature)
+	if err != nil {
+		return nil, http.StatusBadRequest, "bad_signature", "signature is not valid base64"
+	}
+	// Resolve before redeeming so a request naming a missing account does not
+	// burn a challenge it could not have used anyway.
+	id, status, slug, msg = s.resolveAccount(uid)
+	if status != 0 {
+		return nil, status, slug, msg
+	}
+	// Redeem first, verify second: the challenge is single-use either way, so a
+	// wrong signature costs the attacker a fresh round trip per guess rather
+	// than letting them grind one challenge offline against the same nonce.
+	if err := s.challenges.Redeem(proof.Challenge, uid, action); err != nil {
+		return nil, http.StatusUnauthorized, "bad_challenge", err.Error()
+	}
+	if err := identity.Verify(uid, []byte(proof.Challenge), sig); err != nil {
+		return nil, http.StatusUnauthorized, "bad_signature", err.Error()
+	}
+	return id, 0, "", ""
+}
+
+// handleIdentityReveal returns an existing account's private key to a caller
+// that proves it already holds that key.
+//
+// Deliberately POST (never a bare GET) so it cannot be triggered by a link or
+// an image tag. The proof is what actually guards it: before this gate existed,
+// anything that could reach the port could read every private key on the node.
+func (s *Server) handleIdentityReveal(w http.ResponseWriter, r *http.Request) {
+	var body identityRevealRequest
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	uid := strings.TrimSpace(body.UID)
+	if uid == "" {
 		uid = strings.TrimSpace(r.URL.Query().Get("uid"))
 	}
-	id, status, slug, msg := s.resolveAccount(uid)
+	id, status, slug, msg := s.requireProof(uid, body.identityProof, identity.ActionReveal)
 	if status != 0 {
 		writeErrorSlug(w, status, slug, msg, false)
 		return
@@ -271,46 +403,62 @@ func (s *Server) handleIdentityReveal(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleIdentityDelete removes one account and everything it wrote.
+//
+// Two things happen, in this order and no other:
+//
+//  1. the account's User Data Layer rows are purged (cells plus every index
+//     that names the uid, including the cid-scoped ones shared with other
+//     accounts);
+//  2. the keypair file is removed.
+//
+// Purge-then-delete so a failure never strands data: if the purge errors the
+// key is still on disk, the account still exists, and the caller can retry.
+// The reverse order would leave rows nobody can ever attribute, reach or
+// rewrite — the orphaning this endpoint exists to prevent.
+//
+// What deletion still does NOT do, and cannot: records already signed under
+// this uid and replicated to other peers keep verifying there. Removing a key
+// is not a recall.
 func (s *Server) handleIdentityDelete(w http.ResponseWriter, r *http.Request) {
 	var body identityDeleteRequest
-	// Tolerate empty body — confirm flag in a query param is also acceptable
-	// for shells where sending a JSON body with DELETE is awkward.
+	// Tolerate an empty body so the uid may ride in the query — meta-watch's
+	// proxy puts it there. The proof itself must be in the body: a signature in
+	// a URL ends up in every access log between here and the browser.
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	if !body.Confirm && r.URL.Query().Get("confirm") != "true" {
-		writeErrorSlug(w, http.StatusBadRequest, "confirm_required",
-			"identity deletion requires {\"confirm\": true} or ?confirm=true", false)
-		return
-	}
-	dir := s.config.IdentityAccountsDir()
 	uid := strings.TrimSpace(body.UID)
 	if uid == "" {
 		uid = strings.TrimSpace(r.URL.Query().Get("uid"))
 	}
-	if uid == "" {
-		// Back-compat: with no uid, delete the sole account. Ambiguous (and so
-		// refused) once more than one account exists.
-		list, err := identity.List(dir)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		switch len(list) {
-		case 0:
-			w.WriteHeader(http.StatusNoContent) // idempotent
-			return
-		case 1:
-			uid = list[0].UID
-		default:
-			writeErrorSlug(w, http.StatusBadRequest, "uid_required",
-				"multiple accounts exist; specify uid to delete", false)
-			return
-		}
-	}
-	if err := identity.DeleteByUID(dir, uid); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	id, status, slug, msg := s.requireProof(uid, body.identityProof, identity.ActionDelete)
+	if status != 0 {
+		writeErrorSlug(w, status, slug, msg, false)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+
+	// A purge needs storage. Refusing here — rather than deleting the key and
+	// reporting the purge as "0 records" — is the difference between a retry
+	// and permanent orphaned data: once the key is gone the account cannot be
+	// named for a second attempt through this API.
+	if !s.storage.IsConnected() {
+		writeErrorSlug(w, http.StatusServiceUnavailable, "storage_unavailable",
+			"storage is not connected; refusing to delete the key while its data cannot be purged", true)
+		return
+	}
+	purged, err := s.storage.UDLPurgeUser(id.UID)
+	if err != nil {
+		writeErrorSlug(w, http.StatusInternalServerError, "purge_failed",
+			"could not purge this account's data; the account was NOT deleted: "+err.Error(), true)
+		return
+	}
+
+	if err := identity.DeleteByUID(s.config.IdentityAccountsDir(), id.UID); err != nil {
+		writeErrorSlug(w, http.StatusInternalServerError, "delete_failed", err.Error(), false)
+		return
+	}
+	log.Printf("[API] Deleted account %s and purged %d User Data Layer records across %d cids",
+		id.UID, purged.Records, purged.Cids)
+	writeJSON(w, http.StatusOK, identityDeleteResponse{UID: id.UID, Purged: purged})
 }
 
 func (s *Server) handleIdentitySign(w http.ResponseWriter, r *http.Request) {
@@ -331,6 +479,10 @@ func (s *Server) handleIdentitySign(w http.ResponseWriter, r *http.Request) {
 	raw, err := base64.StdEncoding.DecodeString(body.BytesB64)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bytesB64 is not valid base64")
+		return
+	}
+	if identity.IsChallengePayload(raw) {
+		writeErrorSlug(w, http.StatusForbidden, "reserved_payload", reservedPayloadMessage, false)
 		return
 	}
 	sig, err := identity.Sign(id, raw)
@@ -378,6 +530,11 @@ func (s *Server) handleIdentitySignBatch(w http.ResponseWriter, r *http.Request)
 		raw, err := base64.StdEncoding.DecodeString(p)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "payloadsB64["+strconv.Itoa(i)+"] is not valid base64")
+			return
+		}
+		if identity.IsChallengePayload(raw) {
+			writeErrorSlug(w, http.StatusForbidden, "reserved_payload",
+				"payloadsB64["+strconv.Itoa(i)+"]: "+reservedPayloadMessage, false)
 			return
 		}
 		sig, err := identity.Sign(id, raw)

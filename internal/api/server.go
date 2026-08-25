@@ -42,8 +42,11 @@ type Server struct {
 	schemaIndexer     *schema.Indexer
 	webdavHandler     *webdav.Handler
 	search            *searchIndex
-	router            *mux.Router
-	server            *http.Server
+	// challenges backs proof-of-possession on reveal/delete. In-process, so a
+	// restart invalidates the ones in flight — see identity/challenge.go.
+	challenges *identity.ChallengeStore
+	router     *mux.Router
+	server     *http.Server
 }
 
 // NewServer creates a new API server
@@ -139,6 +142,8 @@ func NewServer(
 	// Initialize WebDAV handler (caching is handled by nginx proxy_cache)
 	s.webdavHandler = webdav.NewHandler(cfg)
 
+	s.challenges = identity.NewChallengeStore()
+
 	// One-time migration: fold a pre-multi-account identity.json into the
 	// per-account keystore so existing single-identity hosts keep their uid.
 	if migrated, err := identity.MigrateLegacy(cfg.IdentityFilePath(), cfg.IdentityAccountsDir()); err != nil {
@@ -170,6 +175,7 @@ func (s *Server) setupRoutes() {
 	// at the perimeter — do NOT add to nginx-hash-lock unauth bypass.
 	s.router.HandleFunc("/api/identity", s.handleIdentityGet).Methods("GET")
 	s.router.HandleFunc("/api/identity/accounts", s.handleIdentityAccounts).Methods("GET")
+	s.router.HandleFunc("/api/identity/challenge", s.handleIdentityChallenge).Methods("POST")
 	s.router.HandleFunc("/api/identity/generate", s.handleIdentityGenerate).Methods("POST")
 	s.router.HandleFunc("/api/identity/import", s.handleIdentityImport).Methods("POST")
 	s.router.HandleFunc("/api/identity/reveal", s.handleIdentityReveal).Methods("POST")
@@ -212,6 +218,7 @@ func (s *Server) setupRoutes() {
 	s.router.HandleFunc("/api/udl/user/{uid}/cid/{cid}", s.handleUDLUserCid).Methods("GET")
 	s.router.HandleFunc("/api/udl/cid/{cid}/users", s.handleUDLCidUsers).Methods("GET")
 	s.router.HandleFunc("/api/udl/cid/{cid}/aggregate", s.handleUDLAggregate).Methods("GET")
+	s.router.HandleFunc("/api/udl/users/stats", s.handleUDLUserStats).Methods("GET")
 
 	// Metadata operations - base endpoints
 	s.router.HandleFunc("/meta/{hash}", s.handleGetMeta).Methods("GET")

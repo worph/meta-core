@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/gorilla/mux"
+	"github.com/metazla/meta-core/internal/storage"
 )
 
 // UDLPutRequest is the body of PUT /api/udl/record.
@@ -348,4 +349,36 @@ func aggregatePublicValues(key string, values []string) UDLAggregate {
 		agg.Avg = &avg
 	}
 	return agg
+}
+
+// udlUserStatsResponse is the shape of GET /api/udl/users/stats.
+type udlUserStatsResponse struct {
+	// Users maps uid -> counts. Accounts holding nothing are absent rather than
+	// present with zeroes; a caller rendering a list treats "missing" as 0.
+	Users map[string]storage.UDLUserStats `json:"users"`
+}
+
+// handleUDLUserStats handles GET /api/udl/users/stats — how much every account
+// holds, in one keyspace walk.
+//
+// Bulk rather than per-uid because the only caller is the accounts page, which
+// needs a number for every row: the counts come from a SCAN (there is no
+// per-user cid index — see storage/udl_admin.go), and MATCH filters without
+// indexing, so N per-uid calls would walk the whole keyspace N times.
+//
+// Deliberately not on the critical path of anything. It is an admin read whose
+// cost grows with the keyspace, so callers should fetch it after rendering,
+// never before.
+func (s *Server) handleUDLUserStats(w http.ResponseWriter, r *http.Request) {
+	if !s.storage.IsConnected() {
+		writeErrorSlug(w, http.StatusServiceUnavailable, "storage_unavailable",
+			"storage not connected", true)
+		return
+	}
+	stats, err := s.storage.UDLAllUserStats()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, udlUserStatsResponse{Users: stats})
 }
