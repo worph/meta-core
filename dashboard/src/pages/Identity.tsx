@@ -758,6 +758,15 @@ export default function Identity() {
   const showList = !loading && !fetchError && !secret;
 
   return (
+    // App.tsx's content area is `overflow: hidden`, so every page owns its own
+    // scrolling (Files.tsx does the same). Without this the account list is
+    // simply clipped at the viewport with no scrollbar — invisible on a node
+    // with two accounts, and a dead end on one with fifteen.
+    //
+    // The scroller is the outer element and the padding lives inside it, so the
+    // scrollbar sits at the edge of the content area rather than floating in
+    // 2rem of whitespace, and `margin: 0 auto` still centres the column.
+    <div style={{ height: '100%', overflowY: 'auto', minHeight: 0 }}>
     <div style={{ padding: '2rem', maxWidth: '900px', margin: '0 auto' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <h1 style={{ marginBottom: 0 }}>Identity</h1>
@@ -844,6 +853,7 @@ export default function Identity() {
           ))}
         </>
       )}
+    </div>
     </div>
   );
 }
