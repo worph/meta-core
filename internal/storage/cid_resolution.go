@@ -309,6 +309,10 @@ func (c *Client) DeleteRoot(uuid string) error {
 	if err := c.client.SRem(ctx, c.buildIndexKey(), uuid).Err(); err != nil {
 		return fmt.Errorf("srem index: %w", err)
 	}
+	// Marked so the incremental search-index refresh reads it, finds it gone,
+	// and evicts it — otherwise a deleted root keeps answering searches until
+	// the next full rebuild.
+	c.markDirtyLocked(ctx, uuid)
 	return nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -173,6 +174,7 @@ func (c *Client) SetMetadataFlat(hashID string, metadata map[string]string) erro
 	if err := c.client.SAdd(ctx, c.buildIndexKey(), hashID).Err(); err != nil {
 		return fmt.Errorf("sadd index failed: %w", err)
 	}
+	c.markDirtyLocked(ctx, hashID)
 
 	// Auto-register reverse-index aliases for any cids/<cid> key-set members in
 	// the payload. That is the ONLY shape recognised — the legacy flat cid_* /
@@ -257,6 +259,7 @@ func (c *Client) SetProperty(hashID, property, value string) error {
 	if err := c.client.SAdd(ctx, c.buildIndexKey(), hashID).Err(); err != nil {
 		return fmt.Errorf("sadd index failed: %w", err)
 	}
+	c.markDirtyLocked(ctx, hashID)
 
 	// Auto-register reverse-index alias if this is a CID field.
 	_ = c.maybeAddAliasFromFieldLocked(ctx, hashID, property, value)
@@ -325,6 +328,10 @@ func (c *Client) DeleteMetadata(hashID string) (int64, error) {
 	if err := c.client.SRem(ctx, c.buildIndexKey(), hashID).Err(); err != nil {
 		return deletedCount, fmt.Errorf("srem index failed: %w", err)
 	}
+	// Marked, not unmarked: the incremental refresh reads the record, finds it
+	// gone, and evicts it from the search index. Skipping this would leave a
+	// deleted record answering searches until the next full rebuild.
+	c.markDirtyLocked(ctx, hashID)
 
 	return deletedCount, nil
 }
@@ -441,6 +448,7 @@ func (c *Client) MergeMetadataFlat(hashID string, metadata map[string]string) (i
 	if err := c.client.SAdd(ctx, c.buildIndexKey(), hashID).Err(); err != nil {
 		return len(metadata), fmt.Errorf("sadd index failed: %w", err)
 	}
+	c.markDirtyLocked(ctx, hashID)
 
 	// Auto-register reverse-index aliases for any cids/<cid> key-set members in
 	// the payload. That is the ONLY shape recognised — the legacy flat cid_* /
@@ -468,6 +476,7 @@ func (c *Client) DeleteProperty(hashID, property string) error {
 		return err
 	}
 	c.removeFieldLocked(ctx, hashID, property)
+	c.markDirtyLocked(ctx, hashID)
 	return nil
 }
 
@@ -521,6 +530,7 @@ func (c *Client) AddToSet(hashID, property, value string) (bool, error) {
 	if err := c.client.SAdd(ctx, c.buildIndexKey(), hashID).Err(); err != nil {
 		return true, fmt.Errorf("sadd index failed: %w", err)
 	}
+	c.markDirtyLocked(ctx, hashID)
 
 	return true, nil
 }
@@ -574,11 +584,16 @@ func (c *Client) RemoveFromSet(hashID, property, value string) (bool, error) {
 		}
 		// The key is gone, so the field name must leave the index too.
 		c.removeFieldLocked(ctx, hashID, property)
+		c.markDirtyLocked(ctx, hashID)
 		return true, nil
 	}
 
 	newValue := strings.Join(newValues, "|")
-	return true, c.client.Set(ctx, key, newValue, 0).Err()
+	err = c.client.Set(ctx, key, newValue, 0).Err()
+	// The field survives with fewer members, so no field-index change — but the
+	// VALUE changed, which is exactly what the search index caches.
+	c.markDirtyLocked(ctx, hashID)
+	return true, err
 }
 
 // FileTuple holds the (uuid, path, size, mtime, midhash) record for one
@@ -691,6 +706,44 @@ type SearchTuple struct {
 // haystack — must stay in sync with the fields the search handler documents.
 var searchIndexFields = []string{"title", "fileName", "originaltitle", "showtitle", "filePath"}
 
+// defaultIndexExcludePrefixes are field-name prefixes kept OUT of the in-memory
+// search index. Redis still stores them and every per-record read still returns
+// them — this narrows the *index*, never the store.
+//
+// `categories/newznab/<code>` is the raw Newznab numeric category code, which
+// METADATA_KEYS documents as a mirror of the canonical `categories/<label>`
+// vocabulary that rides alongside it. Nothing in meta-gateway, meta-search,
+// meta-watch or meta-core reads it, and it is the single largest contributor to
+// the index: measured on a live 19.6k-record corpus, `categories/*` was 40% of
+// the whole keyspace and the `newznab` sub-vocabulary was 59% of that — ~24% of
+// all keys, for zero readers.
+//
+// ⚠ Excluding the WHOLE `categories/` family instead would be a security bug,
+// not an optimisation. `categories/XXX` (and `categories/XXX/<leaf>`) is the
+// server-side adult-content enforcement point — meta-search's
+// `query_eval::fields_are_adult` and meta-gateway's `cards::fields_are_adult`
+// both match on it, and the `exclude_adult` preference defaults to ON. A record
+// served from the index without its categories would read as non-adult and the
+// filter would fail OPEN. Only prefixes with no semantic readers belong here.
+var defaultIndexExcludePrefixes = []string{"categories/newznab/"}
+
+// indexExcludePrefixes resolves the exclusion list, allowing an operator to
+// override it with a comma-separated META_CORE_INDEX_EXCLUDE_PREFIXES. An
+// explicitly empty value disables exclusion entirely (index everything).
+func indexExcludePrefixes() []string {
+	raw, set := os.LookupEnv("META_CORE_INDEX_EXCLUDE_PREFIXES")
+	if !set {
+		return defaultIndexExcludePrefixes
+	}
+	out := make([]string, 0, 4)
+	for _, p := range strings.Split(raw, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // GetSearchIndexTuples reads EVERY record's full metadata in a single keyspace
 // SCAN pass over the flat `file:{hashID}/{field}` keys plus batched MGETs,
 // grouped by record — one bulk pass instead of a SCAN+MGET per record (which is
@@ -712,6 +765,7 @@ func (c *Client) GetSearchIndexTuples() ([]SearchTuple, error) {
 	indexKey := c.buildIndexKey()     // {filePrefix}__index__ (a SET, skip it)
 	pattern := filePrefix + "*"
 
+	excluded := indexExcludePrefixes()
 	records := make(map[string]map[string]string)
 	keyBatch := make([]string, 0, 1000)
 
@@ -762,6 +816,11 @@ func (c *Client) GetSearchIndexTuples() ([]SearchTuple, error) {
 			if strings.HasSuffix(k, "/"+FieldsField) {
 				continue
 			}
+			// Index-excluded fields are skipped here rather than after the
+			// MGET, so an excluded key costs neither the fetch nor the memory.
+			if _, field, ok := c.splitRecordKey(k); ok && hasAnyPrefix(field, excluded) {
+				continue
+			}
 			keyBatch = append(keyBatch, k)
 			if len(keyBatch) >= 1000 {
 				if err := flush(); err != nil {
@@ -780,16 +839,21 @@ func (c *Client) GetSearchIndexTuples() ([]SearchTuple, error) {
 
 	out := make([]SearchTuple, 0, len(records))
 	for hashID, fields := range records {
-		var sb strings.Builder
-		for _, f := range searchIndexFields {
-			if v, ok := fields[f]; ok && v != "" {
-				sb.WriteString(strings.ToLower(v))
-				sb.WriteByte('\n')
-			}
-		}
-		out = append(out, SearchTuple{HashID: hashID, Haystack: sb.String(), Fields: fields})
+		// Shared with the incremental path (search_dirty.go) so the two can
+		// never disagree about what is searchable.
+		out = append(out, SearchTuple{HashID: hashID, Haystack: buildHaystack(fields), Fields: fields})
 	}
 	return out, nil
+}
+
+// hasAnyPrefix reports whether s starts with any of the given prefixes.
+func hasAnyPrefix(s string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // GetMemoryInfo returns Redis memory usage information

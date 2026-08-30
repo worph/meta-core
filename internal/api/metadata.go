@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
-	"strings"
 
 	"github.com/gorilla/mux"
 )
@@ -39,6 +38,36 @@ type MetadataSearchRequest struct {
 	Property      string `json:"property,omitempty"`
 	PropertyValue string `json:"propertyValue,omitempty"`
 	Limit         int    `json:"limit,omitempty"`
+
+	// Filters is the structured form: AND across entries, OR within an
+	// entry's Values. Evaluated in memory against the search index alongside
+	// the free-text Query, so an id-anchored lookup costs a map probe per
+	// record rather than a Redis round-trip per record.
+	//
+	// Property/PropertyValue is the single-filter legacy shape and folds into
+	// this list (see normalizedFilters) with Exact=false, preserving its
+	// substring semantics byte-for-byte.
+	Filters []MetadataFilter `json:"filters,omitempty"`
+}
+
+// MetadataFilter is one structured constraint on a record.
+//
+// A record satisfies it when ANY of Values matches, and a search result must
+// satisfy EVERY filter (OR within, AND across). An entry with no usable value
+// constrains nothing — same rule the gateway's `genres_filter_matches` uses, so
+// a caller that lowers an empty filter doesn't accidentally empty the result.
+type MetadataFilter struct {
+	// Property is the field name, WITHOUT a key-set suffix: `genres`, not
+	// `genres/Action`. Both storage shapes are probed — see recordMatchesFilter.
+	Property string `json:"property"`
+	// Values are OR'd. Compared case-insensitively.
+	Values []string `json:"values,omitempty"`
+	// Exact selects CSV-exact comparison (the semantics meta-gateway's
+	// `any_csv_value_matches` applies at its own Layer-B re-filter) over
+	// substring containment. Callers doing identity lookups want this: with a
+	// result limit, a substring match on `tmdbid=1405` also admits `21405` and
+	// can crowd the real matches out of the page.
+	Exact bool `json:"exact,omitempty"`
 }
 
 // MetadataSearchResult is a single search result
@@ -415,65 +444,18 @@ func (s *Server) handleSearchMetadata(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Free-text query: served from the in-memory search index (search_index.go)
-	// so we match in memory instead of doing a SCAN+MGET Redis round-trip per
-	// record (that was 40s+ over ~72k records). Full metadata is fetched only
-	// for the <=limit matches.
-	if req.Query != "" && req.Property == "" {
-		s.serveIndexedSearch(w, req)
-		return
-	}
-
-	// Property filter (rare) or empty query (returns the first `limit`): the
-	// legacy scan. Empty query only fetches `limit` records; property search is
-	// low-volume and not on the hot search path.
-	allHashIDs, err := s.storage.GetAllHashIDs()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	var results []MetadataSearchResult
-	total := len(allHashIDs)
-
-	for _, hashID := range allHashIDs {
-		if len(results) >= req.Limit {
-			break
-		}
-
-		metadata, err := s.storage.GetMetadataFlat(hashID)
-		if err != nil || metadata == nil {
-			continue
-		}
-
-		matches := false
-
-		// Property search
-		if req.Property != "" && req.PropertyValue != "" {
-			value, ok := metadata[req.Property]
-			if ok && strings.Contains(strings.ToLower(value), strings.ToLower(req.PropertyValue)) {
-				matches = true
-			}
-		}
-
-		// If no query or property filter, return all
-		if req.Query == "" && req.Property == "" {
-			matches = true
-		}
-
-		if matches {
-			results = append(results, MetadataSearchResult{
-				HashID:   hashID,
-				Metadata: metadata,
-			})
-		}
-	}
-
-	writeJSON(w, http.StatusOK, MetadataSearchResponse{
-		Results: results,
-		Count:   len(results),
-		Total:   total,
-	})
+	// Everything else — free text, structured filters, both, or neither
+	// (which returns the first `limit`) — is served from the in-memory search
+	// index (search_index.go). Matching and the returned metadata both come
+	// from memory, so a query costs zero Redis round-trips.
+	//
+	// There is deliberately no second path. The property branch used to fall
+	// through to a `GetAllHashIDs` + per-record `GetMetadataFlat` scan, which
+	// is what made an id-anchored lookup 3.63s over ~20k records (vs 10ms for
+	// the free-text branch on the same corpus) and kept meta-core out of the
+	// gateway's anchored search path entirely. The index already holds every
+	// field of every record, so that scan was re-reading data it had in hand.
+	s.serveIndexedSearch(w, req)
 }
 
 // handleBatchUpdate handles POST /api/metadata/batch
