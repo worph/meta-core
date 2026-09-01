@@ -253,6 +253,9 @@ func (s *Server) setupRoutes() {
 	// (the dual-root pattern caused by historical writes that bypassed CID
 	// resolution).
 	s.router.HandleFunc("/api/admin/migrate-dual-roots", s.handleMigrateDualRoots).Methods("POST")
+	// One-shot vocabulary sweep: domain film|tv → screen, workForm backfill
+	// (METADATA_KEYS.md §14.17). Idempotent.
+	s.router.HandleFunc("/api/admin/migrate-domain-screen", s.handleMigrateDomainScreen).Methods("POST")
 
 	// SSE event streams. Mediated mirror of the Redis Streams; consumers
 	// reach them over HTTP instead of touching Redis directly. Auth-bypass
