@@ -287,6 +287,10 @@ return a deprecation pointer at the `/api/watchers/*` routes
 
 ```bash
 POST   /api/admin/migrate-dual-roots  # reunify stranded midhash-rooted entries
+POST   /api/admin/sweep-literature-echoes[?apply=true]
+       # strip query echoes off literature cards: anilistid on site cards,
+       # workcid/chapterNumber/volumeNumber/chapterStart/chapterEnd on any card.
+       # Dry-run unless apply=true; returns {dryRun, planned, fixed, byKey}
 GET/PUT/DELETE /webdav/...            # mounted on /files
 ```
 

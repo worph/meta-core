@@ -339,6 +339,9 @@ Watchers
 
 Admin
   POST /api/admin/migrate-dual-roots
+  POST /api/admin/sweep-literature-echoes   (dry-run unless ?apply=true;
+       strips query echoes off domain=literature fileType=card records —
+       see storage/literature_echo_sweep.go)
 
 WebDAV
   /webdav/...   (GET, PUT, DELETE, MKCOL, COPY, MOVE, PROPFIND)

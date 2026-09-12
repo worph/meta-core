@@ -256,6 +256,9 @@ func (s *Server) setupRoutes() {
 	// One-shot vocabulary sweep: domain film|tv → screen, workForm backfill
 	// (METADATA_KEYS.md §14.17). Idempotent.
 	s.router.HandleFunc("/api/admin/migrate-domain-screen", s.handleMigrateDomainScreen).Methods("POST")
+	// One-shot sweep of query echoes on literature cards (meta-read
+	// reading-model.md §7). Dry-run unless ?apply=true. Idempotent.
+	s.router.HandleFunc("/api/admin/sweep-literature-echoes", s.handleSweepLiteratureEchoes).Methods("POST")
 
 	// SSE event streams. Mediated mirror of the Redis Streams; consumers
 	// reach them over HTTP instead of touching Redis directly. Auth-bypass
