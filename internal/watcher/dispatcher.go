@@ -50,8 +50,18 @@ func (d *Dispatcher) dispatchToStream(event FileEvent) {
 	client := d.storageClient
 	d.mu.RUnlock()
 
+	if err := PublishEvent(client, event); err != nil {
+		log.Printf("[Dispatcher] Failed to publish to stream: %v", err)
+	}
+}
+
+// PublishEvent appends one file event to the file:events stream. Exported so a
+// caller with no Dispatcher (POST /api/files/register on a box whose watcher is
+// off) emits exactly the entry the watcher would — meta-share's ipfs_seed
+// consumes this stream to chunk, seed and provide new files.
+func PublishEvent(client *storage.Client, event FileEvent) error {
 	if client == nil || !client.IsConnected() {
-		return
+		return fmt.Errorf("storage client not connected")
 	}
 
 	// Build stream fields
@@ -79,9 +89,7 @@ func (d *Dispatcher) dispatchToStream(event FileEvent) {
 	// `EmitReset → ClearStream` path is still the only way the stream gets
 	// truncated to zero (signalled to consumers via the `reset` event).
 	_, err := client.XAdd(EventsStream, EventsStreamMaxLen, fields)
-	if err != nil {
-		log.Printf("[Dispatcher] Failed to publish to stream: %v", err)
-	}
+	return err
 }
 
 // EmitReset clears the stream and emits a reset event

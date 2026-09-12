@@ -4,7 +4,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -54,42 +53,8 @@ func (w *Watcher) writeFileTuple(absPath string, size, mtimeNano int64, midhash 
 		return
 	}
 
-	uuid, err := w.storage.GetByCID(midhash)
-	if err != nil {
-		log.Printf("[Watcher] GetByCID(%s): %v", midhash, err)
-		return
-	}
-
-	if uuid == "" {
-		// New content. Mint sets filePath/sizeByte/mtimeNano; SetProperty
-		// then writes the midhash as a cids/<cid> key-set member — and the
-		// cid_resolution.go hook registers the reverse-index alias for us.
-		uuid, err = w.storage.Mint(absPath, size, mtimeNano)
-		if err != nil {
-			log.Printf("[Watcher] Mint(%s): %v", absPath, err)
-			return
-		}
-		if err := w.storage.SetProperty(uuid, storage.CIDsKeyPrefix+midhash, "true"); err != nil {
-			log.Printf("[Watcher] SetProperty cids/%s for %s: %v", midhash, uuid, err)
-		}
-		return
-	}
-
-	// Known content. If this is a new physical path for the same content,
-	// record it as a duplicate. Otherwise refresh size/mtime — same content,
-	// same path, but the file may have been rewritten with a fresh mtime.
-	existing, _ := w.storage.GetProperty(uuid, "filePath")
-	if existing != absPath {
-		if _, err := w.storage.AddDuplicatePath(uuid, absPath); err != nil {
-			log.Printf("[Watcher] AddDuplicatePath %s @ %s: %v", uuid, absPath, err)
-		}
-		return
-	}
-	if _, err := w.storage.MergeMetadataFlat(uuid, map[string]string{
-		"sizeByte":  strconv.FormatInt(size, 10),
-		"mtimeNano": strconv.FormatInt(mtimeNano, 10),
-	}); err != nil {
-		log.Printf("[Watcher] refresh tuple for %s: %v", uuid, err)
+	if _, _, err := w.storage.RegisterFileTuple(absPath, size, mtimeNano, midhash); err != nil {
+		log.Printf("[Watcher] register %s: %v", absPath, err)
 	}
 }
 

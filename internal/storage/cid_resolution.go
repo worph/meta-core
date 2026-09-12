@@ -422,3 +422,50 @@ func (c *Client) GetMetadataDocument(uuid string) (*MetadataDocument, error) {
 		Duplicates: dups,
 	}, nil
 }
+
+// RegisterFileTuple records one physical file under its midhash256 CID, the
+// same way the file watcher does for every file it scans: mint a UUID root
+// (filePath/sizeByte/mtimeNano) and write `cids/<midhash>`, whose hook
+// registers the cid:<midhash> reverse alias. Content already known under
+// another path is recorded as a duplicate; the same path just refreshes
+// size/mtime.
+//
+// Returns the root and whether it was newly minted. Shared by the watcher and
+// POST /api/files/register, which is how a box running with the watcher off
+// (a meta-watch client core) still gets files it writes under /files/plugin
+// resolvable by CID.
+func (c *Client) RegisterFileTuple(absPath string, size, mtimeNano int64, midhash string) (string, bool, error) {
+	if midhash == "" {
+		return "", false, fmt.Errorf("midhash is required")
+	}
+	uuid, err := c.GetByCID(midhash)
+	if err != nil {
+		return "", false, fmt.Errorf("GetByCID(%s): %w", midhash, err)
+	}
+
+	if uuid == "" {
+		uuid, err = c.Mint(absPath, size, mtimeNano)
+		if err != nil {
+			return "", false, fmt.Errorf("Mint(%s): %w", absPath, err)
+		}
+		if err := c.SetProperty(uuid, CIDsKeyPrefix+midhash, "true"); err != nil {
+			return uuid, true, fmt.Errorf("SetProperty cids/%s for %s: %w", midhash, uuid, err)
+		}
+		return uuid, true, nil
+	}
+
+	existing, _ := c.GetProperty(uuid, "filePath")
+	if existing != absPath {
+		if _, err := c.AddDuplicatePath(uuid, absPath); err != nil {
+			return uuid, false, fmt.Errorf("AddDuplicatePath %s @ %s: %w", uuid, absPath, err)
+		}
+		return uuid, false, nil
+	}
+	if _, err := c.MergeMetadataFlat(uuid, map[string]string{
+		"sizeByte":  strconv.FormatInt(size, 10),
+		"mtimeNano": strconv.FormatInt(mtimeNano, 10),
+	}); err != nil {
+		return uuid, false, fmt.Errorf("refresh tuple for %s: %w", uuid, err)
+	}
+	return uuid, false, nil
+}

@@ -243,6 +243,10 @@ func (s *Server) setupRoutes() {
 	s.router.HandleFunc("/api/file/{cid}/info", s.handleGetFileByCIDInfo).Methods("GET")
 	s.router.HandleFunc("/file/{cid}", s.handleGetFileByCID).Methods("GET")
 	s.router.HandleFunc("/file/cid", s.handleComputeFileCID).Methods("POST")
+	// Register one file under /files/plugin by midhash — the watcher's
+	// mint + alias + file:events path for a single file. Registered
+	// unconditionally: it exists for boxes whose watcher is OFF.
+	s.router.HandleFunc("/api/files/register", s.handleRegisterFile).Methods("POST")
 
 	// Public metadata-by-CID resolver. Reverse-index lookup → full document.
 	// Auth-bypassed alongside /api/file/{cid} so meta-share peers can query
