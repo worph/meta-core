@@ -129,6 +129,12 @@
       "note": "codec 0x1009 + IDENTITY multihash 0x00, digest = the verbatim UTF-8 URL. WIRE-IDENTICAL to url (0x1006) apart from the codec, and that difference is the entire contract: 0x1006 means 'fetch these bytes once and seed them', 0x1009 means 'open this in a browser, there are no bytes for us'. A decoder that matched on SHAPE rather than on the codec slot would see an identity multihash wrapping an http(s) URL, take the 0x1006 path, fetch a watch/Bandcamp page, chunk it, seed the HTML and link that content CID onto the record AS THE FILE — the MSR1 poisoning shape, except permanent and replicated. Same tier/reasoning as the rest of the locator family."
     },
     {
+      "name": "provider-file-locator",
+      "cid": "bagfcaaa2bvxxazloon2we5djorwgk43gnfwgkorxga3dcobtgq",
+      "rank": 5,
+      "note": "codec 0x100A + IDENTITY multihash 0x00, digest = varint(len(source)) || source || id - here (\"opensubtitles\",\"file:7061834\"). The GENERIC fetchable locator: one codec for every provider whose bytes are fetched the same way; the provider is inside the digest. Framing byte-identical to card (0x1007), but the byte path RESOLVES it (via source's fetch tier) instead of 404ing. Same codec-slot rule as the rest of the family: match on the CODEC, never the mh (identity 0x00 would fall through and score 0). Tier 5: once the fetched bytes' sha2-256 is linked onto the record it wins the canonical election with no addressing change."
+    },
+    {
       "name": "sha1",
       "cid": "baeircff3eqvxxaqqot2lt242stkdtk3gq4c2vra",
       "rank": 0,

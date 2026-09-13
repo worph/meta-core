@@ -75,6 +75,14 @@ const (
 	CodeYtVideo = 0x1008 // custom — identity-multihash CID wrapping a YouTube (kind, id)
 	CodeExtPlay = 0x1009 // custom — identity-multihash CID wrapping a URL to OPEN, never fetch
 
+	// CodeProviderFile is the FETCHABLE twin of CodeExtPlay: a provider-held
+	// file addressed as varint(len(source))‖source‖id — ("opensubtitles",
+	// "file:7061834"). Framing is byte-identical to CodeCard; only the byte
+	// path differs (it redeems the id through that source's feeder instead of
+	// 404ing). Same codec-slot rule and same tier: once the fetched bytes'
+	// sha2-256 is linked onto the record it wins with no addressing change.
+	CodeProviderFile = 0x100A // custom — identity-multihash CID wrapping a (source, id) provider file
+
 	// CodeNzbPosting is the INVERSE trap of the two above: its multihash is a
 	// REAL sha2-256 digest (over the normalised, sorted article Message-ID
 	// set of a Usenet posting we scanned ourselves — never a locator, no
@@ -183,7 +191,7 @@ func Rank(cidStr string) int {
 	// Opaque locators. Codec-only: their multihash is identity (0x00), so
 	// there is nothing to match on the mh side.
 	if codec == CodeNzbRelease || codec == CodeURL || codec == CodeCard ||
-		codec == CodeYtVideo || codec == CodeExtPlay {
+		codec == CodeYtVideo || codec == CodeExtPlay || codec == CodeProviderFile {
 		return RankLocator
 	}
 	// nzb-posting: codec-only, checked BEFORE the mh switch below — its
