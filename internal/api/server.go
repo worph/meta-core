@@ -247,6 +247,10 @@ func (s *Server) setupRoutes() {
 	// mint + alias + file:events path for a single file. Registered
 	// unconditionally: it exists for boxes whose watcher is OFF.
 	s.router.HandleFunc("/api/files/register", s.handleRegisterFile).Methods("POST")
+	// File-backed roots (filePath+sizeByte+mtimeNano) with sizes, batched
+	// server-side, so clients answer "how many files, how big" without one
+	// read per hashId. ?summary=1 returns only {count, totalSize}.
+	s.router.HandleFunc("/api/files/tuples", s.handleGetFileTuples).Methods("GET")
 
 	// Public metadata-by-CID resolver. Reverse-index lookup → full document.
 	// Auth-bypassed alongside /api/file/{cid} so meta-share peers can query

@@ -301,6 +301,7 @@ CID-addressed (public, auth-bypassed at the perimeter)
 
 Editor / KV / schema / snapshot
   GET /api/metadata/hash-ids
+  GET /api/files/tuples
   GET /api/metadata/list
   POST /api/metadata/search
   POST /api/metadata/batch

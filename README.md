@@ -209,6 +209,7 @@ the `/file/{cid}` reverse-lookup path.)
 
 ```bash
 GET    /api/metadata/hash-ids
+GET    /api/files/tuples
 GET    /api/metadata/list
 POST   /api/metadata/search
 POST   /api/metadata/batch
