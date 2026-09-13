@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gorilla/mux"
@@ -269,6 +270,75 @@ func (s *Server) handleUDLUserCid(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"entries": entries})
+}
+
+// handleUDLUserAll handles GET /api/udl/user/{uid}/all?after=<cid>&limit=<n>
+// — every record a uid owns, for cross-instance profile recovery.
+//
+// The other user-scoped reads answer a question with one coordinate already
+// known. Recovery knows only the uid: a box that has just imported a secret key
+// has no idea which cids or keys the profile ever touched, so it needs the
+// whole set or it gets nothing.
+//
+// Paged on a cid boundary — `nextCid` empty means the export is complete. The
+// response is opaque signed records, exactly as stored; whoever consumes it is
+// responsible for verifying each one before trusting it (meta-core has never
+// held the account key and cannot verify on anyone's behalf).
+func (s *Server) handleUDLUserAll(w http.ResponseWriter, r *http.Request) {
+	if !s.storage.IsConnected() {
+		writeError(w, http.StatusServiceUnavailable, "storage not connected")
+		return
+	}
+	uid := mux.Vars(r)["uid"]
+	if uid == "" {
+		writeError(w, http.StatusBadRequest, "uid is required")
+		return
+	}
+	limit := maxUDLBatch
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			writeError(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		if n < limit {
+			limit = n
+		}
+	}
+	entries, nextCid, err := s.storage.UDLAllForUser(uid, r.URL.Query().Get("after"), limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"entries": entries,
+		"nextCid": nextCid,
+	})
+}
+
+// handleUDLUserCount handles GET /api/udl/user/{uid}/count — how many cids a
+// uid holds records for.
+//
+// Exists so a gateway mirror can enforce a per-profile quota without walking
+// anything: 32 random bytes are a valid uid, so an unbounded mirror is a
+// disk-fill DoS that needs no account. A quota check that itself cost a scan
+// would just move the denial of service one layer up.
+func (s *Server) handleUDLUserCount(w http.ResponseWriter, r *http.Request) {
+	if !s.storage.IsConnected() {
+		writeError(w, http.StatusServiceUnavailable, "storage not connected")
+		return
+	}
+	uid := mux.Vars(r)["uid"]
+	if uid == "" {
+		writeError(w, http.StatusBadRequest, "uid is required")
+		return
+	}
+	n, err := s.storage.UDLCountUserCids(uid)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"cids": n})
 }
 
 // handleUDLCidUsers handles GET /api/udl/cid/{cid}/users (uids_for_cid).

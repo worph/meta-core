@@ -13,6 +13,7 @@ import (
 	"github.com/metazla/meta-core/internal/events"
 	"github.com/metazla/meta-core/internal/identity"
 	"github.com/metazla/meta-core/internal/leader"
+	"github.com/metazla/meta-core/internal/meshdisco"
 	"github.com/metazla/meta-core/internal/mounts"
 	"github.com/metazla/meta-core/internal/schema"
 	"github.com/metazla/meta-core/internal/storage"
@@ -45,8 +46,19 @@ type Server struct {
 	// challenges backs proof-of-possession on reveal/delete. In-process, so a
 	// restart invalidates the ones in flight — see identity/challenge.go.
 	challenges *identity.ChallengeStore
-	router     *mux.Router
-	server     *http.Server
+	// mesh is the UDP discovery node (meta-discovery v1). nil when discovery
+	// is disabled or failed to bind, in which case /api/neighbors reports an
+	// empty list rather than erroring — a dashboard nav is decoration and
+	// must not take the API down with it.
+	mesh   *meshdisco.Node
+	router *mux.Router
+	server *http.Server
+}
+
+// SetMeshNode attaches the UDP discovery node. Separate from NewServer so the
+// server's constructor signature (and its tests) stay untouched.
+func (s *Server) SetMeshNode(n *meshdisco.Node) {
+	s.mesh = n
 }
 
 // NewServer creates a new API server
@@ -216,6 +228,8 @@ func (s *Server) setupRoutes() {
 	s.router.HandleFunc("/api/udl/records", s.handleUDLRecordsPut).Methods("PUT")
 	s.router.HandleFunc("/api/udl/user/{uid}/key/{key}", s.handleUDLUserKey).Methods("GET")
 	s.router.HandleFunc("/api/udl/user/{uid}/cid/{cid}", s.handleUDLUserCid).Methods("GET")
+	s.router.HandleFunc("/api/udl/user/{uid}/all", s.handleUDLUserAll).Methods("GET")
+	s.router.HandleFunc("/api/udl/user/{uid}/count", s.handleUDLUserCount).Methods("GET")
 	s.router.HandleFunc("/api/udl/cid/{cid}/users", s.handleUDLCidUsers).Methods("GET")
 	s.router.HandleFunc("/api/udl/cid/{cid}/aggregate", s.handleUDLAggregate).Methods("GET")
 	s.router.HandleFunc("/api/udl/users/stats", s.handleUDLUserStats).Methods("GET")
@@ -264,6 +278,7 @@ func (s *Server) setupRoutes() {
 	// One-shot vocabulary sweep: domain film|tv → screen, workForm backfill
 	// (METADATA_KEYS.md §14.17). Idempotent.
 	s.router.HandleFunc("/api/admin/migrate-domain-screen", s.handleMigrateDomainScreen).Methods("POST")
+	s.router.HandleFunc("/api/admin/migrate-user-cids", s.handleMigrateUserCids).Methods("POST")
 	// One-shot sweep of query echoes on literature cards (meta-read
 	// reading-model.md §7). Dry-run unless ?apply=true. Idempotent.
 	s.router.HandleFunc("/api/admin/sweep-literature-echoes", s.handleSweepLiteratureEchoes).Methods("POST")
@@ -281,6 +296,11 @@ func (s *Server) setupRoutes() {
 	s.router.HandleFunc("/api/services", s.handleListServices).Methods("GET")
 	s.router.HandleFunc("/services/cleanup/stats", s.handleCleanupStats).Methods("GET")
 	s.router.HandleFunc("/services/{name}", s.handleGetService).Methods("GET")
+
+	// meta-discovery v1: neighbours heard over UDP. Supersedes /api/services,
+	// which is still served above while consumers migrate.
+	s.router.HandleFunc("/neighbors", s.handleListNeighbors).Methods("GET")
+	s.router.HandleFunc("/api/neighbors", s.handleListNeighbors).Methods("GET")
 
 	// Mount management routes (if manager initialized)
 	if s.mountsHandlers != nil {

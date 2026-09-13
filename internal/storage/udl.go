@@ -17,6 +17,7 @@ package storage
 //	udl:rec:<uid>/<cid>/<key>       HASH { record, version, ts, value? }
 //	udl:idx:user:<uid>:key:<key>    SET of <cid>   -> active_for_user_key (My List, Continue Watching)
 //	udl:idx:user:<uid>:cid:<cid>    SET of <key>   -> list_for_user_cid
+//	udl:idx:user:<uid>:cids         SET of <cid>   -> whole-profile export (recovery)
 //	udl:idx:cid:<cid>:key:<key>     SET of <uid>   -> aggregate
 //	udl:idx:cid:<cid>:users         SET of <uid>   -> uids_for_cid
 //
@@ -27,7 +28,9 @@ package storage
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -66,11 +69,24 @@ func udlIdxUserCid(uid, cid string) string { return fmt.Sprintf("udl:idx:user:%s
 func udlIdxCidKey(cid, key string) string  { return fmt.Sprintf("udl:idx:cid:%s:key:%s", cid, key) }
 func udlIdxCidUsers(cid string) string      { return fmt.Sprintf("udl:idx:cid:%s:users", cid) }
 
+// udlIdxUserCids is the set of every cid a uid has ANY record for — the one
+// index that makes "export this whole profile" a set read instead of a
+// keyspace scan.
+//
+// The other four indexes each answer a question with one coordinate already
+// known (a key, a cid). Cross-instance recovery knows neither: it has a uid and
+// nothing else. Without this set the only ways to enumerate a profile are to
+// iterate the hardcoded key list — which silently misses any key added later —
+// or to SCAN `udl:rec:<uid>/*`, which is the full-keyspace-read pathology that
+// already made `/api/udl/users/stats` admin-only.
+func udlIdxUserCids(uid string) string { return fmt.Sprintf("udl:idx:user:%s:cids", uid) }
+
 // udlUpsertScript performs the version-gated upsert + index maintenance
 // atomically. Accepts (returns 1) only when the incoming version strictly
 // exceeds the stored one; otherwise returns 0 (stale).
 //
 //	KEYS: 1=cell 2=idx:user:key 3=idx:user:cid 4=idx:cid:key 5=idx:cid:users
+//	      6=idx:user:cids
 //	ARGV: 1=version 2=ts 3=record 4=value 5=hasValue("1"/"0")
 //	      6=cid 7=key 8=uid 9=tombstone("1"/"0")
 //
@@ -78,9 +94,16 @@ func udlIdxCidUsers(cid string) string      { return fmt.Sprintf("udl:idx:cid:%s
 // would let an older write resurrect the value — but it SREMs the cid from the
 // user+key index. That index is what `active_for_user_key` returns, so leaving
 // deleted cids in it means every My List / Continue Watching read carries every
-// title ever un-liked or finished, forever. The other three indexes are left
+// title ever un-liked or finished, forever. The other four indexes are left
 // alone: they answer "who has an opinion about this cid", where a tombstone is
 // still an answer.
+//
+// ⚠ `idx:user:cids` (KEYS[6]) in particular must NEVER be pruned on a
+// tombstone, even though it looks symmetric with KEYS[2]. It is the export
+// index: a cid dropped from it is a cid whose tombstone never travels, and a
+// tombstone that does not travel is exactly how an un-liked title comes back
+// from the dead on the other box — the peer still holds the older `like` at a
+// lower version, and with no tombstone to beat it, nothing ever supersedes it.
 var udlUpsertScript = redis.NewScript(`
 local stored = redis.call('HGET', KEYS[1], 'version')
 if stored and tonumber(stored) >= tonumber(ARGV[1]) then
@@ -100,6 +123,7 @@ end
 redis.call('SADD', KEYS[3], ARGV[7])
 redis.call('SADD', KEYS[4], ARGV[8])
 redis.call('SADD', KEYS[5], ARGV[8])
+redis.call('SADD', KEYS[6], ARGV[6])
 return 1
 `)
 
@@ -126,6 +150,7 @@ func (c *Client) UDLUpsertIfNewer(uid, cid, key string, version, ts int64, recor
 		c.buildKey(udlIdxUserCid(uid, cid)),
 		c.buildKey(udlIdxCidKey(cid, key)),
 		c.buildKey(udlIdxCidUsers(cid)),
+		c.buildKey(udlIdxUserCids(uid)),
 	}
 	hv := "0"
 	if hasValue {
@@ -248,6 +273,160 @@ func (c *Client) UDLListUserCid(uid, cid string) ([]UDLUserCidEntry, error) {
 		out = append(out, UDLUserCidEntry{Key: key, Record: cell.Record, Version: cell.Version, Ts: cell.Ts})
 	}
 	return out, nil
+}
+
+// UDLUserAllEntry is one row of a whole-profile export.
+type UDLUserAllEntry struct {
+	Cid     string `json:"cid"`
+	Key     string `json:"key"`
+	Record  string `json:"record"`
+	Version int64  `json:"version"`
+	Ts      int64  `json:"ts"`
+}
+
+// UDLAllForUser returns every cell a uid owns, for cross-instance recovery.
+//
+// Ordered by cid (sorted, so paging is stable across calls even though the
+// underlying index is a Redis SET), starting strictly after `afterCid`. A cid's
+// keys are never split across a page: the page ends on a cid boundary once
+// `limit` rows have been emitted, and `nextCid` is the last cid included — pass
+// it back as `afterCid` to continue. `nextCid` is empty when the export is
+// complete.
+//
+// Tombstones are included. They are the CRDT state that stops a deleted value
+// resurrecting on the box that receives this export, so omitting them would
+// make recovery actively wrong rather than merely incomplete.
+func (c *Client) UDLAllForUser(uid, afterCid string, limit int) ([]UDLUserAllEntry, string, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.client == nil {
+		return nil, "", fmt.Errorf("not connected")
+	}
+	if limit <= 0 {
+		limit = 1000
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cids, err := c.client.SMembers(ctx, c.buildKey(udlIdxUserCids(uid))).Result()
+	if err != nil {
+		return nil, "", fmt.Errorf("smembers failed: %w", err)
+	}
+	sort.Strings(cids)
+
+	out := make([]UDLUserAllEntry, 0, limit)
+	nextCid := ""
+	for _, cid := range cids {
+		if afterCid != "" && cid <= afterCid {
+			continue
+		}
+		if len(out) >= limit {
+			nextCid = out[len(out)-1].Cid
+			break
+		}
+		keys, err := c.client.SMembers(ctx, c.buildKey(udlIdxUserCid(uid, cid))).Result()
+		if err != nil {
+			return nil, "", fmt.Errorf("smembers failed: %w", err)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			cell, ok, err := c.udlReadCell(ctx, udlRecKey(uid, cid, key))
+			if err != nil {
+				return nil, "", err
+			}
+			if !ok {
+				continue
+			}
+			out = append(out, UDLUserAllEntry{
+				Cid: cid, Key: key, Record: cell.Record, Version: cell.Version, Ts: cell.Ts,
+			})
+		}
+	}
+	return out, nextCid, nil
+}
+
+// UDLCountUserCids is the number of distinct cids a uid holds records for.
+//
+// O(1) (a Redis SCARD), which is what makes it usable as a per-push quota
+// check on the gateway mirror — a quota that cost a keyspace walk would be a
+// denial-of-service in its own right. Counts cids rather than cells because
+// that is what the index holds; a profile is bounded by the titles it has
+// touched, not by how many keys it has per title.
+func (c *Client) UDLCountUserCids(uid string) (int64, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.client == nil {
+		return 0, fmt.Errorf("not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	n, err := c.client.SCard(ctx, c.buildKey(udlIdxUserCids(uid))).Result()
+	if err != nil {
+		return 0, fmt.Errorf("scard failed: %w", err)
+	}
+	return n, nil
+}
+
+// UDLBackfillUserCids rebuilds the `idx:user:<uid>:cids` sets for data written
+// before that index existed, and reports how many cids it added.
+//
+// One-shot: the upsert script maintains the set from now on. It is a SCAN, but
+// a targeted one (`udl:idx:user:*:cid:*`, which is one key per (uid,cid), not
+// per record) run once at boot rather than per read — the distinction that
+// makes the difference between a migration and the pathology this index exists
+// to avoid.
+func (c *Client) UDLBackfillUserCids() (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.client == nil {
+		return 0, fmt.Errorf("not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pattern := c.buildKey("udl:idx:user:*:cid:*")
+	prefix := c.buildKey("udl:idx:user:")
+	added := 0
+	var cursor uint64
+	for {
+		keys, next, err := c.client.Scan(ctx, cursor, pattern, 500).Result()
+		if err != nil {
+			return added, fmt.Errorf("scan failed: %w", err)
+		}
+		for _, k := range keys {
+			// <prefix><uid>:cid:<cid> — split on the FIRST separator, not the
+			// last. A uid is multibase base58btc, whose alphabet contains no
+			// colon at all, so the first ":cid:" always ends the uid. A cid
+			// that happens to contain ":cid:" in its own name would make the
+			// last occurrence split in the wrong place.
+			rest := strings.TrimPrefix(k, prefix)
+			i := strings.Index(rest, ":cid:")
+			if i < 0 {
+				continue
+			}
+			uid, cid := rest[:i], rest[i+len(":cid:"):]
+			if uid == "" || cid == "" {
+				continue
+			}
+			n, err := c.client.SAdd(ctx, c.buildKey(udlIdxUserCids(uid)), cid).Result()
+			if err != nil {
+				return added, fmt.Errorf("sadd failed: %w", err)
+			}
+			added += int(n)
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return added, nil
 }
 
 // UDLCidUsers returns every uid that has any record for cid — uids_for_cid.

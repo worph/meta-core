@@ -179,7 +179,7 @@ func (c *Client) UDLAllUserStats() (map[string]UDLUserStats, error) {
 }
 
 // UDLPurgeUser removes every trace of one account from the User Data Layer:
-// its cells, its two user-scoped indexes, and its membership in the shared
+// its cells, its three user-scoped indexes, and its membership in the shared
 // cid-scoped indexes. Returns what was removed.
 //
 // The shared indexes are the part that is easy to miss and expensive to leave.
@@ -225,8 +225,10 @@ func (c *Client) UDLPurgeUser(uid string) (UDLUserStats, error) {
 	stats.Cids = len(distinctCids)
 	stats.Keys = len(distinctKeys)
 
-	// The two user-scoped indexes are enumerable directly, and are dropped
-	// whole rather than member-by-member. Scanning them separately also catches
+	// The three user-scoped indexes (`:key:*`, `:cid:*`, `:cids`) are enumerable
+	// directly, and are dropped whole rather than member-by-member. The glob is
+	// what keeps this correct as indexes are added — `:cids` needed no change
+	// here when it landed. Scanning them separately also catches
 	// index entries whose cell is already gone — exactly the state a previously
 	// half-finished purge leaves behind.
 	idxPrefix := c.buildKey("udl:idx:user:") + uid + ":"

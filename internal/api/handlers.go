@@ -14,6 +14,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/metazla/meta-core/internal/leader"
+	"github.com/metazla/meta-core/internal/meshdisco"
 )
 
 // contentTypeByExt maps file extensions to MIME types
@@ -79,13 +80,13 @@ type ErrorResponse struct {
 // Stable error-slug strings. Pinned in the doc; consumers may match on
 // these. Do not rename without a deprecation cycle.
 const (
-	ErrAliasCollision    = "alias_collision"
-	ErrUnknownRoot       = "unknown_root"
-	ErrUnknownCID        = "unknown_cid"
-	ErrSchemaViolation   = "schema_violation"
+	ErrAliasCollision     = "alias_collision"
+	ErrUnknownRoot        = "unknown_root"
+	ErrUnknownCID         = "unknown_cid"
+	ErrSchemaViolation    = "schema_violation"
 	ErrStorageUnavailable = "storage_unavailable"
-	ErrInternal          = "internal"
-	ErrDeprecatedField   = "deprecated_field"
+	ErrInternal           = "internal"
+	ErrDeprecatedField    = "deprecated_field"
 )
 
 // rejectDeprecatedField reports whether a field name is one of the removed
@@ -594,6 +595,44 @@ func (s *Server) handleGetService(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, service)
 }
 
+// handleListNeighbors handles GET /neighbors and GET /api/neighbors.
+//
+// This is the meta-discovery v1 replacement for /api/services: the list is
+// built from UDP announces held in memory, not from files under
+// /meta-core/services, so it works across stacks that share a network but no
+// volume. Instances of the same service are collapsed to the most recent, which
+// preserves the one-row-per-service contract the old endpoint had.
+//
+// A `?all=1` query returns every instance uncollapsed, for debugging.
+func (s *Server) handleListNeighbors(w http.ResponseWriter, r *http.Request) {
+	response := map[string]interface{}{
+		"current":   s.config.ServiceName,
+		"neighbors": []interface{}{},
+		"count":     0,
+	}
+
+	if s.mesh == nil {
+		// Discovery off or failed to bind. Report empty rather than 503 —
+		// the nav is decoration and callers already treat [] as "hide".
+		response["enabled"] = false
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+
+	var list []meshdisco.Neighbor
+	if r.URL.Query().Get("all") != "" {
+		list = s.mesh.Neighbors()
+	} else {
+		list = s.mesh.NeighborsByName()
+	}
+
+	response["enabled"] = true
+	response["neighbors"] = list
+	response["count"] = len(list)
+	response["self"] = s.mesh.Self()
+	writeJSON(w, http.StatusOK, response)
+}
+
 // handleCleanupStats handles GET /services/cleanup/stats
 func (s *Server) handleCleanupStats(w http.ResponseWriter, r *http.Request) {
 	if s.cleaner == nil {
@@ -959,10 +998,10 @@ func (s *Server) handleComputeFileCID(w http.ResponseWriter, r *http.Request) {
 	// CIDv1 format: version (0x01) + codec (0x55) + multihash
 	// Multihash format: hash-code (0x12) + length (0x20) + hash
 	cidBytes := make([]byte, 0, 2+2+32)
-	cidBytes = append(cidBytes, 0x01)       // CIDv1
-	cidBytes = append(cidBytes, 0x55)       // raw codec
-	cidBytes = append(cidBytes, 0x12)       // sha256 code
-	cidBytes = append(cidBytes, 0x20)       // 32 bytes
+	cidBytes = append(cidBytes, 0x01) // CIDv1
+	cidBytes = append(cidBytes, 0x55) // raw codec
+	cidBytes = append(cidBytes, 0x12) // sha256 code
+	cidBytes = append(cidBytes, 0x20) // 32 bytes
 	cidBytes = append(cidBytes, hashBytes...)
 
 	// Encode as base32lower with 'b' prefix (multibase)

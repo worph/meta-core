@@ -27,42 +27,54 @@ type Config struct {
 	HTTPHost string // HTTP API host (default: "0.0.0.0" — meta-core always runs in a container and must answer siblings)
 
 	// Timing configuration
-	HealthCheckIntervalMS    int // Health check interval in ms (default: 5000)
-	HeartbeatIntervalMS      int // Service heartbeat interval in ms (default: 30000)
-	StaleThresholdMS         int // Stale service threshold in ms (default: 60000)
-	CleanupIntervalMS        int // Dead service cleanup interval in ms (default: 600000)
-	DeadServiceThresholdMS   int // Dead service threshold in ms (default: 600000)
+	HealthCheckIntervalMS  int // Health check interval in ms (default: 5000)
+	HeartbeatIntervalMS    int // Service heartbeat interval in ms (default: 30000)
+	StaleThresholdMS       int // Stale service threshold in ms (default: 60000)
+	CleanupIntervalMS      int // Dead service cleanup interval in ms (default: 600000)
+	DeadServiceThresholdMS int // Dead service threshold in ms (default: 600000)
 
 	// File watcher configuration
-	WatchIntervalMS   int      // Polling interval for network mounts (default: 1000)
-	DebounceMS        int      // File change debounce time (default: 30000)
-	EnableFileWatcher bool     // Enable file watcher (default: true)
+	WatchIntervalMS   int  // Polling interval for network mounts (default: 1000)
+	DebounceMS        int  // File change debounce time (default: 30000)
+	EnableFileWatcher bool // Enable file watcher (default: true)
 
 	// Mount configuration
 	MountsDir string // Path to mounts configuration (default: /meta-core/mounts)
+
+	// UDP service discovery (meta-discovery v1). Replaces the file-based
+	// registry under ServicesDir(); see
+	// docs/project-architecture/service-discovery.md.
+	EnableUDPDiscovery  bool   // Announce + listen on the multicast group (default: true)
+	DiscoveryGroup      string // IPv4 multicast group (default: 239.255.77.1)
+	DiscoveryPort       int    // UDP port (default: 9399)
+	DiscoveryIntervalMS int    // Unsolicited announce interval in ms (default: 10000)
 }
 
 // Load creates a Config from environment variables
 func Load() *Config {
 	cfg := &Config{
-		MetaCorePath:          getEnv("META_CORE_PATH", "/meta-core"),
-		FilesPath:             getEnv("FILES_PATH", "/files"),
-		ServiceName:           getEnv("SERVICE_NAME", "meta-core"),
-		ServiceVersion:        getEnv("SERVICE_VERSION", "1.0.0"),
-		APIPort:               getEnvInt("API_PORT", 8180),
-		BaseURL:               getEnv("BASE_URL", ""),
-		PublicURL:             getEnv("META_CORE_PUBLIC_URL", ""),
-		RedisPort:             getEnvInt("REDIS_PORT", 6379),
-		HTTPPort:              getEnvInt("META_CORE_HTTP_PORT", 9000),
-		HTTPHost:              getEnv("META_CORE_HTTP_HOST", "0.0.0.0"),
+		MetaCorePath:           getEnv("META_CORE_PATH", "/meta-core"),
+		FilesPath:              getEnv("FILES_PATH", "/files"),
+		ServiceName:            getEnv("SERVICE_NAME", "meta-core"),
+		ServiceVersion:         getEnv("SERVICE_VERSION", "1.0.0"),
+		APIPort:                getEnvInt("API_PORT", 8180),
+		BaseURL:                getEnv("BASE_URL", ""),
+		PublicURL:              getEnv("META_CORE_PUBLIC_URL", ""),
+		RedisPort:              getEnvInt("REDIS_PORT", 6379),
+		HTTPPort:               getEnvInt("META_CORE_HTTP_PORT", 9000),
+		HTTPHost:               getEnv("META_CORE_HTTP_HOST", "0.0.0.0"),
 		HealthCheckIntervalMS:  getEnvInt("HEALTH_CHECK_INTERVAL_MS", 5000),
-		HeartbeatIntervalMS:   getEnvInt("HEARTBEAT_INTERVAL_MS", 30000),
-		StaleThresholdMS:      getEnvInt("STALE_THRESHOLD_MS", 60000),
-		CleanupIntervalMS:     getEnvInt("CLEANUP_INTERVAL_MS", 600000),
+		HeartbeatIntervalMS:    getEnvInt("HEARTBEAT_INTERVAL_MS", 30000),
+		StaleThresholdMS:       getEnvInt("STALE_THRESHOLD_MS", 60000),
+		CleanupIntervalMS:      getEnvInt("CLEANUP_INTERVAL_MS", 600000),
 		DeadServiceThresholdMS: getEnvInt("DEAD_SERVICE_THRESHOLD_MS", 600000),
-		WatchIntervalMS:       getEnvInt("WATCH_INTERVAL_MS", 1000),
-		DebounceMS:            getEnvInt("DEBOUNCE_MS", 30000),
-		EnableFileWatcher:     getEnvBool("ENABLE_FILE_WATCHER", true),
+		WatchIntervalMS:        getEnvInt("WATCH_INTERVAL_MS", 1000),
+		DebounceMS:             getEnvInt("DEBOUNCE_MS", 30000),
+		EnableFileWatcher:      getEnvBool("ENABLE_FILE_WATCHER", true),
+		EnableUDPDiscovery:     getEnvBool("ENABLE_UDP_DISCOVERY", true),
+		DiscoveryGroup:         getEnv("DISCOVERY_GROUP", "239.255.77.1"),
+		DiscoveryPort:          getEnvInt("DISCOVERY_PORT", 9399),
+		DiscoveryIntervalMS:    getEnvInt("DISCOVERY_INTERVAL_MS", 10000),
 	}
 
 	// Set mounts directory
@@ -161,11 +173,11 @@ func (c *Config) DefaultWatchPath() string {
 //
 //   - /files/watch  — user-curated media. The main library.
 //   - /files/plugin — plugin output (TMDB posters/backdrops, extracted
-//                     subtitles, etc.). Indexed so each artefact gets a
-//                     midhash256 alias and CID-based references from
-//                     other files (e.g. `backdrop=<cid>`) resolve through
-//                     the standard reverse index instead of needing a
-//                     path companion field.
+//     subtitles, etc.). Indexed so each artefact gets a
+//     midhash256 alias and CID-based references from
+//     other files (e.g. `backdrop=<cid>`) resolve through
+//     the standard reverse index instead of needing a
+//     path companion field.
 func (c *Config) DefaultWatcherPaths() []string {
 	return []string{
 		c.FilesPath + "/watch",

@@ -99,3 +99,33 @@ func (s *Server) handleSweepLiteratureEchoes(w http.ResponseWriter, r *http.Requ
 		"byKey":   res.ByKey,
 	})
 }
+
+// handleMigrateUserCids triggers the one-shot sweep that builds
+// `udl:idx:user:<uid>:cids` for User Data Layer records written before that
+// index existed. See storage.UDLBackfillUserCids.
+//
+// The index is what makes whole-profile export a set read instead of a
+// keyspace scan, and it is maintained by the upsert script from now on — so
+// this only ever matters once, for data already on disk. Until it has run, a
+// profile that predates the index exports as **empty**, which means a
+// cross-instance recovery reports success having restored nothing.
+//
+// Returns {fixed: N} — cids added, not cids examined. Safe to call repeatedly:
+// a second pass adds nothing.
+func (s *Server) handleMigrateUserCids(w http.ResponseWriter, r *http.Request) {
+	if !s.storage.IsConnected() {
+		writeError(w, http.StatusServiceUnavailable, "storage not connected")
+		return
+	}
+
+	fixed, err := s.storage.UDLBackfillUserCids()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"fixed":   fixed,
+	})
+}

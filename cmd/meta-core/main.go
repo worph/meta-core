@@ -12,6 +12,7 @@ import (
 	"github.com/metazla/meta-core/internal/config"
 	"github.com/metazla/meta-core/internal/discovery"
 	"github.com/metazla/meta-core/internal/leader"
+	"github.com/metazla/meta-core/internal/meshdisco"
 	"github.com/metazla/meta-core/internal/storage"
 )
 
@@ -72,8 +73,47 @@ func main() {
 		log.Printf("[meta-core] Warning: failed to start service cleaner: %v", err)
 	}
 
+	// UDP service discovery (meta-discovery v1). Runs alongside the file
+	// registry above for now — nothing consumes the wire yet, so this cannot
+	// regress the existing path. The announce payload is rebuilt from
+	// leaderProvider on every tick, which is what keeps it and GET /urls from
+	// drifting apart.
+	var mesh *meshdisco.Node
+	if cfg.EnableUDPDiscovery {
+		hostname, _ := os.Hostname()
+		mesh = meshdisco.New(meshdisco.Config{
+			Name:     cfg.ServiceName,
+			Instance: hostname,
+			Role:     meshdisco.RoleCore,
+			Version:  Version,
+			Group:    cfg.DiscoveryGroup,
+			Port:     cfg.DiscoveryPort,
+			Interval: time.Duration(cfg.DiscoveryIntervalMS) * time.Millisecond,
+			Payload: func() (string, string, *meshdisco.URLs) {
+				info := leaderProvider.LeaderInfo()
+				if info == nil {
+					return "", "starting", nil
+				}
+				return coreBaseURL(cfg), "running", &meshdisco.URLs{
+					Hostname:          info.Hostname,
+					BaseUrl:           info.BaseUrl,
+					ApiUrl:            info.ApiUrl,
+					WebdavUrl:         info.WebdavUrl,
+					WebdavUrlInternal: info.WebdavUrlInternal,
+				}
+			},
+		})
+		if err := mesh.Start(); err != nil {
+			log.Printf("[meta-core] Warning: UDP discovery disabled: %v", err)
+			mesh = nil
+		}
+	} else {
+		log.Println("[meta-core] UDP discovery disabled by ENABLE_UDP_DISCOVERY")
+	}
+
 	// Create and start API server
 	apiServer := api.NewServer(cfg, leaderProvider, disc, cleaner, storageClient)
+	apiServer.SetMeshNode(mesh)
 	if err := apiServer.Start(); err != nil {
 		log.Fatalf("[meta-core] Failed to start API server: %v", err)
 	}
@@ -88,6 +128,12 @@ func main() {
 	// Graceful shutdown in reverse order
 	if err := apiServer.Stop(); err != nil {
 		log.Printf("[meta-core] Error stopping API server: %v", err)
+	}
+
+	if mesh != nil {
+		if err := mesh.Stop(); err != nil {
+			log.Printf("[meta-core] Error stopping UDP discovery: %v", err)
+		}
 	}
 
 	if err := cleaner.Stop(); err != nil {
@@ -112,3 +158,17 @@ func waitForShutdown() {
 	<-sigChan
 }
 
+// coreBaseURL is the browser-facing URL announced for the nav menu. It keeps
+// the three-way fallback the file registry used (discovery/service.go):
+// META_CORE_PUBLIC_URL wins (the reachable URL when there is no Caddy
+// perimeter, e.g. a debug-direct port), then BASE_URL (the Caddy URL), then
+// the container IP.
+func coreBaseURL(cfg *config.Config) string {
+	if cfg.PublicURL != "" {
+		return cfg.PublicURL
+	}
+	if cfg.BaseURL != "" {
+		return cfg.BaseURL
+	}
+	return fmt.Sprintf("http://%s:%d", meshdisco.LocalIPv4(), cfg.APIPort)
+}
