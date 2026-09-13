@@ -59,7 +59,7 @@ func TestFieldIndex_SetMetadataFlatIndexesFields(t *testing.T) {
 			"filePath":                      "/files/watch/a.mkv",
 			"sizeByte":                      "123",
 			"cids/bafkreiaaa":               "true",
-			"titles/jpn":                    "ナルト",
+			"titles/jpn/ナルト":                "true",
 			"categories/TV/UHD":             "true",
 			"info/files/0/path":             "a.mkv",
 			"provenance":                    `{"source":"gateway"}`,
@@ -380,7 +380,7 @@ func TestFieldIndex_WarmBuildsEveryMissingIndex(t *testing.T) {
 		// written through the normal path (already indexed).
 		legacy := map[string]map[string]string{
 			"old1": {"filePath": "/a.mkv", "cids/bafkreiaaa": "true"},
-			"old2": {"filePath": "/b.mkv", "titles/jpn": "ナルト", "deep/a/b": "x"},
+			"old2": {"filePath": "/b.mkv", "titles/jpn/ナルト": "true", "deep/a/b": "x"},
 		}
 		for root, fields := range legacy {
 			for f, v := range fields {
@@ -407,7 +407,7 @@ func TestFieldIndex_WarmBuildsEveryMissingIndex(t *testing.T) {
 		if got := fieldNames(t, c, "old1"); !reflect.DeepEqual(got, []string{"cids/bafkreiaaa", "filePath"}) {
 			t.Errorf("old1 index = %v", got)
 		}
-		if got := fieldNames(t, c, "old2"); !reflect.DeepEqual(got, []string{"deep/a/b", "filePath", "titles/jpn"}) {
+		if got := fieldNames(t, c, "old2"); !reflect.DeepEqual(got, []string{"deep/a/b", "filePath", "titles/jpn/ナルト"}) {
 			t.Errorf("old2 index = %v", got)
 		}
 		if got := fieldNames(t, c, "fresh"); !reflect.DeepEqual(got, []string{"title"}) {
@@ -425,7 +425,7 @@ func TestFieldIndex_WarmBuildsEveryMissingIndex(t *testing.T) {
 		if _, err := c.WarmFieldIndexes(); err != nil {
 			t.Fatalf("second WarmFieldIndexes: %v", err)
 		}
-		if got := fieldNames(t, c, "old2"); !reflect.DeepEqual(got, []string{"deep/a/b", "filePath", "titles/jpn"}) {
+		if got := fieldNames(t, c, "old2"); !reflect.DeepEqual(got, []string{"deep/a/b", "filePath", "titles/jpn/ナルト"}) {
 			t.Errorf("old2 index after second warm = %v", got)
 		}
 	})

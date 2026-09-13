@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 )
@@ -202,6 +203,11 @@ func (c *Client) GetSearchIndexTuplesFor(hashIDs []string) (tuples []SearchTuple
 // blob. Shared by the full and incremental index reads so the two can never
 // disagree about what is searchable — a drift there would make a record's
 // matchability depend on which path happened to index it.
+//
+// Beyond the flat fields it folds in every `titles/<lang3>/<name>` member's
+// name (METADATA_KEYS.md §3): the name lives in the key and the value is the
+// sentinel "true", so a search for an alternative title (`3 percent`) finds the
+// record whose `title` is `3%`.
 func buildHaystack(fields map[string]string) string {
 	var sb strings.Builder
 	for _, f := range searchIndexFields {
@@ -210,5 +216,30 @@ func buildHaystack(fields map[string]string) string {
 			sb.WriteByte('\n')
 		}
 	}
+	for _, name := range titleMemberNames(fields) {
+		sb.WriteString(strings.ToLower(name))
+		sb.WriteByte('\n')
+	}
 	return sb.String()
+}
+
+// titleMemberNames returns the names of a record's `titles/<lang3>/<name>`
+// key-set members, with the `∕` (U+2215) a writer substitutes for `/` mapped
+// back. Sorted: the fields map has no order, and the full and incremental
+// builds must produce byte-identical haystacks.
+func titleMemberNames(fields map[string]string) []string {
+	var names []string
+	for k, v := range fields {
+		rest, ok := strings.CutPrefix(k, "titles/")
+		if !ok || v == "" || v == "false" {
+			continue
+		}
+		_, name, ok := strings.Cut(rest, "/")
+		if !ok || name == "" {
+			continue
+		}
+		names = append(names, strings.ReplaceAll(name, "\u2215", "/"))
+	}
+	sort.Strings(names)
+	return names
 }

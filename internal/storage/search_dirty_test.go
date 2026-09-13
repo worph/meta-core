@@ -174,6 +174,8 @@ func TestDirty_IncrementalTuplesMatchTheFullRebuild(t *testing.T) {
 			"title":                   "Parity Release",
 			"fileName":                "parity.s01e01.mkv",
 			"fileType":                "video",
+			"titles/eng/3 Percent":    "true",
+			"titles/fra/3 Pourcent":   "true",
 			"categories/XXX":          "true",
 			"categories/newznab/5070": "true",
 		}); err != nil {
@@ -208,4 +210,21 @@ func TestDirty_IncrementalTuplesMatchTheFullRebuild(t *testing.T) {
 			t.Error("the incremental path must keep the adult-filter category")
 		}
 	})
+}
+
+// A `titles/<lang3>/<name>` member contributes its NAME (the key), never its
+// "true" value, and the `∕` a writer substituted for `/` reads back as `/`.
+func TestBuildHaystack_FoldsTitleMemberNames(t *testing.T) {
+	got := buildHaystack(map[string]string{
+		"title":                     "3%",
+		"titles/fra/3 Pourcent":     "true",
+		"titles/eng/3 Percent":      "true",
+		"titles/und/Fate\u2215Zero": "true",
+		"titles/eng":                "Retired Scalar",
+		"titles/eng/":               "true",
+	})
+	want := "3%\n3 percent\n3 pourcent\nfate/zero\n"
+	if got != want {
+		t.Errorf("haystack = %q, want %q", got, want)
+	}
 }
