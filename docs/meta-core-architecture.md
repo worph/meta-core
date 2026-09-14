@@ -276,9 +276,8 @@ Bootstrap / discovery
   GET  /status
   GET  /leader
   GET  /urls
-  GET  /services         (alias: /api/services)
-  GET  /services/{name}
-  GET  /services/cleanup/stats
+  GET  /neighbors        (alias: /api/neighbors)
+  GET  /api/stats
 
 Metadata (primary surface for other services)
   GET    /meta

@@ -50,6 +50,9 @@ type Server struct {
 	mesh   *meshdisco.Node
 	router *mux.Router
 	server *http.Server
+	// stats caches the keyspace-walk half of GET /api/stats so a polling
+	// dashboard never puts a multi-second Redis walk on the request path.
+	stats *statsCache
 }
 
 // SetMeshNode attaches the UDP discovery node. Separate from NewServer so the
@@ -70,6 +73,7 @@ func NewServer(
 		storage:        stor,
 		search:         &searchIndex{},
 		router:         mux.NewRouter(),
+		stats:          &statsCache{},
 	}
 
 	// Initialize file watcher/scanner and dispatcher
@@ -168,6 +172,10 @@ func (s *Server) setupRoutes() {
 	s.router.HandleFunc("/status", s.handleStatus).Methods("GET")
 	s.router.HandleFunc("/leader", s.handleLeader).Methods("GET")
 	s.router.HandleFunc("/urls", s.handleURLs).Methods("GET")
+
+	// Dashboard headline counters in one request. Cheap half live, keyspace
+	// walks served from a background-refreshed cache — see stats.go.
+	s.router.HandleFunc("/api/stats", s.handleStats).Methods("GET")
 
 	// Metadata Editor API routes (must be before /meta/{hash} routes)
 	s.router.HandleFunc("/api/metadata/hash-ids", s.handleGetHashIds).Methods("GET")

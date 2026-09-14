@@ -17,10 +17,10 @@ HTTP API.
 |---------|-------------|
 | **Leader gate** | Bash `flock` loop in `docker/leader-election.sh` only `exec`s supervisord on the winner. The Go binary therefore only ever runs as leader. |
 | **Redis owner** | Supervisord starts Redis with AOF + RDB persistence inside the container; meta-core connects to it on localhost. |
-| **HTTP API** | Typed REST surface (gorilla/mux) for metadata, KV browsing, snapshots, schema inference, mounts, watchers, services, and file access by CID. |
+| **HTTP API** | Typed REST surface (gorilla/mux) for metadata, KV browsing, snapshots, schema inference, mounts, watchers, neighbours, and file access by CID. |
 | **SSE event streams** | `/api/events/files` and `/api/events/meta` mirror the underlying Redis Streams so external services never speak Redis. |
 | **WebDAV server** | `/webdav/*` exposes the `/files` volume (read+write) for cross-service file access. nginx in front of meta-core handles caching. |
-| **Service discovery** | File-based registry under `/meta-core/services/*.json` with heartbeat + dead-service cleanup. |
+| **Service discovery** | meta-discovery v1: UDP multicast announce/listen on `239.255.77.1:9399`, neighbours served at `/neighbors`. The file-based registry under `/meta-core/services/*.json` it replaced is gone. |
 | **File watcher / scanner** | Recursive scan + MidHash256 computation; emits events on `file:events`. |
 | **Mount management** | rclone-only mount manager (SMB rendered into `:smb:`, plus pre-defined remotes). Read-only by construction. |
 | **UUID-rooted storage** | Roots are UUIDv7 (Crockford Base32, ULID layout); CIDs are reverse-index aliases. Schema-version sentinel refuses to boot against stale data. |
@@ -167,11 +167,42 @@ GET  /health           # storage + role
 GET  /status           # version, uptime, etc.
 GET  /leader           # current leader info (hostname, PID, timestamps)
 GET  /urls             # baseUrl, apiUrl, webdavUrl, webdavUrlInternal (redisUrl is intentionally empty)
-GET  /services         # registered services + heartbeats
-GET  /api/services     # alias for /services
-GET  /services/{name}  # one service
-GET  /services/cleanup/stats
+GET  /neighbors        # neighbours heard over UDP (meta-discovery v1)
+GET  /api/neighbors    # same, under /api
+GET  /api/stats        # dashboard counters (see below)
 ```
+
+`/services`, `/api/services`, `/services/{name}` and `/services/cleanup/stats`
+are **gone** — the registration-and-heartbeat registry they served was replaced
+by meta-discovery v1 (`/neighbors`). nginx answers an unknown non-`/api` path
+with the dashboard's `index.html`, so a stale caller gets `200 text/html` rather
+than a 404; that is what made the dashboard fail with
+`SyntaxError: Unexpected token '<'` until 1.0.21.
+
+#### `GET /api/stats`
+
+Every headline counter in one request, split by cost:
+
+```jsonc
+{
+  "records": 88709,        // SCARD file:__index__ — metadata roots, file or not
+  "redisKeys": 3115447,    // DBSIZE — the flat per-field keys dominate
+  "redisMemory": "588.74M",
+  "identities": 3,         // signing accounts on disk
+  "files": { "count": 4864, "totalSize": 64587914424 },  // null until first sweep
+  "udlUsers": 5,           // accounts holding User Data Layer records
+  "sweptAt": 1789402401970,
+  "sweeping": false
+}
+```
+
+The first four are O(1) commands and are live on every call. `files` and
+`udlUsers` need a keyspace walk (~0.5s and ~3s respectively on an 88k-record
+box), so they are served from a single-flight cache refreshed in the background
+with a 60s TTL — the walk is **never** on the request path, because the
+dashboard polls and ten open tabs must not cost ten Redis walks. Prefer this
+over `/api/kv/info`, which does one `GET` per root (6s+) and sums `sizeByte`
+across records that share a file.
 
 ### Metadata — primary surface
 
