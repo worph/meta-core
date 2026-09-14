@@ -10,7 +10,6 @@ set -e
 # Create required directories
 mkdir -p /meta-core/locks
 mkdir -p /meta-core/db/redis
-mkdir -p /meta-core/services
 mkdir -p /meta-core/mounts/errors
 mkdir -p /files
 mkdir -p /var/log/supervisor

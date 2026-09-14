@@ -10,7 +10,6 @@ import (
 
 	"github.com/metazla/meta-core/internal/api"
 	"github.com/metazla/meta-core/internal/config"
-	"github.com/metazla/meta-core/internal/discovery"
 	"github.com/metazla/meta-core/internal/leader"
 	"github.com/metazla/meta-core/internal/meshdisco"
 	"github.com/metazla/meta-core/internal/storage"
@@ -61,18 +60,6 @@ func main() {
 	}
 	log.Printf("[meta-core] Redis schema version OK (v%d)", storage.SchemaVersion)
 
-	// Create and start service discovery
-	disc := discovery.NewService(cfg)
-	if err := disc.Start(); err != nil {
-		log.Fatalf("[meta-core] Failed to start service discovery: %v", err)
-	}
-
-	// Create and start dead service cleaner
-	cleaner := discovery.NewCleaner(cfg)
-	if err := cleaner.Start(); err != nil {
-		log.Printf("[meta-core] Warning: failed to start service cleaner: %v", err)
-	}
-
 	// UDP service discovery (meta-discovery v1). Runs alongside the file
 	// registry above for now — nothing consumes the wire yet, so this cannot
 	// regress the existing path. The announce payload is rebuilt from
@@ -112,7 +99,7 @@ func main() {
 	}
 
 	// Create and start API server
-	apiServer := api.NewServer(cfg, leaderProvider, disc, cleaner, storageClient)
+	apiServer := api.NewServer(cfg, leaderProvider, storageClient)
 	apiServer.SetMeshNode(mesh)
 	if err := apiServer.Start(); err != nil {
 		log.Fatalf("[meta-core] Failed to start API server: %v", err)
@@ -134,14 +121,6 @@ func main() {
 		if err := mesh.Stop(); err != nil {
 			log.Printf("[meta-core] Error stopping UDP discovery: %v", err)
 		}
-	}
-
-	if err := cleaner.Stop(); err != nil {
-		log.Printf("[meta-core] Error stopping service cleaner: %v", err)
-	}
-
-	if err := disc.Stop(); err != nil {
-		log.Printf("[meta-core] Error stopping service discovery: %v", err)
 	}
 
 	if err := storageClient.Close(); err != nil {

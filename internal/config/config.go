@@ -42,7 +42,7 @@ type Config struct {
 	MountsDir string // Path to mounts configuration (default: /meta-core/mounts)
 
 	// UDP service discovery (meta-discovery v1). Replaces the file-based
-	// registry under ServicesDir(); see
+	// registry that used to live under /meta-core/services; see
 	// docs/project-architecture/service-discovery.md.
 	EnableUDPDiscovery  bool   // Announce + listen on the multicast group (default: true)
 	DiscoveryGroup      string // IPv4 multicast group (default: 239.255.77.1)
@@ -83,24 +83,16 @@ func Load() *Config {
 	return cfg
 }
 
-// LockFilePath returns the path to the leader lock file
+// LockFilePath returns the path to the Redis-volume mutex. Held by
+// docker/leader-election.sh; nothing reads it, and it is NOT service
+// discovery — see docs/project-architecture/service-discovery.md.
 func (c *Config) LockFilePath() string {
 	return c.MetaCorePath + "/locks/kv-leader.lock"
-}
-
-// InfoFilePath returns the path to the leader info file
-func (c *Config) InfoFilePath() string {
-	return c.MetaCorePath + "/locks/kv-leader.info"
 }
 
 // RedisDataDir returns the path to Redis data directory
 func (c *Config) RedisDataDir() string {
 	return c.MetaCorePath + "/db/redis"
-}
-
-// ServicesDir returns the path to services directory
-func (c *Config) ServicesDir() string {
-	return c.MetaCorePath + "/services"
 }
 
 // MountsFilePath returns the path to the mounts configuration file

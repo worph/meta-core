@@ -9,7 +9,6 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/metazla/meta-core/internal/config"
-	"github.com/metazla/meta-core/internal/discovery"
 	"github.com/metazla/meta-core/internal/events"
 	"github.com/metazla/meta-core/internal/identity"
 	"github.com/metazla/meta-core/internal/leader"
@@ -26,8 +25,6 @@ import (
 type Server struct {
 	config            *config.Config
 	leaderProvider    *leader.LeaderInfoProvider
-	discovery         *discovery.Service
-	cleaner           *discovery.Cleaner
 	storage           *storage.Client
 	mountsManager     *mounts.Manager
 	mountsHandlers    *mounts.Handlers
@@ -65,15 +62,11 @@ func (s *Server) SetMeshNode(n *meshdisco.Node) {
 func NewServer(
 	cfg *config.Config,
 	leaderProvider *leader.LeaderInfoProvider,
-	disc *discovery.Service,
-	cleaner *discovery.Cleaner,
 	stor *storage.Client,
 ) *Server {
 	s := &Server{
 		config:         cfg,
 		leaderProvider: leaderProvider,
-		discovery:      disc,
-		cleaner:        cleaner,
 		storage:        stor,
 		search:         &searchIndex{},
 		router:         mux.NewRouter(),
@@ -289,13 +282,6 @@ func (s *Server) setupRoutes() {
 	// Caddy publicly). See docs/api-mediated-access.md "Auth".
 	s.router.HandleFunc("/api/events/files", s.handleEventsFiles).Methods("GET")
 	s.router.HandleFunc("/api/events/meta", s.handleEventsMeta).Methods("GET")
-
-	// Service discovery
-	// Both /services and /api/services are supported for consistency with other services
-	s.router.HandleFunc("/services", s.handleListServices).Methods("GET")
-	s.router.HandleFunc("/api/services", s.handleListServices).Methods("GET")
-	s.router.HandleFunc("/services/cleanup/stats", s.handleCleanupStats).Methods("GET")
-	s.router.HandleFunc("/services/{name}", s.handleGetService).Methods("GET")
 
 	// meta-discovery v1: neighbours heard over UDP. Supersedes /api/services,
 	// which is still served above while consumers migrate.

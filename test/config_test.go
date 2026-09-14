@@ -77,15 +77,9 @@ func TestConfigPaths(t *testing.T) {
 		t.Errorf("Unexpected LockFilePath: %s", cfg.LockFilePath())
 	}
 
-	if cfg.InfoFilePath() != "/test/locks/kv-leader.info" {
-		t.Errorf("Unexpected InfoFilePath: %s", cfg.InfoFilePath())
-	}
 
 	if cfg.RedisDataDir() != "/test/db/redis" {
 		t.Errorf("Unexpected RedisDataDir: %s", cfg.RedisDataDir())
 	}
 
-	if cfg.ServicesDir() != "/test/services" {
-		t.Errorf("Unexpected ServicesDir: %s", cfg.ServicesDir())
-	}
 }

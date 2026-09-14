@@ -548,62 +548,13 @@ func (s *Server) handleGetFileByCID(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, fileInfo.Name(), fileInfo.ModTime(), file)
 }
 
-// handleListServices handles GET /services and GET /api/services
-// Supports optional ?current=<service-name> query parameter
-func (s *Server) handleListServices(w http.ResponseWriter, r *http.Request) {
-	services, err := s.discovery.DiscoverAll()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	response := map[string]interface{}{
-		"services": services,
-		"count":    len(services),
-	}
-
-	// Add 'current' field if query parameter is provided
-	current := r.URL.Query().Get("current")
-	if current != "" {
-		response["current"] = current
-	}
-
-	writeJSON(w, http.StatusOK, response)
-}
-
-// handleGetService handles GET /services/{name}
-func (s *Server) handleGetService(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	name := vars["name"]
-
-	if name == "" {
-		writeError(w, http.StatusBadRequest, "service name is required")
-		return
-	}
-
-	service, err := s.discovery.Discover(name)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	if service == nil {
-		writeError(w, http.StatusNotFound, "service not found")
-		return
-	}
-
-	writeJSON(w, http.StatusOK, service)
-}
-
 // handleListNeighbors handles GET /neighbors and GET /api/neighbors.
 //
-// This is the meta-discovery v1 replacement for /api/services: the list is
-// built from UDP announces held in memory, not from files under
-// /meta-core/services, so it works across stacks that share a network but no
-// volume. Instances of the same service are collapsed to the most recent, which
-// preserves the one-row-per-service contract the old endpoint had.
-//
-// A `?all=1` query returns every instance uncollapsed, for debugging.
+// meta-discovery v1. The list is built from UDP announces held in memory, not
+// from files under /meta-core/services, so it works across stacks that share a
+// network but no volume. Instances of the same service are collapsed to the
+// most recent, which preserves the one-row-per-service shape the old
+// /api/services had. `?all=1` returns every instance, for debugging.
 func (s *Server) handleListNeighbors(w http.ResponseWriter, r *http.Request) {
 	response := map[string]interface{}{
 		"current":   s.config.ServiceName,
@@ -631,17 +582,6 @@ func (s *Server) handleListNeighbors(w http.ResponseWriter, r *http.Request) {
 	response["count"] = len(list)
 	response["self"] = s.mesh.Self()
 	writeJSON(w, http.StatusOK, response)
-}
-
-// handleCleanupStats handles GET /services/cleanup/stats
-func (s *Server) handleCleanupStats(w http.ResponseWriter, r *http.Request) {
-	if s.cleaner == nil {
-		writeError(w, http.StatusServiceUnavailable, "cleaner not initialized")
-		return
-	}
-
-	stats := s.cleaner.Stats()
-	writeJSON(w, http.StatusOK, stats)
 }
 
 // writeJSON writes a JSON response
