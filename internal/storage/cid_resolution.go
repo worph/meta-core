@@ -157,6 +157,42 @@ func (c *Client) addAliasLocked(ctx context.Context, uuid, cidStr string) error 
 	return nil
 }
 
+// removeAliasLocked is the inverse of addAliasLocked: it drops the reverse-index
+// entry cid:<cid> → <uuid>. The caller must already hold c.mu, and must delete
+// the cids/<cid> key-set member itself (DeleteProperty does both).
+//
+// ⚠ Why this exists. A cids/ member write touches THREE keys — the flat
+// file:<uuid>/cids/<cid>, the __fields__ index entry, and this reverse alias —
+// while the delete path only ever removed the first two. A "deleted" CID
+// therefore still resolved: GET /meta/<cid>, ResolveRoot and GetByCID all kept
+// answering with the record. The asymmetry is not theoretical. meta-share
+// published dag-pb roots computed over RAR volumes and par2 files onto six
+// records on watch.nsl.sh; removing the member was expressible, removing the
+// claim was not, so the false identity survived its own retraction.
+//
+// Guarded, not blind: the alias is removed only when it currently points at
+// THIS uuid. Two records can legitimately race to claim a cid (see the
+// dual-root guard in addAliasLocked, which leaves the first writer's alias in
+// place); deleting a member from the loser must not unpick the winner's index.
+func (c *Client) removeAliasLocked(ctx context.Context, uuid, cidStr string) error {
+	if uuid == "" || cidStr == "" {
+		return nil
+	}
+	indexKey := c.buildCIDIndexKey(cidStr)
+	existing, err := c.client.Get(ctx, indexKey).Result()
+	if err == redis.Nil {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read existing alias: %w", err)
+	}
+	if existing != uuid {
+		// Somebody else owns this alias. Leave it.
+		return nil
+	}
+	return c.client.Del(ctx, indexKey).Err()
+}
+
 // ResolveRoot maps a hash supplied by a caller (a meta-sort write, an editor
 // lookup, an SSE consumer) to the actual storage root key.
 //

@@ -460,6 +460,10 @@ func (c *Client) MergeMetadataFlat(hashID string, metadata map[string]string) (i
 
 // DeleteProperty deletes a single property
 // Uses flat key: DEL file:{hashId}/{property}
+//
+// For a cids/<cid> member this is the full inverse of the write: the flat key,
+// the __fields__ entry AND the cid:<cid> reverse alias all go. Anything less
+// leaves the CID still resolving to this record — see removeAliasLocked.
 func (c *Client) DeleteProperty(hashID, property string) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -474,6 +478,13 @@ func (c *Client) DeleteProperty(hashID, property string) error {
 	key := c.buildKeyPrefix(hashID) + property
 	if err := c.client.Del(ctx, key).Err(); err != nil {
 		return err
+	}
+	// Before the field index forgets the name, use it: a cids/ member owns a
+	// reverse-index entry that nothing else will ever clean up.
+	if cidStr := cidFromKeysetField(property); cidStr != "" {
+		if err := c.removeAliasLocked(ctx, hashID, cidStr); err != nil {
+			return fmt.Errorf("remove alias for %s: %w", cidStr, err)
+		}
 	}
 	c.removeFieldLocked(ctx, hashID, property)
 	c.markDirtyLocked(ctx, hashID)
