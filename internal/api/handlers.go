@@ -550,11 +550,11 @@ func (s *Server) handleGetFileByCID(w http.ResponseWriter, r *http.Request) {
 
 // handleListNeighbors handles GET /neighbors and GET /api/neighbors.
 //
-// meta-discovery v1. The list is built from UDP announces held in memory, not
-// from files under /meta-core/services, so it works across stacks that share a
-// network but no volume. Instances of the same service are collapsed to the
-// most recent, which preserves the one-row-per-service shape the old
-// /api/services had. `?all=1` returns every instance, for debugging.
+// Beacon v2 (docs/project-architecture/beacon-v2.md). The list is this node's
+// in-memory view of the UDP group, so it works across stacks that share a
+// network but no volume. Instances of one name collapse to the most recent
+// (one row per service, the nav menu's shape); `?all=1` returns every
+// instance, `?cap=<pattern>` keeps only nodes with a matching capability.
 func (s *Server) handleListNeighbors(w http.ResponseWriter, r *http.Request) {
 	response := map[string]interface{}{
 		"current":   s.config.ServiceName,
@@ -575,6 +575,15 @@ func (s *Server) handleListNeighbors(w http.ResponseWriter, r *http.Request) {
 		list = s.mesh.Neighbors()
 	} else {
 		list = s.mesh.NeighborsByName()
+	}
+	if pattern := r.URL.Query().Get("cap"); pattern != "" {
+		kept := list[:0]
+		for _, nb := range list {
+			if nb.Matches(pattern) {
+				kept = append(kept, nb)
+			}
+		}
+		list = kept
 	}
 
 	response["enabled"] = true

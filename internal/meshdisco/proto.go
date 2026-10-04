@@ -1,75 +1,62 @@
-// Package meshdisco implements meta-discovery v1: UDP multicast service
-// discovery for the meta-* services.
+// Package meshdisco implements beacon v2: local resource advertise / discover
+// over UDP multicast (239.255.99.1:9099), the protocol every meta-* service
+// and SDK-hosted plugin uses to find its neighbours.
 //
-// It replaces two file-based mechanisms that both required a shared
-// /meta-core volume:
+// A node advertises Resources, each tagged with capability strings
+// ("metamesh.core", "metamesh.service/meta-sort", "metamesh.transport/nzb@1");
+// consumers keep a live view of everyone else's and filter by capability.
+// meta-core advertises "metamesh.core" carrying its /urls block, which is how
+// services locate it without a shared volume.
 //
-//   - /meta-core/locks/kv-leader.info — a one-line file holding meta-core's
-//     API URL, read at boot to locate meta-core.
-//   - /meta-core/services/<name>-<host>.json — per-service registration files
-//     aggregated into the dashboard's service nav.
-//
-// Both answer the same question — where is meta-core, and who else is on this
-// network — so one announce packet answers both. Discovery scope becomes the
-// docker network the container is attached to rather than the volume it
-// mounts, which is what lets per-app CasaOS stacks and the meta-watch island
-// see their neighbours without sharing storage.
-//
-// The wire protocol is documented in
-// docs/project-architecture/service-discovery.md. Keep this file and that doc
-// in step — every other language implementation is written against the doc.
+// The wire protocol is documented in docs/project-architecture/beacon-v2.md.
+// Keep this package and that doc in step — the Rust (meta-feeder-sdk),
+// TypeScript and Python implementations are written against the doc.
 package meshdisco
 
-import "time"
-
-const (
-	// ProtocolVersion is the `v` field on every message. Receivers ignore
-	// messages carrying a version they don't know.
-	ProtocolVersion = 1
-
-	// DefaultGroup is the IPv4 multicast group. Deliberately NOT beacon's
-	// 239.255.99.1 (sandbox/beacon), so the two protocols cannot cross-talk
-	// if they ever share a network.
-	DefaultGroup = "239.255.77.1"
-
-	// DefaultPort is the UDP port. Deliberately NOT beacon's 9099, for the
-	// same reason.
-	DefaultPort = 9399
-
-	// DefaultInterval is how often an unsolicited announce is emitted.
-	DefaultInterval = 10 * time.Second
-
-	// LivenessFactor multiplies the announce interval to get the staleness
-	// window: a neighbour last seen longer ago than interval*factor is
-	// dropped. This replaces the old heartbeat file + cleaner.go reaper.
-	LivenessFactor = 3
-
-	// ReadBufferSize is the datagram receive buffer. Beacon's reference
-	// implementation uses 1 KiB, which truncates a realistic payload; an
-	// announce carrying the full URLs block is comfortably under 8 KiB.
-	ReadBufferSize = 8192
-
-	// TypeDiscovery is a probe: "who is out there?". Sent at startup and on
-	// a manual refresh, answered immediately by every listener.
-	TypeDiscovery = "discovery"
-
-	// TypeAnnounce is a service describing itself, sent unsolicited on a
-	// ticker and unicast in reply to a probe.
-	TypeAnnounce = "announce"
-
-	// RoleCore marks meta-core itself — the only role that carries a URLs
-	// block. Consumers locating meta-core filter on this.
-	RoleCore = "core"
-
-	// RoleService marks every other meta-* service.
-	RoleService = "service"
+import (
+	"encoding/json"
+	"strings"
+	"time"
 )
 
-// URLs mirrors meta-core's existing GET /urls response (api.URLsResponse)
-// minus redisUrl, which the api-mediated-access lockdown retired. Embedding it
-// in the announce makes the announce a drop-in for the /urls hop that
-// LeaderClient performs today; /urls itself stays, since meta-search and
-// meta-share still call it.
+const (
+	// Proto and Version form the envelope every v2 message carries. Anything
+	// else on the group (beacon v1, junk) is dropped silently.
+	Proto   = "beacon"
+	Version = 2
+
+	// DefaultGroup / DefaultPort are beacon's endpoint, on purpose: one
+	// well-known place for every kind of local resource. v1 and v2 coexist
+	// because v2 never sends v1's "discovery" / "announce" types.
+	DefaultGroup = "239.255.99.1"
+	DefaultPort  = 9099
+
+	// DefaultInterval is how often an unsolicited advertise is emitted.
+	DefaultInterval = 10 * time.Second
+
+	// LivenessFactor multiplies the interval to get the staleness window.
+	// Expiry is evaluated at read time; there is no reaper.
+	LivenessFactor = 3
+
+	// ReadBufferSize is the receive buffer; MaxDatagram is what a sender
+	// stays under so nothing fragments.
+	ReadBufferSize = 8192
+	MaxDatagram    = 1400
+
+	TypeProbe     = "probe"
+	TypeAdvertise = "advertise"
+	TypeBye       = "bye"
+
+	// CapCore is meta-core's capability; its resource carries Data.urls.
+	CapCore = "metamesh.core"
+	// CapServicePrefix + name is every service's capability.
+	CapServicePrefix = "metamesh.service/"
+	CapAnyService    = "metamesh.service/*"
+)
+
+// URLs mirrors meta-core's GET /urls response (api.URLsResponse) minus
+// redisUrl. It travels as the metamesh.core resource's Data.urls, so a service
+// locates meta-core from the advertise alone.
 type URLs struct {
 	Hostname          string `json:"hostname"`
 	BaseUrl           string `json:"baseUrl"`
@@ -78,55 +65,173 @@ type URLs struct {
 	WebdavUrlInternal string `json:"webdavUrlInternal"`
 }
 
-// Message is the single wire type: both probe and announce are one JSON
-// datagram. Everything but `v` and `type` is omitted on a probe.
-type Message struct {
-	V    int    `json:"v"`
-	Type string `json:"type"`
-
-	// Name is the service name, e.g. "meta-core", "meta-sort".
-	Name string `json:"name,omitempty"`
-	// Instance distinguishes two instances of the same Name — the container
-	// hostname. Also used to recognise and drop our own multicast echo.
-	Instance string `json:"instance,omitempty"`
-	// Role is RoleCore or RoleService.
-	Role string `json:"role,omitempty"`
-	// Version is the service's build version, for display only.
-	Version string `json:"version,omitempty"`
-	// Status is "running" | "starting" | "stopping".
+// NodeInfo says who is advertising.
+type NodeInfo struct {
+	Name     string `json:"name"`
+	Instance string `json:"instance"`
+	Version  string `json:"version,omitempty"`
+	// Status is "starting" | "running"; absent reads as running.
 	Status string `json:"status,omitempty"`
-
-	// BaseUrl is the browser-facing URL the nav menu links to. Built with
-	// the same three-way fallback the file registry used:
-	// META_CORE_PUBLIC_URL -> BASE_URL -> http://<local-ip>:<port>.
-	BaseUrl string `json:"baseUrl,omitempty"`
-
-	// URLs is populated only when Role == RoleCore.
-	URLs *URLs `json:"urls,omitempty"`
-
-	// Token is reserved for a future HMAC over the payload. v1 senders omit
-	// it and v1 receivers ignore it; see the doc's Security section.
-	Token string `json:"token,omitempty"`
 }
 
-// Neighbor is a Message plus the receive-side facts the sender cannot state
-// about itself.
-type Neighbor struct {
-	Message
-	// Addr is the source address the datagram arrived from. Taken from the
-	// packet, never from the payload — a sender does not get to claim its
-	// own IP.
-	Addr string `json:"addr"`
-	// LastSeen is when we last received an announce from this instance.
-	LastSeen time.Time `json:"lastSeen"`
+// Resource is one advertised thing.
+type Resource struct {
+	ID   string   `json:"id"`
+	Caps []string `json:"caps"`
+	// Endpoints: well-known names http, ui, manifest, mcp. A value starting
+	// with "/" is relative to endpoints.http.
+	Endpoints map[string]string `json:"endpoints,omitempty"`
+	Rev       string            `json:"rev,omitempty"`
+	// Binds names the one consumer instance this resource belongs to.
+	Binds string          `json:"binds,omitempty"`
+	Data  json.RawMessage `json:"data,omitempty"`
 }
 
-// key identifies a neighbour entry. Two instances of the same service are
-// distinct neighbours; callers that want one row per service (the nav menu)
-// collapse by Name themselves.
-func (m Message) key() string {
-	if m.Instance == "" {
-		return m.Name
+// Matches reports whether any cap matches pattern.
+func (r Resource) Matches(pattern string) bool {
+	for _, c := range r.Caps {
+		if CapMatches(pattern, c) {
+			return true
+		}
 	}
-	return m.Name + "|" + m.Instance
+	return false
+}
+
+// MatchesAny reports whether any cap matches any pattern; an empty list matches.
+func (r Resource) MatchesAny(patterns []string) bool {
+	if len(patterns) == 0 {
+		return true
+	}
+	for _, p := range patterns {
+		if r.Matches(p) {
+			return true
+		}
+	}
+	return false
+}
+
+// Endpoint returns the named endpoint as an absolute URL.
+func (r Resource) Endpoint(name string) string {
+	v := r.Endpoints[name]
+	if strings.HasPrefix(v, "/") {
+		base := r.Endpoints["http"]
+		if base == "" {
+			return ""
+		}
+		return strings.TrimRight(base, "/") + v
+	}
+	return v
+}
+
+// Message is every v2 datagram.
+type Message struct {
+	Proto     string     `json:"proto"`
+	V         int        `json:"v"`
+	Type      string     `json:"type"`
+	Node      *NodeInfo  `json:"node,omitempty"`
+	Resources []Resource `json:"resources,omitempty"`
+	// From and Want are probe-only.
+	From string   `json:"from,omitempty"`
+	Want []string `json:"want,omitempty"`
+}
+
+// Parse decodes a datagram, returning ok=false for anything that is not a
+// well-formed beacon v2 message (v1 traffic, other versions, unknown types,
+// an advertise/bye without a node).
+func Parse(b []byte) (Message, bool) {
+	var m Message
+	if err := json.Unmarshal(b, &m); err != nil {
+		return m, false
+	}
+	if m.Proto != Proto || m.V != Version {
+		return m, false
+	}
+	switch m.Type {
+	case TypeProbe:
+		return m, true
+	case TypeAdvertise, TypeBye:
+		if m.Node == nil || m.Node.Name == "" || m.Node.Instance == "" {
+			return m, false
+		}
+		return m, true
+	}
+	return m, false
+}
+
+func splitContract(s string) (string, string, bool) {
+	if i := strings.LastIndex(s, "@"); i >= 0 {
+		return s[:i], s[i+1:], true
+	}
+	return s, "", false
+}
+
+// CapMatches reports whether capability cap satisfies pattern:
+// "*" matches everything; an "@N" on the pattern must equal the cap's
+// contract (none on the pattern ignores it); "x/*" matches any variant of x;
+// otherwise the bases must be equal.
+func CapMatches(pattern, cap string) bool {
+	if pattern == "*" {
+		return true
+	}
+	pbase, pc, phas := splitContract(pattern)
+	cbase, cc, chas := splitContract(cap)
+	if phas && (!chas || pc != cc) {
+		return false
+	}
+	if prefix, ok := strings.CutSuffix(pbase, "/*"); ok {
+		rest, ok := strings.CutPrefix(cbase, prefix)
+		return ok && strings.HasPrefix(rest, "/") && len(rest) > 1
+	}
+	return pbase == cbase
+}
+
+// Neighbor is a node heard on the wire, as served by /api/neighbors.
+type Neighbor struct {
+	NodeInfo
+	Resources []Resource `json:"resources"`
+	// Caps flattens every resource's caps, for consumers that just filter.
+	Caps []string `json:"caps"`
+	// BaseUrl is the metamesh.service/* resource's endpoints.ui — kept so
+	// v1-era readers (the nav menu) keep working.
+	BaseUrl string `json:"baseUrl,omitempty"`
+	// Addr is the packet's source address, never a payload claim.
+	Addr string `json:"addr"`
+	// LastSeen is unix seconds.
+	LastSeen float64 `json:"lastSeen"`
+}
+
+// Matches reports whether any resource matches pattern.
+func (n Neighbor) Matches(pattern string) bool {
+	for _, r := range n.Resources {
+		if r.Matches(pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func newNeighbor(node NodeInfo, resources []Resource, addr string, seen time.Time) Neighbor {
+	nb := Neighbor{
+		NodeInfo:  node,
+		Resources: resources,
+		Caps:      []string{},
+		Addr:      addr,
+		LastSeen:  float64(seen.UnixNano()) / 1e9,
+	}
+	if nb.Resources == nil {
+		nb.Resources = []Resource{}
+	}
+	seenCap := map[string]bool{}
+	for _, r := range resources {
+		for _, c := range r.Caps {
+			if !seenCap[c] {
+				seenCap[c] = true
+				nb.Caps = append(nb.Caps, c)
+			}
+		}
+		if nb.BaseUrl == "" && r.Matches(CapAnyService) {
+			nb.BaseUrl = r.Endpoint("ui")
+		}
+	}
+	return nb
 }

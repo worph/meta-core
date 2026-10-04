@@ -43,7 +43,7 @@ type Server struct {
 	// challenges backs proof-of-possession on reveal/delete. In-process, so a
 	// restart invalidates the ones in flight — see identity/challenge.go.
 	challenges *identity.ChallengeStore
-	// mesh is the UDP discovery node (meta-discovery v1). nil when discovery
+	// mesh is the UDP discovery node (beacon v2). nil when discovery
 	// is disabled or failed to bind, in which case /api/neighbors reports an
 	// empty list rather than erroring — a dashboard nav is decoration and
 	// must not take the API down with it.
@@ -291,7 +291,7 @@ func (s *Server) setupRoutes() {
 	s.router.HandleFunc("/api/events/files", s.handleEventsFiles).Methods("GET")
 	s.router.HandleFunc("/api/events/meta", s.handleEventsMeta).Methods("GET")
 
-	// meta-discovery v1: neighbours heard over UDP. Supersedes /api/services,
+	// beacon v2: neighbours heard over UDP. Supersedes /api/services,
 	// which is still served above while consumers migrate.
 	s.router.HandleFunc("/neighbors", s.handleListNeighbors).Methods("GET")
 	s.router.HandleFunc("/api/neighbors", s.handleListNeighbors).Methods("GET")

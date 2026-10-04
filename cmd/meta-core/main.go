@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -60,37 +61,47 @@ func main() {
 	}
 	log.Printf("[meta-core] Redis schema version OK (v%d)", storage.SchemaVersion)
 
-	// UDP service discovery (meta-discovery v1). Runs alongside the file
-	// registry above for now — nothing consumes the wire yet, so this cannot
-	// regress the existing path. The announce payload is rebuilt from
-	// leaderProvider on every tick, which is what keeps it and GET /urls from
-	// drifting apart.
+	// Beacon v2 (docs/project-architecture/beacon-v2.md): advertise meta-core
+	// as metamesh.core — carrying the /urls block services locate us by — plus
+	// its own metamesh.service/<name> nav entry. The payload is rebuilt from
+	// leaderProvider on every tick, which keeps it and GET /urls from drifting.
 	var mesh *meshdisco.Node
 	if cfg.EnableUDPDiscovery {
 		hostname, _ := os.Hostname()
 		mesh = meshdisco.New(meshdisco.Config{
 			Name:     cfg.ServiceName,
 			Instance: hostname,
-			Role:     meshdisco.RoleCore,
 			Version:  Version,
 			Group:    cfg.DiscoveryGroup,
 			Port:     cfg.DiscoveryPort,
 			Interval: time.Duration(cfg.DiscoveryIntervalMS) * time.Millisecond,
-			Payload: func() (string, string, *meshdisco.URLs) {
+			Payload: func() (string, []meshdisco.Resource) {
+				service := meshdisco.Resource{
+					ID:        "service",
+					Caps:      []string{meshdisco.CapServicePrefix + cfg.ServiceName},
+					Endpoints: map[string]string{"ui": coreBaseURL(cfg)},
+				}
 				info := leaderProvider.LeaderInfo()
 				if info == nil {
-					return "", "starting", nil
+					return "starting", []meshdisco.Resource{service}
 				}
-				return coreBaseURL(cfg), "running", &meshdisco.URLs{
+				data, _ := json.Marshal(map[string]meshdisco.URLs{"urls": {
 					Hostname:          info.Hostname,
 					BaseUrl:           info.BaseUrl,
 					ApiUrl:            info.ApiUrl,
 					WebdavUrl:         info.WebdavUrl,
 					WebdavUrlInternal: info.WebdavUrlInternal,
+				}})
+				core := meshdisco.Resource{
+					ID:        "core",
+					Caps:      []string{meshdisco.CapCore},
+					Endpoints: map[string]string{"http": info.ApiUrl},
+					Data:      data,
 				}
+				return "running", []meshdisco.Resource{core, service}
 			},
 		})
-		if err := mesh.Start(); err != nil {
+	if err := mesh.Start(); err != nil {
 			log.Printf("[meta-core] Warning: UDP discovery disabled: %v", err)
 			mesh = nil
 		}

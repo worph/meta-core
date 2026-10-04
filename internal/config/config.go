@@ -41,13 +41,13 @@ type Config struct {
 	// Mount configuration
 	MountsDir string // Path to mounts configuration (default: /meta-core/mounts)
 
-	// UDP service discovery (meta-discovery v1). Replaces the file-based
-	// registry that used to live under /meta-core/services; see
-	// docs/project-architecture/service-discovery.md.
-	EnableUDPDiscovery  bool   // Announce + listen on the multicast group (default: true)
-	DiscoveryGroup      string // IPv4 multicast group (default: 239.255.77.1)
-	DiscoveryPort       int    // UDP port (default: 9399)
-	DiscoveryIntervalMS int    // Unsolicited announce interval in ms (default: 10000)
+	// UDP discovery (beacon v2). Replaces the file-based registry that used
+	// to live under /meta-core/services; see
+	// docs/project-architecture/beacon-v2.md.
+	EnableUDPDiscovery  bool   // Advertise + listen on the multicast group (default: true)
+	DiscoveryGroup      string // BEACON_GROUP: IPv4 multicast group (default: 239.255.99.1)
+	DiscoveryPort       int    // BEACON_PORT: UDP port (default: 9099)
+	DiscoveryIntervalMS int    // BEACON_INTERVAL_MS: unsolicited advertise interval (default: 10000)
 }
 
 // Load creates a Config from environment variables
@@ -72,9 +72,9 @@ func Load() *Config {
 		DebounceMS:             getEnvInt("DEBOUNCE_MS", 30000),
 		EnableFileWatcher:      getEnvBool("ENABLE_FILE_WATCHER", true),
 		EnableUDPDiscovery:     getEnvBool("ENABLE_UDP_DISCOVERY", true),
-		DiscoveryGroup:         getEnv("DISCOVERY_GROUP", "239.255.77.1"),
-		DiscoveryPort:          getEnvInt("DISCOVERY_PORT", 9399),
-		DiscoveryIntervalMS:    getEnvInt("DISCOVERY_INTERVAL_MS", 10000),
+		DiscoveryGroup:         getEnv("BEACON_GROUP", "239.255.99.1"),
+		DiscoveryPort:          getEnvInt("BEACON_PORT", 9099),
+		DiscoveryIntervalMS:    getEnvInt("BEACON_INTERVAL_MS", 10000),
 	}
 
 	// Set mounts directory
@@ -85,7 +85,7 @@ func Load() *Config {
 
 // LockFilePath returns the path to the Redis-volume mutex. Held by
 // docker/leader-election.sh; nothing reads it, and it is NOT service
-// discovery — see docs/project-architecture/service-discovery.md.
+// discovery — see docs/project-architecture/beacon-v2.md.
 func (c *Config) LockFilePath() string {
 	return c.MetaCorePath + "/locks/kv-leader.lock"
 }

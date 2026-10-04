@@ -8,8 +8,8 @@ MetaMesh dev/prod stack.
 
 meta-core runs as its own container (`metacore-app`). Other MetaMesh services
 (meta-sort, meta-fuse, meta-stremio, meta-dup, meta-search, meta-share,
-meta-gateway, meta-watch, …) locate it over UDP multicast (meta-discovery v1 —
-its `role=core` announce carries the full `/urls` payload) and then call its
+meta-gateway, meta-watch, …) locate it over UDP multicast (beacon v2 —
+its `metamesh.core` advertise carries the full `/urls` payload) and then call its
 HTTP API. `META_CORE_URL` on a client pins it instead. Redis is not published
 outside the container — all metadata I/O is mediated by the HTTP/SSE API
 (see [`docs/api-mediated-access.md`](docs/api-mediated-access.md)).
@@ -24,7 +24,7 @@ outside the container — all metadata I/O is mediated by the HTTP/SSE API
 | **In-memory search index** | `POST /api/metadata/search` matches against an in-memory snapshot of every record, kept current by incremental refreshes (full reconcile every 30 min) — no Redis round-trip per record on the request path (`internal/api/search_index.go`). |
 | **SSE event streams** | `/api/events/files` and `/api/events/meta` mirror the underlying Redis Streams so external services never speak Redis. |
 | **WebDAV server** | `/webdav/*` exposes the `/files` volume (read+write) for cross-service file access. nginx in front of meta-core handles caching. |
-| **Service discovery** | meta-discovery v1: UDP multicast announce/listen on `239.255.77.1:9399`, neighbours served at `/neighbors`. The file-based registry under `/meta-core/services/*.json` it replaced is gone. |
+| **Service discovery** | beacon v2: UDP multicast advertise/listen on `239.255.99.1:9099`, neighbours served at `/neighbors`. The file-based registry under `/meta-core/services/*.json` it replaced is gone. |
 | **File watcher / scanner** | Recursive scan + MidHash256 computation; emits events on `file:events`. Watched roots are POSTed watcher configs (`/meta-core/watchers.json`), not env vars. |
 | **Mount management** | rclone-only mount manager (SMB rendered into `:smb:`, plus pre-defined remotes). Read-only by construction. |
 | **UUID-rooted storage** | Roots are UUIDv7 (Crockford Base32, ULID layout); CIDs are reverse-index aliases. Schema-version sentinel refuses to boot against stale data. |
@@ -58,7 +58,7 @@ outside the container — all metadata I/O is mediated by the HTTP/SSE API
 │   ├─ rclone rcd          (mount daemon, RC API on :5572)                 │
 │   ├─ mount-watcher.sh    (rclone mount lifecycle)                        │
 │   └─ meta-core (Go)      ─►  HTTP API + SSE + WebDAV on :9000            │
-│                          ─►  UDP announce/listen 239.255.77.1:9399       │
+│                          ─►  UDP advertise/listen 239.255.99.1:9099      │
 └──────────────────────────────────────────────────────────────────────────┘
                                        │
                 ┌──────────────────────┴──────────────────────┐
@@ -72,7 +72,7 @@ outside the container — all metadata I/O is mediated by the HTTP/SSE API
                 └─────────────────────────────────────────────┘
 
    meta-sort / meta-fuse / meta-stremio / meta-search / meta-share / …
-      │  1. hear role=core announce on UDP multicast (carries /urls)
+      │  1. hear the metamesh.core advertise on UDP multicast (carries /urls)
       └─ 2. HTTP + SSE (+ WebDAV) to metacore-app — never Redis, never the volume
 ```
 
@@ -140,7 +140,7 @@ Environment variables (from `internal/config/config.go` unless noted):
 |---|---|---|
 | `META_CORE_PATH` | `/meta-core` | meta-core's own volume root (lock, Redis data, identity, mounts, watchers, cache). No other service mounts it. |
 | `FILES_PATH` | `/files` | Files volume root. |
-| `SERVICE_NAME` | `meta-core` | Name in the meta-discovery announce. |
+| `SERVICE_NAME` | `meta-core` | Name in the beacon v2 advertise. |
 | `SERVICE_VERSION` | `1.0.0` | Reported via `/status`. |
 | `API_PORT` | `8180` | External port baked into the constructed `baseUrl` when `BASE_URL` is unset. |
 | `BASE_URL` | _empty_ | Overrides the constructed `baseUrl` (the Caddy/HTTPS perimeter URL). |
@@ -149,9 +149,9 @@ Environment variables (from `internal/config/config.go` unless noted):
 | `META_CORE_HTTP_PORT` | `9000` | Go HTTP+SSE+WebDAV port. |
 | `META_CORE_HTTP_HOST` | `0.0.0.0` | HTTP bind. |
 | `ENABLE_FILE_WATCHER` | `true` | Disable to suppress the in-process watcher entirely (`POST /api/files/register` stays available). |
-| `ENABLE_UDP_DISCOVERY` | `true` | meta-discovery v1 announce + listen. |
-| `DISCOVERY_GROUP` / `DISCOVERY_PORT` | `239.255.77.1` / `9399` | Multicast group and UDP port. |
-| `DISCOVERY_INTERVAL_MS` | `10000` | Unsolicited announce interval. |
+| `ENABLE_UDP_DISCOVERY` | `true` | beacon v2 advertise + listen. |
+| `BEACON_GROUP` / `BEACON_PORT` | `239.255.99.1` / `9099` | Multicast group and UDP port. |
+| `BEACON_INTERVAL_MS` | `10000` | Unsolicited advertise interval. |
 | `META_CORE_INDEX_EXCLUDE_PREFIXES` | `categories/newznab/` | Comma-separated field prefixes left out of the in-memory search index; set empty to index everything (`internal/storage/client.go`). |
 | `ELECTION_RETRY_SECS` | `5` | flock retry interval (read by `docker/leader-election.sh`, not the Go binary). |
 
@@ -178,14 +178,14 @@ GET  /health           # storage + role
 GET  /status           # version, uptime, etc.
 GET  /leader           # current leader info (hostname, PID, timestamps)
 GET  /urls             # baseUrl, apiUrl, webdavUrl, webdavUrlInternal (redisUrl is intentionally empty)
-GET  /neighbors        # neighbours heard over UDP (meta-discovery v1)
+GET  /neighbors        # neighbours heard over UDP (beacon v2)
 GET  /api/neighbors    # same, under /api
 GET  /api/stats        # dashboard counters (see below)
 ```
 
 `/services`, `/api/services`, `/services/{name}` and `/services/cleanup/stats`
 are **gone** — the registration-and-heartbeat registry they served was replaced
-by meta-discovery v1 (`/neighbors`). nginx answers an unknown non-`/api` path
+by beacon v2 (`/neighbors`). nginx answers an unknown non-`/api` path
 with the dashboard's `index.html`, so a stale caller gets `200 text/html` rather
 than a 404; that is what made the dashboard fail with
 `SyntaxError: Unexpected token '<'` until 1.0.21.
@@ -395,7 +395,7 @@ binary.
 The lock is a **mutex, not service discovery** — it only stops two Redis
 writers landing on one RDB/AOF. Nothing reads it, and the `kv-leader.info`
 file it used to publish is gone: siblings locate meta-core over UDP
-(see [service-discovery.md](../../docs/project-architecture/service-discovery.md)).
+(see [beacon-v2.md](../../docs/project-architecture/beacon-v2.md)).
 `internal/leader` keeps its name for history, but only builds the `/urls`
 payload (`baseUrl`, `apiUrl`, `webdavUrl`, `webdavUrlInternal`) that `/urls`
 and the UDP announce share.
@@ -418,7 +418,7 @@ the repo-root [`METADATA_KEYS.md`](../../METADATA_KEYS.md).
 | `cmd/meta-core` | Entry point; Redis connect + schema sentinel + UDP discovery + service wiring. |
 | `internal/config` | Env-driven configuration, path helpers. |
 | `internal/leader` | `LeaderInfoProvider` — builds the `/urls` payload from hostname/IP/config; no election logic. |
-| `internal/meshdisco` | meta-discovery v1 announcer + listener (the Go reference implementation). |
+| `internal/meshdisco` | beacon v2 node (advertise, probe, neighbour map) — the Go port of the spec. |
 | `internal/storage` | Redis wrapper (`client.go`), UUIDv7 minting, CID reverse index (`cid_resolution.go`), schema sentinel, field indexes + search-index bulk reads, UDL store (`udl.go`, `udl_admin.go`), stats, one-shot migrations/sweeps. |
 | `internal/cid` | CID parsing + rank ladder for canonical-CID selection (`cid-rank-vectors.json`, guarded by the meta-root `scripts/check-cid-vectors.sh`). |
 | `internal/identity` | Multi-account secp256k1 keystore, challenge/proof-of-possession, signature verification. |
@@ -438,7 +438,7 @@ the repo-root [`METADATA_KEYS.md`](../../METADATA_KEYS.md).
 2. Build LeaderInfoProvider (no election — the bash gate already won)
 3. Connect to local Redis (retry up to 30× / 1s)
 4. EnsureSchemaVersion — abort if the existing Redis layout is stale
-5. Start meta-discovery v1 node (unless ENABLE_UDP_DISCOVERY=false)
+5. Start beacon v2 node (unless ENABLE_UDP_DISCOVERY=false)
 6. Construct API server (identity keystore migration, watcher, watchers,
    mounts, WebDAV)
 7. Start API server + pollers + search-index refresh loop; start

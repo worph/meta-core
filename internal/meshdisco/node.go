@@ -13,24 +13,24 @@ import (
 	"time"
 
 	"golang.org/x/net/ipv4"
+	"golang.org/x/sys/unix"
 )
 
 // Config configures a Node. Payload is a function rather than a value so the
-// announce is rebuilt from live state on every tick — that is what keeps the
-// announced URLs and GET /urls from drifting apart.
+// advertise is rebuilt from live state on every tick — that is what keeps the
+// advertised core URLs and GET /urls from drifting apart.
 type Config struct {
 	Name     string
 	Instance string
-	Role     string
 	Version  string
 
 	Group    string
 	Port     int
 	Interval time.Duration
 
-	// Payload returns the identity/URL fields for this announce. Name,
-	// Instance, Role, Version and the envelope are filled in by the Node.
-	Payload func() (baseURL string, status string, urls *URLs)
+	// Payload returns this node's status ("starting" / "running") and its
+	// resources. The envelope and NodeInfo are filled in by the Node.
+	Payload func() (status string, resources []Resource)
 }
 
 func (c *Config) applyDefaults() {
@@ -43,13 +43,17 @@ func (c *Config) applyDefaults() {
 	if c.Interval <= 0 {
 		c.Interval = DefaultInterval
 	}
-	if c.Role == "" {
-		c.Role = RoleService
-	}
 }
 
-// Node is one participant in the mesh: it announces itself, answers probes,
-// and keeps a TTL map of everyone else it has heard from.
+type seen struct {
+	node      NodeInfo
+	resources []Resource
+	addr      string
+	lastSeen  time.Time
+}
+
+// Node is one beacon v2 participant: it advertises its resources, answers
+// probes, and keeps a TTL map of every other node it has heard from.
 type Node struct {
 	cfg   Config
 	group net.IP
@@ -60,7 +64,7 @@ type Node struct {
 	// ifaces are the multicast-capable interfaces we joined and send on.
 	// A container attached to two docker networks (metashare-app on `pcs`
 	// and `metamesh-mesh`, metawatch-* on `metawatch` and `metamesh-mesh`)
-	// has two entries here, and MUST be announced on both — sending via the
+	// has two entries here, and MUST be advertised on both — sending via the
 	// default route alone silently covers only one network.
 	ifaces []net.Interface
 
@@ -68,8 +72,8 @@ type Node struct {
 	// two-step operation on one shared socket.
 	sendMu sync.Mutex
 
-	mu        sync.RWMutex
-	neighbors map[string]*Neighbor
+	mu    sync.RWMutex
+	nodes map[string]*seen
 
 	stopChan chan struct{}
 	stopOnce sync.Once
@@ -80,27 +84,26 @@ type Node struct {
 func New(cfg Config) *Node {
 	cfg.applyDefaults()
 	return &Node{
-		cfg:       cfg,
-		neighbors: make(map[string]*Neighbor),
-		stopChan:  make(chan struct{}),
+		cfg:      cfg,
+		nodes:    make(map[string]*seen),
+		stopChan: make(chan struct{}),
 	}
 }
 
 // Start opens the multicast socket, joins the group on every eligible
-// interface, and begins announcing. A join failure on one interface is logged
-// and skipped rather than fatal — matching the ENABLE_MDNS precedent in the
-// Rust services, where a host that blocks multicast degrades instead of
-// failing to boot.
+// interface, and begins advertising. A join failure on one interface is logged
+// and skipped rather than fatal — a host that blocks multicast degrades
+// instead of failing to boot.
 func (n *Node) Start() error {
 	n.group = net.ParseIP(n.cfg.Group)
 	if n.group == nil || n.group.To4() == nil {
-		return fmt.Errorf("meshdisco: invalid multicast group %q", n.cfg.Group)
+		return fmt.Errorf("beacon: invalid multicast group %q", n.cfg.Group)
 	}
 
 	lc := net.ListenConfig{Control: reusePort}
 	conn, err := lc.ListenPacket(context.Background(), "udp4", fmt.Sprintf(":%d", n.cfg.Port))
 	if err != nil {
-		return fmt.Errorf("meshdisco: listen on :%d: %w", n.cfg.Port, err)
+		return fmt.Errorf("beacon: listen on :%d: %w", n.cfg.Port, err)
 	}
 	n.closer = conn
 
@@ -108,41 +111,41 @@ func (n *Node) Start() error {
 	// TTL 1: link-local only. Discovery never routes off the local segment;
 	// the two-host topology keeps two separate meshes by design.
 	if err := pc.SetMulticastTTL(1); err != nil {
-		log.Printf("[meshdisco] Warning: could not set multicast TTL: %v", err)
+		log.Printf("[beacon] Warning: could not set multicast TTL: %v", err)
 	}
 	n.pc = pc
 
 	n.ifaces = eligibleInterfaces()
 	if len(n.ifaces) == 0 {
-		log.Println("[meshdisco] Warning: no multicast-capable interfaces found; discovery will be inert")
+		log.Println("[beacon] Warning: no multicast-capable interfaces found; discovery will be inert")
 	}
 
 	group := &net.UDPAddr{IP: n.group}
 	joined := 0
 	for i := range n.ifaces {
 		if err := pc.JoinGroup(&n.ifaces[i], group); err != nil {
-			log.Printf("[meshdisco] Warning: join %s on %s failed: %v", n.cfg.Group, n.ifaces[i].Name, err)
+			log.Printf("[beacon] Warning: join %s on %s failed: %v", n.cfg.Group, n.ifaces[i].Name, err)
 			continue
 		}
 		joined++
 	}
-	log.Printf("[meshdisco] Listening on %s:%d as %s/%s (joined %d of %d interfaces)",
+	log.Printf("[beacon] Listening on %s:%d as %s/%s (joined %d of %d interfaces)",
 		n.cfg.Group, n.cfg.Port, n.cfg.Name, n.cfg.Instance, joined, len(n.ifaces))
 
 	n.wg.Add(2)
 	go n.readLoop()
-	go n.announceLoop()
+	go n.advertiseLoop()
 
 	return nil
 }
 
-// Stop closes the socket and waits for the loops to exit. It sends a final
-// announce with status "stopping" so neighbours drop us immediately instead of
-// waiting out the staleness window.
+// Stop multicasts a bye — so neighbours drop us immediately instead of
+// waiting out the staleness window — then closes the socket and waits for the
+// loops to exit.
 func (n *Node) Stop() error {
 	var err error
 	n.stopOnce.Do(func() {
-		n.sendAnnounce(nil, "stopping")
+		n.broadcast(Message{Proto: Proto, V: Version, Type: TypeBye, Node: n.nodeInfo("")})
 		close(n.stopChan)
 		if n.closer != nil {
 			err = n.closer.Close()
@@ -152,28 +155,27 @@ func (n *Node) Stop() error {
 	return err
 }
 
-// Probe multicasts a discovery message on every interface. Every listener
-// replies immediately, so a caller does not have to wait out an announce
-// interval. This is what makes the protocol usable on the boot path.
-func (n *Node) Probe() {
-	n.broadcast(Message{V: ProtocolVersion, Type: TypeDiscovery})
+// Probe multicasts a probe on every interface. Every node owning a resource
+// matching one of want (every node, when want is empty) replies immediately,
+// so a caller does not have to wait out an interval.
+func (n *Node) Probe(want ...string) {
+	n.broadcast(Message{Proto: Proto, V: Version, Type: TypeProbe, From: n.cfg.Instance, Want: want})
 }
 
-// Neighbors returns everyone heard from within the staleness window, sorted by
-// name. Entries older than that are dropped as a side effect — expiry is a
-// read-time concern, so there is no reaper goroutine and no equivalent of the
-// old cleaner.go.
+// Neighbors returns every node heard from within the staleness window,
+// sorted by (name, instance). Expired entries are dropped as a side effect —
+// expiry is a read-time concern, so there is no reaper goroutine.
 func (n *Node) Neighbors() []Neighbor {
 	cutoff := time.Now().Add(-n.cfg.Interval * LivenessFactor)
 
 	n.mu.Lock()
-	out := make([]Neighbor, 0, len(n.neighbors))
-	for k, nb := range n.neighbors {
-		if nb.LastSeen.Before(cutoff) {
-			delete(n.neighbors, k)
+	out := make([]Neighbor, 0, len(n.nodes))
+	for k, s := range n.nodes {
+		if s.lastSeen.Before(cutoff) {
+			delete(n.nodes, k)
 			continue
 		}
-		out = append(out, *nb)
+		out = append(out, newNeighbor(s.node, s.resources, s.addr, s.lastSeen))
 	}
 	n.mu.Unlock()
 
@@ -186,13 +188,12 @@ func (n *Node) Neighbors() []Neighbor {
 	return out
 }
 
-// NeighborsByName collapses multiple instances of one service down to the most
-// recently seen, which is the shape the nav menu wants (and what the existing
-// /api/services dedup contract asserts).
+// NeighborsByName collapses multiple instances of one name down to the most
+// recently seen — the shape the nav menu wants.
 func (n *Node) NeighborsByName() []Neighbor {
 	best := make(map[string]Neighbor)
 	for _, nb := range n.Neighbors() {
-		if cur, ok := best[nb.Name]; !ok || nb.LastSeen.After(cur.LastSeen) {
+		if cur, ok := best[nb.Name]; !ok || nb.LastSeen > cur.LastSeen {
 			best[nb.Name] = nb
 		}
 	}
@@ -204,10 +205,27 @@ func (n *Node) NeighborsByName() []Neighbor {
 	return out
 }
 
-// Self returns this node's own announce, so callers can render themselves in
-// the menu without waiting to hear their own multicast echo back.
+// Self returns this node as a row, so callers can render themselves without
+// waiting to hear their own multicast echo back.
 func (n *Node) Self() Neighbor {
-	return Neighbor{Message: n.buildAnnounce("running"), LastSeen: time.Now()}
+	status, resources := n.payload()
+	return newNeighbor(*n.nodeInfo(status), resources, "", time.Now())
+}
+
+func (n *Node) payload() (string, []Resource) {
+	if n.cfg.Payload == nil {
+		return "running", nil
+	}
+	return n.cfg.Payload()
+}
+
+func (n *Node) nodeInfo(status string) *NodeInfo {
+	return &NodeInfo{Name: n.cfg.Name, Instance: n.cfg.Instance, Version: n.cfg.Version, Status: status}
+}
+
+func (n *Node) advertiseMsg() Message {
+	status, resources := n.payload()
+	return Message{Proto: Proto, V: Version, Type: TypeAdvertise, Node: n.nodeInfo(status), Resources: resources}
 }
 
 func (n *Node) readLoop() {
@@ -228,32 +246,39 @@ func (n *Node) readLoop() {
 				return
 			default:
 			}
-			log.Printf("[meshdisco] Read error: %v", err)
+			log.Printf("[beacon] Read error: %v", err)
 			continue
 		}
 
-		var msg Message
-		if err := json.Unmarshal(buf[:nRead], &msg); err != nil {
-			// Malformed or foreign traffic on the group — ignore quietly.
-			continue
-		}
-		if msg.V != ProtocolVersion {
-			continue
-		}
-		// Drop our own multicast echo. Loopback is left enabled so that a
-		// single-container test still sees traffic; we filter by identity
-		// instead of relying on the socket option.
-		if msg.Instance != "" && msg.Instance == n.cfg.Instance && msg.Name == n.cfg.Name {
-			continue
+		msg, ok := Parse(buf[:nRead])
+		if !ok {
+			continue // v1 or foreign traffic on the shared group
 		}
 
 		switch msg.Type {
-		case TypeDiscovery:
-			// Unicast the reply straight back to the prober's source
-			// address. The kernel picks the right interface by route, and
-			// the prober's ephemeral source port is where it is listening.
-			n.sendAnnounce(src, "running")
-		case TypeAnnounce:
+		case TypeProbe:
+			if msg.From == n.cfg.Instance {
+				continue
+			}
+			ad := n.advertiseMsg()
+			wanted := len(msg.Want) == 0
+			for _, r := range ad.Resources {
+				if r.MatchesAny(msg.Want) {
+					wanted = true
+					break
+				}
+			}
+			if wanted {
+				// Unicast straight back to the prober's source address; its
+				// ephemeral source port is where it is listening.
+				n.send(ad, src)
+			}
+		case TypeAdvertise, TypeBye:
+			// Drop our own multicast echo. Loopback stays enabled so a
+			// single-container test still sees traffic; we filter by identity.
+			if msg.Node.Instance == n.cfg.Instance {
+				continue
+			}
 			n.record(msg, src)
 		}
 	}
@@ -269,25 +294,21 @@ func (n *Node) record(msg Message, src net.Addr) {
 		}
 	}
 
-	if msg.Status == "stopping" {
-		n.mu.Lock()
-		delete(n.neighbors, msg.key())
-		n.mu.Unlock()
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if msg.Type == TypeBye {
+		delete(n.nodes, msg.Node.Instance)
 		return
 	}
-
-	nb := &Neighbor{Message: msg, Addr: addr, LastSeen: time.Now()}
-	n.mu.Lock()
-	n.neighbors[msg.key()] = nb
-	n.mu.Unlock()
+	n.nodes[msg.Node.Instance] = &seen{node: *msg.Node, resources: msg.Resources, addr: addr, lastSeen: time.Now()}
 }
 
-func (n *Node) announceLoop() {
+func (n *Node) advertiseLoop() {
 	defer n.wg.Done()
 
-	// Announce immediately, then probe once so the map fills without waiting
-	// a full interval for everyone else's ticker.
-	n.sendAnnounce(nil, "running")
+	// Advertise immediately, then probe once so the map fills without
+	// waiting a full interval for everyone else's ticker.
+	n.broadcast(n.advertiseMsg())
 	n.Probe()
 
 	ticker := time.NewTicker(n.cfg.Interval)
@@ -298,51 +319,32 @@ func (n *Node) announceLoop() {
 		case <-n.stopChan:
 			return
 		case <-ticker.C:
-			n.sendAnnounce(nil, "running")
+			n.broadcast(n.advertiseMsg())
 		}
 	}
 }
 
-func (n *Node) buildAnnounce(status string) Message {
-	msg := Message{
-		V:        ProtocolVersion,
-		Type:     TypeAnnounce,
-		Name:     n.cfg.Name,
-		Instance: n.cfg.Instance,
-		Role:     n.cfg.Role,
-		Version:  n.cfg.Version,
-		Status:   status,
-	}
-	if n.cfg.Payload != nil {
-		baseURL, st, urls := n.cfg.Payload()
-		msg.BaseUrl = baseURL
-		if st != "" && status == "running" {
-			msg.Status = st
-		}
-		// Only meta-core carries a URLs block; a service announcing one
-		// would let any container on the network impersonate the core.
-		if n.cfg.Role == RoleCore {
-			msg.URLs = urls
-		}
-	}
-	return msg
-}
-
-// sendAnnounce multicasts when dst is nil, or unicasts to dst (a probe reply).
-func (n *Node) sendAnnounce(dst net.Addr, status string) {
-	msg := n.buildAnnounce(status)
-	if dst == nil {
-		n.broadcast(msg)
-		return
-	}
+func encode(msg Message) ([]byte, bool) {
 	body, err := json.Marshal(msg)
 	if err != nil {
+		return nil, false
+	}
+	if len(body) > MaxDatagram {
+		log.Printf("[beacon] Warning: %d-byte datagram exceeds the fragmentation-safe %d", len(body), MaxDatagram)
+	}
+	return body, true
+}
+
+// send unicasts msg to dst (a probe reply).
+func (n *Node) send(msg Message, dst net.Addr) {
+	body, ok := encode(msg)
+	if !ok {
 		return
 	}
 	n.sendMu.Lock()
 	defer n.sendMu.Unlock()
 	if _, err := n.pc.WriteTo(body, nil, dst); err != nil {
-		log.Printf("[meshdisco] Reply to %s failed: %v", dst, err)
+		log.Printf("[beacon] Reply to %s failed: %v", dst, err)
 	}
 }
 
@@ -353,8 +355,8 @@ func (n *Node) broadcast(msg Message) {
 	if n.pc == nil {
 		return
 	}
-	body, err := json.Marshal(msg)
-	if err != nil {
+	body, ok := encode(msg)
+	if !ok {
 		return
 	}
 	dst := &net.UDPAddr{IP: n.group, Port: n.cfg.Port}
@@ -363,11 +365,11 @@ func (n *Node) broadcast(msg Message) {
 	defer n.sendMu.Unlock()
 	for i := range n.ifaces {
 		if err := n.pc.SetMulticastInterface(&n.ifaces[i]); err != nil {
-			log.Printf("[meshdisco] Warning: select interface %s failed: %v", n.ifaces[i].Name, err)
+			log.Printf("[beacon] Warning: select interface %s failed: %v", n.ifaces[i].Name, err)
 			continue
 		}
 		if _, err := n.pc.WriteTo(body, nil, dst); err != nil {
-			log.Printf("[meshdisco] Warning: send on %s failed: %v", n.ifaces[i].Name, err)
+			log.Printf("[beacon] Warning: send on %s failed: %v", n.ifaces[i].Name, err)
 		}
 	}
 }
@@ -377,7 +379,7 @@ func (n *Node) broadcast(msg Message) {
 func eligibleInterfaces() []net.Interface {
 	all, err := net.Interfaces()
 	if err != nil {
-		log.Printf("[meshdisco] Warning: could not enumerate interfaces: %v", err)
+		log.Printf("[beacon] Warning: could not enumerate interfaces: %v", err)
 		return nil
 	}
 
@@ -402,12 +404,15 @@ func eligibleInterfaces() []net.Interface {
 	return out
 }
 
-// reusePort sets SO_REUSEADDR so a second listener (a test, or a sidecar) can
-// bind the same multicast port on the same host.
+// reusePort sets SO_REUSEADDR + SO_REUSEPORT so several listeners (a test, a
+// sidecar, a beacon v1 responder in the same netns) can bind 9099 on one host.
 func reusePort(_, _ string, c syscall.RawConn) error {
 	var serr error
 	err := c.Control(func(fd uintptr) {
-		serr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+		serr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+		if serr == nil {
+			serr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+		}
 	})
 	if err != nil {
 		return err
